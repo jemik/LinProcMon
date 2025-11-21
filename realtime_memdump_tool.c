@@ -16,6 +16,7 @@
 #include <linux/cn_proc.h>
 #include <signal.h>
 #include <dirent.h>
+#include <time.h>
 
 #ifdef ENABLE_YARA
 #include <yara.h>
@@ -25,6 +26,7 @@
 
 int nl_sock;
 const char* yara_rules_path = NULL;
+int continuous_scan = 0;  // Flag for continuous monitoring of all processes
 
 void cleanup(int sig) {
     printf("\n[!] Exiting...\n");
@@ -160,6 +162,48 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end) {
     close(out_fd);
 }
 
+void print_process_info(pid_t pid) {
+    char cmdline_path[64], comm_path[64];
+    char cmdline[2048] = "";
+    char comm[256] = "";
+    
+    // Read process name from /proc/PID/comm
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    FILE *comm_file = fopen(comm_path, "r");
+    if (comm_file) {
+        if (fgets(comm, sizeof(comm), comm_file)) {
+            // Remove trailing newline
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n')
+                comm[len-1] = '\0';
+        }
+        fclose(comm_file);
+    }
+    
+    // Read command line from /proc/PID/cmdline
+    snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", pid);
+    FILE *cmdline_file = fopen(cmdline_path, "r");
+    if (cmdline_file) {
+        size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, cmdline_file);
+        fclose(cmdline_file);
+        
+        if (len > 0) {
+            cmdline[len] = '\0';
+            // Replace null bytes with spaces for display
+            for (size_t i = 0; i < len - 1; i++) {
+                if (cmdline[i] == '\0')
+                    cmdline[i] = ' ';
+            }
+        }
+    }
+    
+    if (strlen(comm) > 0 || strlen(cmdline) > 0) {
+        printf("[INFO] Process: %s\n", strlen(comm) > 0 ? comm : "<unknown>");
+        if (strlen(cmdline) > 0)
+            printf("[INFO] Cmdline: %s\n", cmdline);
+    }
+}
+
 void check_exe_link(pid_t pid) {
     char exe_path[64], exe_target[256];
     snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
@@ -198,6 +242,7 @@ void check_env_vars(pid_t pid) {
 }
 
 void scan_maps_and_dump(pid_t pid) {
+    print_process_info(pid);
     check_exe_link(pid);
     check_env_vars(pid);
 
@@ -208,6 +253,8 @@ void scan_maps_and_dump(pid_t pid) {
     if (!maps) return;
 
     char line[MAX_LINE];
+    int suspicious_count = 0;
+    
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
         char perms[5];
@@ -217,19 +264,62 @@ void scan_maps_and_dump(pid_t pid) {
         if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %[^\n]", &start, &end, perms, path) < 3)
             continue;
 
-        if (strchr(perms, 'x') != NULL && (
-            strstr(path, "memfd:") != NULL ||
-            strstr(path, "/dev/shm") != NULL ||
-            strstr(path, "/proc/self") != NULL ||
-            strstr(path, "/tmp/") != NULL ||
-            strstr(path, "anon_inode") != NULL ||
-            (strlen(path) == 0 && strstr(perms, "rwx") != NULL))) {
+        int is_executable = strchr(perms, 'x') != NULL;
+        int is_writable = strchr(perms, 'w') != NULL;
+        int is_readable = strchr(perms, 'r') != NULL;
+        int is_rwx = is_readable && is_writable && is_executable;
+        int is_anonymous = (strlen(path) == 0);
+        
+        // Detection criteria for malware techniques:
+        int suspicious = 0;
+        const char *reason = NULL;
+        
+        // 1. RWX regions (code injection, self-modifying code)
+        if (is_rwx) {
+            suspicious = 1;
+            reason = "RWX permissions (writable+executable)";
+        }
+        // 2. Executable regions in suspicious paths
+        else if (is_executable && (
+            strstr(path, "memfd:") != NULL ||           // memfd_create execution
+            strstr(path, "/dev/shm") != NULL ||         // shared memory execution  
+            strstr(path, "/proc/self") != NULL ||       // self-reference execution
+            strstr(path, "/tmp/") != NULL ||            // tmp execution
+            strstr(path, "anon_inode") != NULL)) {      // anonymous inode
+            suspicious = 1;
+            reason = "Executable memory in suspicious location";
+        }
+        // 3. Anonymous executable mappings (reflective loading, process hollowing)
+        else if (is_executable && is_anonymous && strstr(path, "[stack]") == NULL && 
+                 strstr(path, "[vdso]") == NULL && strstr(path, "[vvar]") == NULL) {
+            suspicious = 1;
+            reason = "Anonymous executable mapping (possible injection)";
+        }
+        // 4. Executable heap (shellcode execution)
+        else if (is_executable && strstr(path, "[heap]") != NULL) {
+            suspicious = 1;
+            reason = "Executable heap (shellcode/injection)";
+        }
+        // 5. Large anonymous writable mappings (staged payloads)
+        else if (is_writable && is_anonymous && (end - start) > 1024*1024 && // > 1MB
+                 strstr(path, "[stack]") == NULL && strstr(path, "[heap]") == NULL) {
+            // These could become executable later via mprotect
+            printf("[WARN] Large anonymous writable region in PID %d: %lx-%lx (%s) size=%luMB\n", 
+                   pid, start, end, perms, (end-start)/(1024*1024));
+        }
 
-            printf("[!] Suspicious memory detected in PID %d: %lx-%lx (%s) %s\n", pid, start, end, perms, path);
+        if (suspicious) {
+            suspicious_count++;
+            printf("[!] ALERT: %s in PID %d\n", reason, pid);
+            printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
             dump_memory_region(pid, start, end);
         }
     }
     fclose(maps);
+    
+    if (suspicious_count > 0) {
+        printf("[!] Total suspicious regions found: %d\n", suspicious_count);
+    }
 }
 
 void handle_proc_event(struct cn_msg *cn_hdr) {
@@ -238,23 +328,46 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
     if (ev->what == PROC_EVENT_EXEC) {
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
-        printf("[EXEC] New process PID=%d PPID=%d\n", pid, ppid);
+        printf("\n[EXEC] New process PID=%d PPID=%d\n", pid, ppid);
+        printf("========================================\n");
         usleep(100000); // slight delay for maps to be available
         scan_maps_and_dump(pid);
+        printf("========================================\n");
     }
 }
 
 int main(int argc, char **argv) {
     signal(SIGINT, cleanup);
 
-    if (argc >= 3 && strcmp(argv[1], "--yara") == 0) {
-        yara_rules_path = argv[2];
+    // Parse command line arguments
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--yara") == 0 && i + 1 < argc) {
+            yara_rules_path = argv[++i];
 #ifdef ENABLE_YARA
-        printf("[+] YARA scanning enabled using rule file: %s\n", yara_rules_path);
+            printf("[+] YARA scanning enabled using rule file: %s\n", yara_rules_path);
 #else
-        printf("[!] WARNING: YARA support not compiled in. --yara flag ignored.\n");
-        printf("[!] Recompile with -DENABLE_YARA and link against libyara to enable YARA scanning.\n");
+            printf("[!] WARNING: YARA support not compiled in. --yara flag ignored.\n");
+            printf("[!] Recompile with -DENABLE_YARA and link against libyara to enable YARA scanning.\n");
 #endif
+        } else if (strcmp(argv[i], "--continuous") == 0) {
+            continuous_scan = 1;
+            printf("[+] Continuous monitoring enabled (will rescan running processes)\n");
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Usage: %s [OPTIONS]\n", argv[0]);
+            printf("Real-time process monitoring for malware detection\n\n");
+            printf("Options:\n");
+            printf("  --yara <file>     Enable YARA scanning with specified rules file\n");
+            printf("  --continuous      Enable continuous monitoring (rescan processes every 30s)\n");
+            printf("  --help, -h        Show this help message\n\n");
+            printf("Detection capabilities:\n");
+            printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
+            printf("  - Process hollowing and reflective loading\n");
+            printf("  - RWX memory regions (JIT spray, self-modifying code)\n");
+            printf("  - Fileless execution techniques\n");
+            printf("  - Heap/stack code execution\n");
+            printf("  - Suspicious environment variables (LD_PRELOAD)\n");
+            return 0;
+        }
     }
 
     nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
@@ -270,6 +383,19 @@ int main(int argc, char **argv) {
 
     if (bind(nl_sock, (struct sockaddr *)&sa, sizeof(sa)) == -1) {
         perror("bind"); return 1;
+    }
+
+    // Increase socket receive buffer to prevent "No buffer space available" errors
+    int rcvbuf_size = 1024 * 1024; // 1MB
+    if (setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size)) == -1) {
+        perror("setsockopt SO_RCVBUF");
+        // Continue anyway, not fatal
+    }
+
+    // Set socket to non-blocking mode
+    int flags = fcntl(nl_sock, F_GETFL, 0);
+    if (flags != -1) {
+        fcntl(nl_sock, F_SETFL, flags | O_NONBLOCK);
     }
 
     struct {
@@ -295,21 +421,70 @@ int main(int argc, char **argv) {
     }
 
     printf("[+] Listening for process creation events (real-time)...\n");
+    if (continuous_scan) {
+        printf("[+] Continuous monitoring active - will rescan all processes every 30 seconds\n");
+    }
+
+    time_t last_full_scan = time(NULL);
 
     while (1) {
-        char buf[1024];
+        char buf[8192];  // Increased from 1024 to handle more events
         ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
+        
         if (len == -1) {
-            if (errno == EINTR) continue;
-            perror("recv"); break;
+            if (errno == EINTR) {
+                continue;  // Interrupted by signal, retry
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // No data available - check if we should do a full scan
+                if (continuous_scan) {
+                    time_t now = time(NULL);
+                    if (now - last_full_scan >= 30) {
+                        printf("\n[*] Performing periodic scan of all running processes...\n");
+                        // Scan /proc for all PIDs
+                        DIR *proc_dir = opendir("/proc");
+                        if (proc_dir) {
+                            struct dirent *entry;
+                            while ((entry = readdir(proc_dir)) != NULL) {
+                                // Check if directory name is a number (PID)
+                                if (entry->d_type == DT_DIR) {
+                                    pid_t pid = atoi(entry->d_name);
+                                    if (pid > 0) {
+                                        scan_maps_and_dump(pid);
+                                    }
+                                }
+                            }
+                            closedir(proc_dir);
+                        }
+                        last_full_scan = now;
+                        printf("[*] Periodic scan complete\n\n");
+                    }
+                }
+                // Sleep briefly to avoid busy-waiting
+                usleep(10000);  // 10ms
+                continue;
+            }
+            // Real error occurred
+            perror("recv");
+            break;
+        }
+        
+        if (len == 0) {
+            // Should not happen with netlink sockets, but handle it
+            fprintf(stderr, "[!] Netlink socket closed\n");
+            break;
         }
 
+        // Process all messages in the buffer
         struct nlmsghdr *nlh = (struct nlmsghdr *)buf;
         while (NLMSG_OK(nlh, len)) {
             struct cn_msg *cn_hdr = NLMSG_DATA(nlh);
             handle_proc_event(cn_hdr);
             nlh = NLMSG_NEXT(nlh, len);
         }
+        
+        // Immediately try to drain more events from the socket buffer
+        // without sleeping to prevent kernel buffer overflow
     }
 
     return 0;
