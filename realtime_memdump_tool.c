@@ -586,7 +586,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Real-time process monitoring for malware detection\n\n");
-            printf("Options:\n");
+            printf("[+] Options:\n");
             printf("  --yara <file>     Enable YARA scanning with specified rules file\n");
             printf("  --continuous      Enable continuous monitoring (rescan processes every 30s)\n");
             printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
