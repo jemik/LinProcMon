@@ -1,5 +1,5 @@
 // realtime_memdump_tool.c
-// Linux C tool for real-time process monitoring + memory injection detection + dumping + YARA scan
+// Linux C tool for real-time process monitoring + memory injection detection + dumping + YARA scan + env check
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -174,8 +174,32 @@ void check_exe_link(pid_t pid) {
     }
 }
 
+void check_env_vars(pid_t pid) {
+    char env_path[64];
+    snprintf(env_path, sizeof(env_path), "/proc/%d/environ", pid);
+
+    FILE *env_file = fopen(env_path, "r");
+    if (!env_file) return;
+
+    char env_buf[8192];
+    size_t len = fread(env_buf, 1, sizeof(env_buf) - 1, env_file);
+    fclose(env_file);
+
+    if (len <= 0) return;
+    env_buf[len] = '\0';
+
+    char *p = env_buf;
+    while (p < env_buf + len) {
+        if (strstr(p, "LD_PRELOAD=") == p || strstr(p, "LD_LIBRARY_PATH=") == p) {
+            printf("[!] Suspicious ENV in PID %d: %s\n", pid, p);
+        }
+        p += strlen(p) + 1;
+    }
+}
+
 void scan_maps_and_dump(pid_t pid) {
     check_exe_link(pid);
+    check_env_vars(pid);
 
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
