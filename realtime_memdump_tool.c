@@ -591,7 +591,7 @@ int main(int argc, char **argv) {
             printf("  --continuous      Enable continuous monitoring (rescan processes every 30s)\n");
             printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
             printf("  --threads <N>     Number of worker threads (1-%d, default: 4)\n", MAX_WORKER_THREADS);
-            printf("  --mem_dump        Enable memory dumping to disk (default: off)\n")
+            printf("  --mem_dump        Enable memory dumping to disk (default: off)\n");
             printf("  --help, -h        Show this help message\n\n");
             printf("Detection capabilities:\n");
             printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
