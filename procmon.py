@@ -3,7 +3,11 @@ import time
 import logging
 from datetime import datetime
 
-# Set up logging
+# ANSI color codes for terminal output
+RED_BG = "\033[41m"
+RESET = "\033[0m"
+
+# Set up logging to file
 logging.basicConfig(
     filename='process_log.txt',
     level=logging.INFO,
@@ -60,8 +64,13 @@ def log_new_processes():
 
             if suspicious_hit:
                 log_msg += f" [SUSPICIOUS: matched '{suspicious_hit}']"
-
-            logging.info(log_msg)
+                # Log to file
+                logging.info(log_msg)
+                # Print to screen with red background
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                print(f"{now}. {RED_BG}SUSPICIOUS match '{suspicious_hit}'{RESET} Name='{name}' PID={pid} PPID={ppid} CMD='{cmd_str}'")
+            else:
+                logging.info(log_msg)
 
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
@@ -69,10 +78,10 @@ def log_new_processes():
     seen_pids = current_pids
 
 if __name__ == "__main__":
-    print("Monitoring new processes with heuristic detection. Press Ctrl+C to stop.")
+    print("🛡️  Monitoring new processes with heuristic detection. Press Ctrl+C to stop.")
     try:
         while True:
             log_new_processes()
             time.sleep(1)
     except KeyboardInterrupt:
-        print("Monitoring stopped.")
+        print("🛑 Monitoring stopped.")
