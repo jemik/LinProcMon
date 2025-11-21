@@ -23,7 +23,8 @@
 #endif
 
 #define MAX_LINE 4096
-#define PROCESS_INIT_DELAY_US 20000  // 20ms delay for process initialization
+// Note: No delay for process initialization - prioritize event processing speed
+// Short-lived processes may race (exit before we read them) - this is acceptable
 
 int nl_sock;
 const char* yara_rules_path = NULL;
@@ -378,8 +379,8 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
             printf("\n[EXEC] PID=%d PPID=%d\n", pid, ppid);
         }
         
-        // Minimal delay for process to initialize - reduced for speed
-        usleep(PROCESS_INIT_DELAY_US);
+        // No delay - process immediately to drain kernel buffer faster
+        // Short-lived processes will race but that's OK
         scan_maps_and_dump(pid);
         
         if (!quiet_mode) {
@@ -443,7 +444,8 @@ int main(int argc, char **argv) {
 
     // Increase socket receive buffer significantly to prevent "No buffer space available" errors
     // This allows kernel to buffer more events during processing spikes
-    int rcvbuf_size = 4 * 1024 * 1024; // 4MB buffer (up from 1MB)
+    // In container environments (Docker/K8s), process churn can be extreme
+    int rcvbuf_size = 16 * 1024 * 1024; // 16MB buffer for container environments
     if (setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size)) == -1) {
         perror("setsockopt SO_RCVBUF");
         // Continue anyway, not fatal
