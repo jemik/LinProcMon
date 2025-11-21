@@ -369,6 +369,30 @@ void scan_maps_and_dump(pid_t pid) {
     char line[MAX_LINE];
     int suspicious_count = 0;
     
+    // Helper function to check if path is a legitimate system binary/library
+    int is_legitimate_path(const char *path) {
+        if (strlen(path) == 0) return 0;  // Anonymous
+        
+        // Whitelist common legitimate paths
+        const char *legitimate_prefixes[] = {
+            "/usr/lib", "/lib", "/lib64",           // System libraries
+            "/usr/bin", "/bin", "/sbin",            // System binaries
+            "/opt/",                                 // Optional software
+            "/usr/local/",                           // User-installed software
+            "/snap/",                                // Snap packages
+            "/var/lib/snapd",                        // Snap runtime
+            "[vdso]", "[vvar]", "[vsyscall]",       // Kernel pages
+            "[stack]", "[heap]"                      // Process memory
+        };
+        
+        for (size_t i = 0; i < sizeof(legitimate_prefixes)/sizeof(legitimate_prefixes[0]); i++) {
+            if (strstr(path, legitimate_prefixes[i]) == path) {  // Starts with prefix
+                return 1;
+            }
+        }
+        return 0;
+    }
+    
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
         char perms[5];
@@ -388,8 +412,14 @@ void scan_maps_and_dump(pid_t pid) {
         int suspicious = 0;
         const char *reason = NULL;
         
+        // Skip detection for legitimate system paths (libraries, binaries)
+        // This significantly reduces false positives from JIT compilers, etc.
+        int is_legit = is_legitimate_path(path);
+        
         // 1. RWX regions (code injection, self-modifying code)
-        if (is_rwx) {
+        // BUT: Many legitimate programs use RWX (JIT compilers: Java, Node.js, browsers)
+        // Only flag RWX in non-system locations or anonymous memory
+        if (is_rwx && !is_legit) {
             suspicious = 1;
             reason = "RWX permissions (writable+executable)";
         }
@@ -403,18 +433,15 @@ void scan_maps_and_dump(pid_t pid) {
             suspicious = 1;
             reason = "Executable memory in suspicious location";
         }
-        // 2b. Executable anonymous file mappings (fd-based, no backing file path)
-        // This catches mmap(fd) from memfd_create when path shows as empty or deleted
-        else if (is_executable && !is_anonymous && (
-            strstr(path, "(deleted)") != NULL ||        // deleted file descriptor
-            (strstr(path, "/") == NULL && strlen(path) > 0))) {  // fd reference without full path
-            suspicious = 1;
-            reason = "Executable memory from file descriptor (possible memfd)";
-        }
         // 3. Anonymous executable mappings (reflective loading, process hollowing)
-        else if (is_executable && is_anonymous && strstr(path, "[stack]") == NULL && 
-                 strstr(path, "[vdso]") == NULL && strstr(path, "[vvar]") == NULL &&
-                 strstr(path, "[vsyscall]") == NULL) {
+        // BUT exclude legitimate kernel pages: [stack], [vdso], [vvar], [vsyscall]
+        // Also exclude vsyscall page by address range (0xffffffffff600000-0xffffffffff601000)
+        else if (is_executable && is_anonymous && 
+                 strstr(path, "[stack]") == NULL && 
+                 strstr(path, "[vdso]") == NULL && 
+                 strstr(path, "[vvar]") == NULL &&
+                 strstr(path, "[vsyscall]") == NULL &&
+                 !(start >= 0xffffffffff600000UL && end <= 0xffffffffff601000UL)) {  // vsyscall page range
             suspicious = 1;
             reason = "Anonymous executable mapping (possible injection)";
         }
