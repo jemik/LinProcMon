@@ -16,7 +16,10 @@
 #include <linux/cn_proc.h>
 #include <signal.h>
 #include <dirent.h>
+
+#ifdef ENABLE_YARA
 #include <yara.h>
+#endif
 
 #define MAX_LINE 4096
 
@@ -29,6 +32,7 @@ void cleanup(int sig) {
     exit(0);
 }
 
+#ifdef ENABLE_YARA
 // YARA callback function for match reporting
 static int yara_callback(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
     (void)context;  // Mark as intentionally unused
@@ -98,6 +102,12 @@ int scan_with_yara(const char *filename) {
 
     return result;
 }
+#else
+int scan_with_yara(const char *filename) {
+    printf("[INFO] YARA support not compiled in. Skipping scan of %s\n", filename);
+    return 0;
+}
+#endif
 
 void dump_memory_region(pid_t pid, unsigned long start, unsigned long end) {
     char mem_path[64];
@@ -215,7 +225,12 @@ int main(int argc, char **argv) {
 
     if (argc >= 3 && strcmp(argv[1], "--yara") == 0) {
         yara_rules_path = argv[2];
+#ifdef ENABLE_YARA
         printf("[+] YARA scanning enabled using rule file: %s\n", yara_rules_path);
+#else
+        printf("[!] WARNING: YARA support not compiled in. --yara flag ignored.\n");
+        printf("[!] Recompile with -DENABLE_YARA and link against libyara to enable YARA scanning.\n");
+#endif
     }
 
     nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
