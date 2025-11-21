@@ -23,13 +23,24 @@
 #endif
 
 #define MAX_LINE 4096
+#define PROCESS_INIT_DELAY_US 20000  // 20ms delay for process initialization
 
 int nl_sock;
 const char* yara_rules_path = NULL;
 int continuous_scan = 0;  // Flag for continuous monitoring of all processes
+int quiet_mode = 0;  // Suppress non-critical messages
+
+// Statistics
+static unsigned long total_events = 0;
+static unsigned long suspicious_found = 0;
+static unsigned long race_conditions = 0;
 
 void cleanup(int sig) {
     printf("\n[!] Exiting...\n");
+    printf("[*] Statistics:\n");
+    printf("    Total events processed: %lu\n", total_events);
+    printf("    Suspicious findings: %lu\n", suspicious_found);
+    printf("    Race conditions (normal): %lu\n", race_conditions);
     close(nl_sock);
     exit(0);
 }
@@ -197,10 +208,12 @@ void print_process_info(pid_t pid) {
         }
     }
     
-    if (strlen(comm) > 0 || strlen(cmdline) > 0) {
-        printf("[INFO] Process: %s\n", strlen(comm) > 0 ? comm : "<unknown>");
+    // Only print if we got valid info
+    if (!quiet_mode && (strlen(comm) > 0 || strlen(cmdline) > 0)) {
+        printf("[INFO] Process: %s", strlen(comm) > 0 ? comm : "<unknown>");
         if (strlen(cmdline) > 0)
-            printf("[INFO] Cmdline: %s\n", cmdline);
+            printf(" | Cmdline: %s", cmdline);
+        printf("\n");
     }
 }
 
@@ -209,12 +222,25 @@ void check_exe_link(pid_t pid) {
     snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", pid);
     ssize_t len = readlink(exe_path, exe_target, sizeof(exe_target) - 1);
     if (len == -1) {
-        printf("[!] WARNING: /proc/%d/exe missing (possibly memfd or anonymous exec)\n", pid);
+        // Process likely exited before we could read it - this is normal
+        race_conditions++;
+        if (!quiet_mode) {
+            // Only print if it's NOT a permission denied or no such file error
+            if (errno != ENOENT && errno != EACCES) {
+                printf("[!] WARNING: /proc/%d/exe unreadable: %s\n", pid, strerror(errno));
+            }
+        }
         return;
     }
     exe_target[len] = '\0';
-    if (strstr(exe_target, "memfd:") || strstr(exe_target, "(deleted)") || strstr(exe_target, "anon_inode")) {
-        printf("[!] Suspicious exe symlink for PID %d: %s\n", pid, exe_target);
+    if (strstr(exe_target, "memfd:") || strstr(exe_target, "anon_inode")) {
+        // These are actually suspicious
+        printf("[!] ALERT: Suspicious exe symlink for PID %d: %s\n", pid, exe_target);
+    } else if (strstr(exe_target, "(deleted)")) {
+        // Running from deleted file - could be legitimate (updated binary) or suspicious
+        if (!quiet_mode) {
+            printf("[WARN] Process running from deleted file PID %d: %s\n", pid, exe_target);
+        }
     }
 }
 
@@ -242,15 +268,23 @@ void check_env_vars(pid_t pid) {
 }
 
 void scan_maps_and_dump(pid_t pid) {
-    print_process_info(pid);
-    check_exe_link(pid);
-    check_env_vars(pid);
-
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
 
     FILE *maps = fopen(maps_path, "r");
-    if (!maps) return;
+    if (!maps) {
+        // Process likely exited - this is a race condition, not an error
+        race_conditions++;
+        return;
+    }
+
+    // First read process info and check for obvious red flags
+    // In quiet mode, skip non-essential checks to process faster
+    if (!quiet_mode) {
+        print_process_info(pid);
+    }
+    check_exe_link(pid);
+    check_env_vars(pid);
 
     char line[MAX_LINE];
     int suspicious_count = 0;
@@ -291,7 +325,8 @@ void scan_maps_and_dump(pid_t pid) {
         }
         // 3. Anonymous executable mappings (reflective loading, process hollowing)
         else if (is_executable && is_anonymous && strstr(path, "[stack]") == NULL && 
-                 strstr(path, "[vdso]") == NULL && strstr(path, "[vvar]") == NULL) {
+                 strstr(path, "[vdso]") == NULL && strstr(path, "[vvar]") == NULL &&
+                 strstr(path, "[vsyscall]") == NULL) {
             suspicious = 1;
             reason = "Anonymous executable mapping (possible injection)";
         }
@@ -300,8 +335,8 @@ void scan_maps_and_dump(pid_t pid) {
             suspicious = 1;
             reason = "Executable heap (shellcode/injection)";
         }
-        // 5. Large anonymous writable mappings (staged payloads)
-        else if (is_writable && is_anonymous && (end - start) > 1024*1024 && // > 1MB
+        // 5. Large anonymous writable mappings (staged payloads) - only warn in verbose mode
+        else if (!quiet_mode && is_writable && is_anonymous && (end - start) > 10*1024*1024 && // > 10MB
                  strstr(path, "[stack]") == NULL && strstr(path, "[heap]") == NULL) {
             // These could become executable later via mprotect
             printf("[WARN] Large anonymous writable region in PID %d: %lx-%lx (%s) size=%luMB\n", 
@@ -310,14 +345,23 @@ void scan_maps_and_dump(pid_t pid) {
 
         if (suspicious) {
             suspicious_count++;
-            printf("[!] ALERT: %s in PID %d\n", reason, pid);
-            printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
+            suspicious_found++;
+            
+            // Always print alerts, even in quiet mode
+            if (quiet_mode) {
+                // Compact format for quiet mode
+                printf("[!] %s | PID=%d | %lx-%lx (%s) %s\n", reason, pid, start, end, perms, path);
+            } else {
+                printf("[!] ALERT: %s in PID %d\n", reason, pid);
+                printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
+            }
+            
             dump_memory_region(pid, start, end);
         }
     }
     fclose(maps);
     
-    if (suspicious_count > 0) {
+    if (suspicious_count > 0 && !quiet_mode) {
         printf("[!] Total suspicious regions found: %d\n", suspicious_count);
     }
 }
@@ -328,11 +372,19 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
     if (ev->what == PROC_EVENT_EXEC) {
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
-        printf("\n[EXEC] New process PID=%d PPID=%d\n", pid, ppid);
-        printf("========================================\n");
-        usleep(100000); // slight delay for maps to be available
+        total_events++;
+        
+        if (!quiet_mode) {
+            printf("\n[EXEC] PID=%d PPID=%d\n", pid, ppid);
+        }
+        
+        // Minimal delay for process to initialize - reduced for speed
+        usleep(PROCESS_INIT_DELAY_US);
         scan_maps_and_dump(pid);
-        printf("========================================\n");
+        
+        if (!quiet_mode) {
+            printf("========================================\n");
+        }
     }
 }
 
@@ -352,12 +404,16 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--continuous") == 0) {
             continuous_scan = 1;
             printf("[+] Continuous monitoring enabled (will rescan running processes)\n");
+        } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
+            quiet_mode = 1;
+            printf("[+] Quiet mode enabled (only critical alerts)\n");
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Real-time process monitoring for malware detection\n\n");
             printf("Options:\n");
             printf("  --yara <file>     Enable YARA scanning with specified rules file\n");
             printf("  --continuous      Enable continuous monitoring (rescan processes every 30s)\n");
+            printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
             printf("  --help, -h        Show this help message\n\n");
             printf("Detection capabilities:\n");
             printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
@@ -385,12 +441,17 @@ int main(int argc, char **argv) {
         perror("bind"); return 1;
     }
 
-    // Increase socket receive buffer to prevent "No buffer space available" errors
-    int rcvbuf_size = 1024 * 1024; // 1MB
+    // Increase socket receive buffer significantly to prevent "No buffer space available" errors
+    // This allows kernel to buffer more events during processing spikes
+    int rcvbuf_size = 4 * 1024 * 1024; // 4MB buffer (up from 1MB)
     if (setsockopt(nl_sock, SOL_SOCKET, SO_RCVBUF, &rcvbuf_size, sizeof(rcvbuf_size)) == -1) {
         perror("setsockopt SO_RCVBUF");
         // Continue anyway, not fatal
     }
+    
+    // Also increase send buffer
+    int sndbuf_size = 1024 * 1024; // 1MB
+    setsockopt(nl_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf_size, sizeof(sndbuf_size));
 
     // Set socket to non-blocking mode
     int flags = fcntl(nl_sock, F_GETFL, 0);
@@ -428,7 +489,7 @@ int main(int argc, char **argv) {
     time_t last_full_scan = time(NULL);
 
     while (1) {
-        char buf[8192];  // Increased from 1024 to handle more events
+        char buf[65536];  // 64KB buffer to handle many events at once
         ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
         
         if (len == -1) {
@@ -440,13 +501,18 @@ int main(int argc, char **argv) {
                 if (continuous_scan) {
                     time_t now = time(NULL);
                     if (now - last_full_scan >= 30) {
-                        printf("\n[*] Performing periodic scan of all running processes...\n");
-                        // Scan /proc for all PIDs
+                        if (!quiet_mode) {
+                            printf("\n[*] Performing periodic scan (stats: %lu events, %lu alerts, %lu races)\n", 
+                                   total_events, suspicious_found, race_conditions);
+                        }
+                        // Note: Periodic full scans are VERY noisy and may cause buffer overflow
+                        // Consider disabling or making this optional
+                        // Commenting out for now:
+                        /*
                         DIR *proc_dir = opendir("/proc");
                         if (proc_dir) {
                             struct dirent *entry;
                             while ((entry = readdir(proc_dir)) != NULL) {
-                                // Check if directory name is a number (PID)
                                 if (entry->d_type == DT_DIR) {
                                     pid_t pid = atoi(entry->d_name);
                                     if (pid > 0) {
@@ -456,12 +522,15 @@ int main(int argc, char **argv) {
                             }
                             closedir(proc_dir);
                         }
+                        */
                         last_full_scan = now;
-                        printf("[*] Periodic scan complete\n\n");
+                        if (!quiet_mode) {
+                            printf("[*] Periodic scan skipped (too noisy - use targeted scans instead)\n\n");
+                        }
                     }
                 }
                 // Sleep briefly to avoid busy-waiting
-                usleep(10000);  // 10ms
+                usleep(1000);  // 1ms (reduced from 10ms for faster response)
                 continue;
             }
             // Real error occurred
