@@ -277,9 +277,14 @@ void check_exe_link(pid_t pid) {
         return;
     }
     exe_target[len] = '\0';
+    
+    // CRITICAL: memfd execution detection
     if (strstr(exe_target, "memfd:") || strstr(exe_target, "anon_inode")) {
-        // These are actually suspicious
-        printf("[!] ALERT: Suspicious exe symlink for PID %d: %s\n", pid, exe_target);
+        // Process is executing from memfd - VERY suspicious
+        pthread_mutex_lock(&stats_mutex);
+        suspicious_found++;
+        pthread_mutex_unlock(&stats_mutex);
+        printf("[!] CRITICAL: Process executing from memfd | PID=%d | exe=%s\n", pid, exe_target);
     } else if (strstr(exe_target, "(deleted)")) {
         // Running from deleted file - could be legitimate (updated binary) or suspicious
         if (!quiet_mode) {
@@ -352,12 +357,14 @@ void scan_maps_and_dump(pid_t pid) {
     }
 
     // First read process info and check for obvious red flags
-    // In quiet mode, skip non-essential checks to process faster
+    // check_exe_link must run in all modes to detect memfd execution
+    check_exe_link(pid);
+    check_env_vars(pid);
+    
+    // Print process info only in verbose mode
     if (!quiet_mode) {
         print_process_info(pid);
     }
-    check_exe_link(pid);
-    check_env_vars(pid);
 
     char line[MAX_LINE];
     int suspicious_count = 0;
@@ -395,6 +402,14 @@ void scan_maps_and_dump(pid_t pid) {
             strstr(path, "anon_inode") != NULL)) {      // anonymous inode
             suspicious = 1;
             reason = "Executable memory in suspicious location";
+        }
+        // 2b. Executable anonymous file mappings (fd-based, no backing file path)
+        // This catches mmap(fd) from memfd_create when path shows as empty or deleted
+        else if (is_executable && !is_anonymous && (
+            strstr(path, "(deleted)") != NULL ||        // deleted file descriptor
+            (strstr(path, "/") == NULL && strlen(path) > 0))) {  // fd reference without full path
+            suspicious = 1;
+            reason = "Executable memory from file descriptor (possible memfd)";
         }
         // 3. Anonymous executable mappings (reflective loading, process hollowing)
         else if (is_executable && is_anonymous && strstr(path, "[stack]") == NULL && 
@@ -552,6 +567,23 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
             }
         }
     }
+    else if (ev->what == PROC_EVENT_FORK) {
+        // Fork creates a copy of parent process, including memory mappings
+        // Check child process for inherited malicious mappings
+        pid_t child_pid = ev->event_data.fork.child_pid;
+        pid_t parent_pid = ev->event_data.fork.parent_pid;
+        
+        pthread_mutex_lock(&stats_mutex);
+        total_events++;
+        pthread_mutex_unlock(&stats_mutex);
+        
+        // Queue child for scanning (may have inherited suspicious mappings from parent)
+        if (queue_push(&event_queue, child_pid, parent_pid) < 0) {
+            if (!quiet_mode) {
+                fprintf(stderr, "[!] WARNING: Event queue full, dropped fork event for PID %d\n", child_pid);
+            }
+        }
+    }
 }
 
 int main(int argc, char **argv) {
@@ -620,6 +652,30 @@ int main(int argc, char **argv) {
         }
     }
     printf("[+] Started %d worker threads for async processing\n", num_threads);
+
+    // Perform initial scan of all running processes to catch existing threats
+    printf("[+] Performing initial scan of running processes...\n");
+    DIR *proc_dir = opendir("/proc");
+    if (proc_dir) {
+        struct dirent *entry;
+        int scanned = 0;
+        while ((entry = readdir(proc_dir)) != NULL) {
+            if (entry->d_type == DT_DIR) {
+                pid_t pid = atoi(entry->d_name);
+                if (pid > 0) {
+                    // Queue for worker threads to scan
+                    if (!should_ignore_process(pid)) {
+                        queue_push(&event_queue, pid, 0);
+                        scanned++;
+                    }
+                }
+            }
+        }
+        closedir(proc_dir);
+        printf("[+] Initial scan queued %d processes\n", scanned);
+        // Give workers time to process the initial scan
+        sleep(2);
+    }
 
     nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
     if (nl_sock == -1) {
