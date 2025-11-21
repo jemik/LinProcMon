@@ -17,12 +17,16 @@
 #include <signal.h>
 #include <dirent.h>
 #include <time.h>
+#include <pthread.h>
 
 #ifdef ENABLE_YARA
 #include <yara.h>
 #endif
 
 #define MAX_LINE 4096
+#define MAX_WORKER_THREADS 8
+#define EVENT_QUEUE_SIZE 1024
+
 // Note: No delay for process initialization - prioritize event processing speed
 // Short-lived processes may race (exit before we read them) - this is acceptable
 
@@ -30,18 +34,48 @@ int nl_sock;
 const char* yara_rules_path = NULL;
 int continuous_scan = 0;  // Flag for continuous monitoring of all processes
 int quiet_mode = 0;  // Suppress non-critical messages
+int mem_dump = 0;  // Enable memory dumping to disk
 
-// Statistics
+// Statistics (now protected by mutex)
 static unsigned long total_events = 0;
 static unsigned long suspicious_found = 0;
 static unsigned long race_conditions = 0;
+static unsigned long queue_drops = 0;
+
+// Thread-safe event queue
+typedef struct {
+    pid_t pid;
+    pid_t ppid;
+} event_data_t;
+
+typedef struct {
+    event_data_t events[EVENT_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+    int shutdown;
+} event_queue_t;
+
+event_queue_t event_queue;
+pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void cleanup(int sig) {
     printf("\n[!] Exiting...\n");
+    
+    // Signal shutdown and wake up worker threads
+    pthread_mutex_lock(&event_queue.mutex);
+    event_queue.shutdown = 1;
+    pthread_cond_broadcast(&event_queue.not_empty);
+    pthread_mutex_unlock(&event_queue.mutex);
+    
     printf("[*] Statistics:\n");
     printf("    Total events processed: %lu\n", total_events);
     printf("    Suspicious findings: %lu\n", suspicious_found);
     printf("    Race conditions (normal): %lu\n", race_conditions);
+    printf("    Queue drops (overload): %lu\n", queue_drops);
     close(nl_sock);
     exit(0);
 }
@@ -123,9 +157,25 @@ int scan_with_yara(const char *filename) {
 }
 #endif
 
-void dump_memory_region(pid_t pid, unsigned long start, unsigned long end) {
+void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int skip_large) {
     char mem_path[64];
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+
+    size_t size = end - start;
+    
+    // Check for overflow and excessively large regions
+    if (end < start || size > 1024*1024*1024) {
+        fprintf(stderr, "[-] Invalid or too large memory region: %zu bytes\n", size);
+        return;
+    }
+    
+    // In high-load environments, skip dumping large regions to prevent buffer overflow
+    // Log the region for manual investigation instead
+    if (skip_large && size > 10*1024*1024) {  // > 10MB
+        printf("[INFO] Skipping dump of large region (manual investigation recommended): PID=%d range=0x%lx-0x%lx size=%zuMB\n",
+               pid, start, end, size/(1024*1024));
+        return;
+    }
 
     int mem_fd = open(mem_path, O_RDONLY);
     if (mem_fd < 0) {
@@ -143,15 +193,6 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end) {
     }
 
     lseek(mem_fd, start, SEEK_SET);
-    size_t size = end - start;
-    
-    // Check for overflow and excessively large regions (limit to 1GB)
-    if (end < start || size > 1024*1024*1024) {
-        fprintf(stderr, "[-] Invalid or too large memory region: %zu bytes\n", size);
-        close(mem_fd);
-        close(out_fd);
-        return;
-    }
     
     char *buffer = malloc(size);
     if (!buffer) {
@@ -224,7 +265,9 @@ void check_exe_link(pid_t pid) {
     ssize_t len = readlink(exe_path, exe_target, sizeof(exe_target) - 1);
     if (len == -1) {
         // Process likely exited before we could read it - this is normal
+        pthread_mutex_lock(&stats_mutex);
         race_conditions++;
+        pthread_mutex_unlock(&stats_mutex);
         if (!quiet_mode) {
             // Only print if it's NOT a permission denied or no such file error
             if (errno != ENOENT && errno != EACCES) {
@@ -268,6 +311,33 @@ void check_env_vars(pid_t pid) {
     }
 }
 
+// Check if process should be ignored (Docker/container infrastructure)
+int should_ignore_process(pid_t pid) {
+    char comm_path[64], comm[256] = "";
+    
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    FILE *comm_file = fopen(comm_path, "r");
+    if (!comm_file) return 0;
+    
+    if (fgets(comm, sizeof(comm), comm_file)) {
+        size_t len = strlen(comm);
+        if (len > 0 && comm[len-1] == '\n')
+            comm[len-1] = '\0';
+    }
+    fclose(comm_file);
+    
+    // Ignore Docker/container infrastructure processes
+    if (strstr(comm, "runc") || 
+        strstr(comm, "containerd-shim") ||
+        strstr(comm, "docker-proxy") ||
+        strstr(comm, "dockerd") ||
+        strcmp(comm, "containerd") == 0) {
+        return 1;
+    }
+    
+    return 0;
+}
+
 void scan_maps_and_dump(pid_t pid) {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -275,7 +345,9 @@ void scan_maps_and_dump(pid_t pid) {
     FILE *maps = fopen(maps_path, "r");
     if (!maps) {
         // Process likely exited - this is a race condition, not an error
+        pthread_mutex_lock(&stats_mutex);
         race_conditions++;
+        pthread_mutex_unlock(&stats_mutex);
         return;
     }
 
@@ -337,16 +409,22 @@ void scan_maps_and_dump(pid_t pid) {
             reason = "Executable heap (shellcode/injection)";
         }
         // 5. Large anonymous writable mappings (staged payloads) - only warn in verbose mode
+        // NOTE: Disabled even in verbose mode during high-load - causes I/O delays
+        // Re-enable only for targeted forensic analysis
+        /*
         else if (!quiet_mode && is_writable && is_anonymous && (end - start) > 10*1024*1024 && // > 10MB
                  strstr(path, "[stack]") == NULL && strstr(path, "[heap]") == NULL) {
             // These could become executable later via mprotect
             printf("[WARN] Large anonymous writable region in PID %d: %lx-%lx (%s) size=%luMB\n", 
                    pid, start, end, perms, (end-start)/(1024*1024));
         }
+        */
 
         if (suspicious) {
             suspicious_count++;
+            pthread_mutex_lock(&stats_mutex);
             suspicious_found++;
+            pthread_mutex_unlock(&stats_mutex);
             
             // Always print alerts, even in quiet mode
             if (quiet_mode) {
@@ -357,7 +435,11 @@ void scan_maps_and_dump(pid_t pid) {
                 printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
             }
             
-            dump_memory_region(pid, start, end);
+            // Only dump memory if --mem_dump flag is enabled
+            if (mem_dump) {
+                // In quiet mode, skip dumping large regions to prevent I/O blocking
+                dump_memory_region(pid, start, end, quiet_mode);
+            }
         }
     }
     fclose(maps);
@@ -367,30 +449,115 @@ void scan_maps_and_dump(pid_t pid) {
     }
 }
 
+// Initialize event queue
+void queue_init(event_queue_t *q) {
+    memset(q, 0, sizeof(event_queue_t));
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    pthread_cond_init(&q->not_full, NULL);
+    q->shutdown = 0;
+}
+
+// Non-blocking enqueue (returns 0 on success, -1 if full)
+int queue_push(event_queue_t *q, pid_t pid, pid_t ppid) {
+    pthread_mutex_lock(&q->mutex);
+    
+    if (q->count >= EVENT_QUEUE_SIZE) {
+        // Queue full - drop event and track it
+        pthread_mutex_lock(&stats_mutex);
+        queue_drops++;
+        pthread_mutex_unlock(&stats_mutex);
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    
+    q->events[q->tail].pid = pid;
+    q->events[q->tail].ppid = ppid;
+    q->tail = (q->tail + 1) % EVENT_QUEUE_SIZE;
+    q->count++;
+    
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+// Blocking dequeue (returns 0 on success, -1 on shutdown)
+int queue_pop(event_queue_t *q, event_data_t *event) {
+    pthread_mutex_lock(&q->mutex);
+    
+    while (q->count == 0 && !q->shutdown) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+    
+    if (q->shutdown && q->count == 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    
+    *event = q->events[q->head];
+    q->head = (q->head + 1) % EVENT_QUEUE_SIZE;
+    q->count--;
+    
+    pthread_cond_signal(&q->not_full);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+// Worker thread function
+void *worker_thread(void *arg) {
+    (void)arg;  // Unused
+    
+    while (1) {
+        event_data_t event;
+        if (queue_pop(&event_queue, &event) < 0) {
+            // Shutdown signal received
+            break;
+        }
+        
+        // Skip Docker/container infrastructure processes
+        if (should_ignore_process(event.pid)) {
+            continue;
+        }
+        
+        if (!quiet_mode) {
+            printf("\n[EXEC] PID=%d PPID=%d (thread=%lu)\n", 
+                   event.pid, event.ppid, pthread_self());
+        }
+        
+        scan_maps_and_dump(event.pid);
+        
+        if (!quiet_mode) {
+            printf("========================================\n");
+        }
+    }
+    
+    return NULL;
+}
+
 void handle_proc_event(struct cn_msg *cn_hdr) {
     struct proc_event *ev = (struct proc_event *)cn_hdr->data;
 
     if (ev->what == PROC_EVENT_EXEC) {
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
+        
+        pthread_mutex_lock(&stats_mutex);
         total_events++;
+        pthread_mutex_unlock(&stats_mutex);
         
-        if (!quiet_mode) {
-            printf("\n[EXEC] PID=%d PPID=%d\n", pid, ppid);
-        }
-        
-        // No delay - process immediately to drain kernel buffer faster
-        // Short-lived processes will race but that's OK
-        scan_maps_and_dump(pid);
-        
-        if (!quiet_mode) {
-            printf("========================================\n");
+        // Non-blocking push to queue - if queue is full, event is dropped (tracked in stats)
+        if (queue_push(&event_queue, pid, ppid) < 0) {
+            if (!quiet_mode) {
+                fprintf(stderr, "[!] WARNING: Event queue full, dropped event for PID %d\n", pid);
+            }
         }
     }
 }
 
 int main(int argc, char **argv) {
     signal(SIGINT, cleanup);
+
+    int num_threads = 4;  // Default number of worker threads
 
     // Parse command line arguments
     for (int i = 1; i < argc; i++) {
@@ -408,6 +575,14 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--quiet") == 0 || strcmp(argv[i], "-q") == 0) {
             quiet_mode = 1;
             printf("[+] Quiet mode enabled (only critical alerts)\n");
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            num_threads = atoi(argv[++i]);
+            if (num_threads < 1) num_threads = 1;
+            if (num_threads > MAX_WORKER_THREADS) num_threads = MAX_WORKER_THREADS;
+            printf("[+] Using %d worker threads\n", num_threads);
+        } else if (strcmp(argv[i], "--mem_dump") == 0) {
+            mem_dump = 1;
+            printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Real-time process monitoring for malware detection\n\n");
@@ -415,6 +590,8 @@ int main(int argc, char **argv) {
             printf("  --yara <file>     Enable YARA scanning with specified rules file\n");
             printf("  --continuous      Enable continuous monitoring (rescan processes every 30s)\n");
             printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
+            printf("  --threads <N>     Number of worker threads (1-%d, default: 4)\n", MAX_WORKER_THREADS);
+            printf("  --mem_dump        Enable memory dumping to disk (default: off)\n")
             printf("  --help, -h        Show this help message\n\n");
             printf("Detection capabilities:\n");
             printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
@@ -422,10 +599,27 @@ int main(int argc, char **argv) {
             printf("  - RWX memory regions (JIT spray, self-modifying code)\n");
             printf("  - Fileless execution techniques\n");
             printf("  - Heap/stack code execution\n");
-            printf("  - Suspicious environment variables (LD_PRELOAD)\n");
+            printf("  - Suspicious environment variables (LD_PRELOAD)\n\n");
+            printf("Multi-threaded architecture:\n");
+            printf("  - Main thread rapidly drains netlink socket (no blocking)\n");
+            printf("  - Worker threads process events asynchronously\n");
+            printf("  - Prevents 'No buffer space available' in high-load environments\n");
             return 0;
         }
     }
+
+    // Initialize event queue
+    queue_init(&event_queue);
+
+    // Create worker threads
+    pthread_t workers[MAX_WORKER_THREADS];
+    for (int i = 0; i < num_threads; i++) {
+        if (pthread_create(&workers[i], NULL, worker_thread, NULL) != 0) {
+            perror("pthread_create");
+            return 1;
+        }
+    }
+    printf("[+] Started %d worker threads for async processing\n", num_threads);
 
     nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
     if (nl_sock == -1) {

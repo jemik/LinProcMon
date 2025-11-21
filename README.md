@@ -1,6 +1,6 @@
 # LinProcMon
 
-Real-time Linux process monitoring tool designed to detect malware, memory injection, fileless execution, and in-memory payload unpacking techniques.
+Real-time Linux process monitoring tool designed to detect malware, memory injection, fileless execution, and in-memory payload unpacking techniques. **Now with multi-threaded architecture for high-load container environments!**
 
 ## Overview
 
@@ -12,16 +12,20 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 - **Fileless Execution**: Catches execution from deleted files, memfd, and temporary locations
 - **Heap/Stack Execution**: Identifies shellcode execution in non-standard memory regions
 - **Environment Variable Inspection**: Detects LD_PRELOAD and LD_LIBRARY_PATH hijacking
-- **Memory Dumping**: Automatically dumps suspicious memory regions for forensic analysis
+- **Optional Memory Dumping**: Dumps suspicious memory regions for forensic analysis (disabled by default for performance)
 - **YARA Integration**: Optional malware scanning of dumped memory regions
 
 ## Features
 
-- ✅ Real-time process monitoring via netlink connector
+- ✅ **Multi-threaded architecture** - Producer-consumer pattern prevents buffer overflow in high-load environments
+- ✅ Real-time process monitoring via netlink connector (16MB kernel buffer)
 - ✅ Comprehensive memory injection detection
-- ✅ Automatic memory dumping of suspicious regions
+- ✅ Optional memory dumping (--mem_dump flag)
 - ✅ Optional YARA rule scanning
+- ✅ **Docker/container aware** - Filters noisy infrastructure processes (runc, containerd-shim)
 - ✅ Continuous monitoring mode (rescans running processes)
+- ✅ Quiet mode for production use (--quiet)
+- ✅ Configurable worker threads (1-8 threads)
 - ✅ Low overhead, suitable for production environments
 - ✅ Detailed alerting with reason codes
 - ✅ Self-contained static binary support (no dependencies)
