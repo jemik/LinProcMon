@@ -11,6 +11,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <linux/netlink.h>
 #include <linux/connector.h>
 #include <linux/cn_proc.h>
@@ -30,17 +31,26 @@
 // Note: No delay for process initialization - prioritize event processing speed
 // Short-lived processes may race (exit before we read them) - this is acceptable
 
+volatile sig_atomic_t running = 1;  // Main loop control flag
 int nl_sock;
 const char* yara_rules_path = NULL;
 int continuous_scan = 0;  // Flag for continuous monitoring of all processes
 int quiet_mode = 0;  // Suppress non-critical messages
 int mem_dump = 0;  // Enable memory dumping to disk
+int sandbox_mode = 0;  // Sandbox mode: monitor specific process tree
+pid_t sandbox_root_pid = 0;  // Root PID for sandbox monitoring
+char* sandbox_binary = NULL;  // Binary to execute in sandbox mode
+char** sandbox_args = NULL;  // Arguments for sandbox binary
+int sandbox_args_count = 0;  // Number of arguments
 
 // Statistics (now protected by mutex)
 static unsigned long total_events = 0;
 static unsigned long suspicious_found = 0;
 static unsigned long race_conditions = 0;
 static unsigned long queue_drops = 0;
+static unsigned long sandbox_events = 0;  // Events from sandbox process tree
+static unsigned long files_created = 0;  // Files created by sandbox
+static unsigned long sockets_created = 0;  // Network connections by sandbox
 
 // Thread-safe event queue
 typedef struct {
@@ -63,6 +73,7 @@ event_queue_t event_queue;
 pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void cleanup(int sig) {
+    running = 0;  // Signal main loop to exit
     printf("\n[!] Exiting...\n");
     
     // Signal shutdown and wake up worker threads
@@ -76,6 +87,11 @@ void cleanup(int sig) {
     printf("    Suspicious findings: %lu\n", suspicious_found);
     printf("    Race conditions (normal): %lu\n", race_conditions);
     printf("    Queue drops (overload): %lu\n", queue_drops);
+    if (sandbox_mode) {
+        printf("    Sandbox events: %lu\n", sandbox_events);
+        printf("    Files created: %lu\n", files_created);
+        printf("    Sockets created: %lu\n", sockets_created);
+    }
     close(nl_sock);
     exit(0);
 }
@@ -343,6 +359,129 @@ int should_ignore_process(pid_t pid) {
     return 0;
 }
 
+// Helper function to check if path is a legitimate system binary/library
+static int is_legitimate_path(const char *path) {
+    if (strlen(path) == 0) return 0;  // Anonymous
+    
+    // Whitelist common legitimate paths
+    const char *legitimate_prefixes[] = {
+        "/usr/lib", "/lib", "/lib64",           // System libraries
+        "/usr/bin", "/bin", "/sbin",            // System binaries
+        "/opt/",                                 // Optional software
+        "/usr/local/",                           // User-installed software
+        "/snap/",                                // Snap packages
+        "/var/lib/snapd",                        // Snap runtime
+        "[vdso]", "[vvar]", "[vsyscall]",       // Kernel pages
+        "[stack]", "[heap]"                      // Process memory
+    };
+    
+    for (size_t i = 0; i < sizeof(legitimate_prefixes)/sizeof(legitimate_prefixes[0]); i++) {
+        if (strstr(path, legitimate_prefixes[i]) == path) {  // Starts with prefix
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Check if PID belongs to sandbox process tree
+static int is_sandbox_process(pid_t pid) {
+    if (!sandbox_mode) return 0;
+    if (pid == sandbox_root_pid) return 1;
+    
+    // Check if this process is a descendant of sandbox root
+    pid_t current = pid;
+    for (int depth = 0; depth < 100; depth++) {  // Max depth to prevent infinite loop
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
+        
+        FILE *f = fopen(stat_path, "r");
+        if (!f) return 0;  // Process doesn't exist
+        
+        pid_t ppid;
+        // Parse: pid (comm) state ppid
+        if (fscanf(f, "%*d %*s %*c %d", &ppid) != 1) {
+            fclose(f);
+            return 0;
+        }
+        fclose(f);
+        
+        if (ppid == sandbox_root_pid) return 1;  // Parent is sandbox root
+        if (ppid <= 1) return 0;  // Reached init/kernel
+        
+        current = ppid;
+    }
+    return 0;
+}
+
+// Monitor file creation by sandbox process
+static void check_file_operations(pid_t pid) {
+    if (!sandbox_mode || !is_sandbox_process(pid)) return;
+    
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
+    
+    DIR *fd_dir = opendir(fd_path);
+    if (!fd_dir) return;
+    
+    struct dirent *entry;
+    while ((entry = readdir(fd_dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        char link_path[128];
+        char target[PATH_MAX];
+        snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
+        
+        ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+        if (len > 0) {
+            target[len] = '\0';
+            
+            // Check for suspicious file creation
+            if (strstr(target, "/tmp/") || strstr(target, "/dev/shm/") || 
+                strstr(target, "/var/tmp/")) {
+                printf("[SANDBOX] File created: %s (PID=%d)\n", target, pid);
+                pthread_mutex_lock(&stats_mutex);
+                files_created++;
+                pthread_mutex_unlock(&stats_mutex);
+            }
+        }
+    }
+    closedir(fd_dir);
+}
+
+// Monitor network connections by sandbox process
+static void check_network_connections(pid_t pid) {
+    if (!sandbox_mode || !is_sandbox_process(pid)) return;
+    
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
+    
+    DIR *fd_dir = opendir(fd_path);
+    if (!fd_dir) return;
+    
+    struct dirent *entry;
+    while ((entry = readdir(fd_dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        char link_path[128];
+        char target[PATH_MAX];
+        snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
+        
+        ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+        if (len > 0) {
+            target[len] = '\0';
+            
+            // Check for socket creation
+            if (strstr(target, "socket:") != NULL) {
+                printf("[SANDBOX] Socket created: %s (PID=%d)\n", target, pid);
+                pthread_mutex_lock(&stats_mutex);
+                sockets_created++;
+                pthread_mutex_unlock(&stats_mutex);
+            }
+        }
+    }
+    closedir(fd_dir);
+}
+
 void scan_maps_and_dump(pid_t pid) {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -354,6 +493,16 @@ void scan_maps_and_dump(pid_t pid) {
         race_conditions++;
         pthread_mutex_unlock(&stats_mutex);
         return;
+    }
+
+    // Check if this is a sandbox process
+    if (sandbox_mode && is_sandbox_process(pid)) {
+        pthread_mutex_lock(&stats_mutex);
+        sandbox_events++;
+        pthread_mutex_unlock(&stats_mutex);
+        printf("[SANDBOX] Monitoring PID %d\n", pid);
+        check_file_operations(pid);
+        check_network_connections(pid);
     }
 
     // First read process info and check for obvious red flags
@@ -368,30 +517,6 @@ void scan_maps_and_dump(pid_t pid) {
 
     char line[MAX_LINE];
     int suspicious_count = 0;
-    
-    // Helper function to check if path is a legitimate system binary/library
-    int is_legitimate_path(const char *path) {
-        if (strlen(path) == 0) return 0;  // Anonymous
-        
-        // Whitelist common legitimate paths
-        const char *legitimate_prefixes[] = {
-            "/usr/lib", "/lib", "/lib64",           // System libraries
-            "/usr/bin", "/bin", "/sbin",            // System binaries
-            "/opt/",                                 // Optional software
-            "/usr/local/",                           // User-installed software
-            "/snap/",                                // Snap packages
-            "/var/lib/snapd",                        // Snap runtime
-            "[vdso]", "[vvar]", "[vsyscall]",       // Kernel pages
-            "[stack]", "[heap]"                      // Process memory
-        };
-        
-        for (size_t i = 0; i < sizeof(legitimate_prefixes)/sizeof(legitimate_prefixes[0]); i++) {
-            if (strstr(path, legitimate_prefixes[i]) == path) {  // Starts with prefix
-                return 1;
-            }
-        }
-        return 0;
-    }
     
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
@@ -561,6 +686,11 @@ void *worker_thread(void *arg) {
             continue;
         }
         
+        // In sandbox mode, only monitor sandbox process tree
+        if (sandbox_mode && !is_sandbox_process(event.pid)) {
+            continue;
+        }
+        
         if (!quiet_mode) {
             printf("\n[EXEC] PID=%d PPID=%d (thread=%lu)\n", 
                    event.pid, event.ppid, pthread_self());
@@ -579,9 +709,31 @@ void *worker_thread(void *arg) {
 void handle_proc_event(struct cn_msg *cn_hdr) {
     struct proc_event *ev = (struct proc_event *)cn_hdr->data;
 
+    // Debug: always log that we got an event
+    static int event_count = 0;
+    event_count++;
+    if (sandbox_mode && event_count < 20) {  // Limit spam
+        fprintf(stderr, "[DEBUG] handle_proc_event called, event type=%d\n", ev->what);
+        fflush(stderr);
+    }
+
+    // Debug: log event types in sandbox mode
+    if (sandbox_mode && !quiet_mode) {
+        if (ev->what != PROC_EVENT_EXEC && ev->what != PROC_EVENT_FORK) {
+            // Uncomment to debug other event types:
+            // printf("[DEBUG] Event type: %d\n", ev->what);
+        }
+    }
+
     if (ev->what == PROC_EVENT_EXEC) {
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
+        
+        // Debug sandbox events - force flush
+        if (sandbox_mode) {
+            fprintf(stderr, "[DEBUG] EXEC event: PID=%d PPID=%d sandbox_root=%d\n", pid, ppid, sandbox_root_pid);
+            fflush(stderr);
+        }
         
         pthread_mutex_lock(&stats_mutex);
         total_events++;
@@ -599,6 +751,10 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
         // Check child process for inherited malicious mappings
         pid_t child_pid = ev->event_data.fork.child_pid;
         pid_t parent_pid = ev->event_data.fork.parent_pid;
+        
+        if (!quiet_mode || (sandbox_mode && is_sandbox_process(parent_pid))) {
+            printf("[FORK] Parent=%d Child=%d\n", parent_pid, child_pid);
+        }
         
         pthread_mutex_lock(&stats_mutex);
         total_events++;
@@ -642,6 +798,26 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--mem_dump") == 0) {
             mem_dump = 1;
             printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
+        } else if (strcmp(argv[i], "--sandbox") == 0 && i + 1 < argc) {
+            sandbox_mode = 1;
+            sandbox_binary = argv[++i];
+            
+            // Collect remaining args for the sandbox binary
+            sandbox_args_count = argc - i;
+            sandbox_args = malloc((sandbox_args_count + 1) * sizeof(char*));
+            sandbox_args[0] = sandbox_binary;
+            for (int j = 1; j < sandbox_args_count; j++) {
+                sandbox_args[j] = argv[i + j];
+            }
+            sandbox_args[sandbox_args_count] = NULL;
+            
+            printf("[+] Sandbox mode enabled\n");
+            printf("[+] Will execute: %s", sandbox_binary);
+            for (int j = 1; j < sandbox_args_count; j++) {
+                printf(" %s", sandbox_args[j]);
+            }
+            printf("\n");
+            break;  // No more args to parse
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             printf("Usage: %s [OPTIONS]\n", argv[0]);
             printf("Real-time process monitoring for malware detection\n\n");
@@ -651,6 +827,8 @@ int main(int argc, char **argv) {
             printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
             printf("  --threads <N>     Number of worker threads (1-%d, default: 4)\n", MAX_WORKER_THREADS);
             printf("  --mem_dump        Enable memory dumping to disk (default: off)\n");
+            printf("  --sandbox <bin>   Sandbox mode: execute and monitor specific binary\n");
+            printf("                    All remaining arguments are passed to the binary\n");
             printf("  --help, -h        Show this help message\n\n");
             printf("Detection capabilities:\n");
             printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
@@ -658,7 +836,15 @@ int main(int argc, char **argv) {
             printf("  - RWX memory regions (JIT spray, self-modifying code)\n");
             printf("  - Fileless execution techniques\n");
             printf("  - Heap/stack code execution\n");
-            printf("  - Suspicious environment variables (LD_PRELOAD)\n\n");
+            printf("  - Suspicious environment variables (LD_PRELOAD)\n");
+            printf("  - File operations in /tmp, /dev/shm (sandbox mode)\n");
+            printf("  - Network socket creation (sandbox mode)\n\n");
+            printf("Sandbox mode examples:\n");
+            printf("  Monitor binary:      %s --sandbox ./malware\n", argv[0]);
+            printf("  With arguments:      %s --sandbox ./malware arg1 arg2\n", argv[0]);
+            printf("  Python script:       %s --sandbox python3 script.py arg1\n", argv[0]);
+            printf("  Bash script:         %s --sandbox bash script.sh\n", argv[0]);
+            printf("  With memory dump:    %s --sandbox --mem_dump ./malware\n\n", argv[0]);
             printf("Multi-threaded architecture:\n");
             printf("  - Main thread rapidly drains netlink socket (no blocking)\n");
             printf("  - Worker threads process events asynchronously\n");
@@ -681,27 +867,30 @@ int main(int argc, char **argv) {
     printf("[+] Started %d worker threads for async processing\n", num_threads);
 
     // Perform initial scan of all running processes to catch existing threats
-    printf("[+] Performing initial scan of running processes...\n");
-    DIR *proc_dir = opendir("/proc");
-    if (proc_dir) {
-        struct dirent *entry;
-        int scanned = 0;
-        while ((entry = readdir(proc_dir)) != NULL) {
-            if (entry->d_type == DT_DIR) {
-                pid_t pid = atoi(entry->d_name);
-                if (pid > 0) {
-                    // Queue for worker threads to scan
-                    if (!should_ignore_process(pid)) {
-                        queue_push(&event_queue, pid, 0);
-                        scanned++;
+    // Skip this in sandbox mode - we only care about the sandbox process tree
+    if (!sandbox_mode) {
+        printf("[+] Performing initial scan of running processes...\n");
+        DIR *proc_dir = opendir("/proc");
+        if (proc_dir) {
+            struct dirent *entry;
+            int scanned = 0;
+            while ((entry = readdir(proc_dir)) != NULL) {
+                if (entry->d_type == DT_DIR) {
+                    pid_t pid = atoi(entry->d_name);
+                    if (pid > 0) {
+                        // Queue for worker threads to scan
+                        if (!should_ignore_process(pid)) {
+                            queue_push(&event_queue, pid, 0);
+                            scanned++;
+                        }
                     }
                 }
             }
+            closedir(proc_dir);
+            printf("[+] Initial scan queued %d processes\n", scanned);
+            // Give workers time to process the initial scan
+            sleep(2);
         }
-        closedir(proc_dir);
-        printf("[+] Initial scan queued %d processes\n", scanned);
-        // Give workers time to process the initial scan
-        sleep(2);
     }
 
     nl_sock = socket(PF_NETLINK, SOCK_DGRAM, NETLINK_CONNECTOR);
@@ -765,11 +954,72 @@ int main(int argc, char **argv) {
         printf("[+] Continuous monitoring active - will rescan all processes every 30 seconds\n");
     }
 
-    time_t last_full_scan = time(NULL);
+    // If sandbox mode, execute the binary and monitor its process tree
+    if (sandbox_mode) {
+        printf("[+] Launching sandbox process...\n");
+        
+        pid_t child_pid = fork();
+        if (child_pid == -1) {
+            perror("fork");
+            return 1;
+        }
+        
+        if (child_pid == 0) {
+            // Child process - execute the sandbox binary
+            // Auto-detect scripts based on file extension
+            if (strstr(sandbox_binary, ".py") != NULL) {
+                // Python script - prepend python3
+                char **new_args = malloc((sandbox_args_count + 2) * sizeof(char*));
+                new_args[0] = "python3";
+                for (int i = 0; i < sandbox_args_count; i++) {
+                    new_args[i + 1] = sandbox_args[i];
+                }
+                new_args[sandbox_args_count + 1] = NULL;
+                execvp("python3", new_args);
+                perror("execvp python3");
+            } else if (strstr(sandbox_binary, ".sh") != NULL) {
+                // Bash script - prepend bash
+                char **new_args = malloc((sandbox_args_count + 2) * sizeof(char*));
+                new_args[0] = "bash";
+                for (int i = 0; i < sandbox_args_count; i++) {
+                    new_args[i + 1] = sandbox_args[i];
+                }
+                new_args[sandbox_args_count + 1] = NULL;
+                execvp("bash", new_args);
+                perror("execvp bash");
+            } else {
+                // Direct execution - use execvp to search PATH
+                execvp(sandbox_binary, sandbox_args);
+                perror("execvp");
+            }
+            
+            // If exec fails
+            exit(1);
+        }
+        
+        // Parent process - store sandbox root PID
+        sandbox_root_pid = child_pid;
+        printf("[+] Sandbox process started with PID %d\n", sandbox_root_pid);
+        printf("[+] Monitoring process tree...\n");
+        
+        // Give the process a moment to start and then scan it
+        usleep(100000); // 100ms
+        queue_push(&event_queue, sandbox_root_pid, 0);
+    }
 
-    while (1) {
+    time_t last_full_scan = time(NULL);
+    time_t last_sandbox_scan = time(NULL);
+
+    while (running) {
         char buf[65536];  // 64KB buffer to handle many events at once
         ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
+        
+        // Debug netlink activity
+        static int recv_count = 0;
+        if (sandbox_mode && len > 0 && recv_count++ < 10) {
+            fprintf(stderr, "[DEBUG] Received %zd bytes from netlink\n", len);
+            fflush(stderr);
+        }
         
         if (len == -1) {
             if (errno == EINTR) {
@@ -777,6 +1027,57 @@ int main(int argc, char **argv) {
             }
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // No data available - check if we should do a full scan
+                
+                // Check if sandbox process has exited
+                if (sandbox_mode && sandbox_root_pid > 0) {
+                    int status;
+                    pid_t result = waitpid(sandbox_root_pid, &status, WNOHANG);
+                    if (result == sandbox_root_pid) {
+                        printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                        if (WIFEXITED(status)) {
+                            printf("[+] Exit code: %d\n", WEXITSTATUS(status));
+                        } else if (WIFSIGNALED(status)) {
+                            printf("[+] Killed by signal: %d\n", WTERMSIG(status));
+                        }
+                        printf("[+] Sandbox monitoring complete. Shutting down...\n");
+                        running = 0;
+                    } else if (result == -1 && errno == ECHILD) {
+                        // Child already exited
+                        printf("\n[+] Sandbox process has terminated\n");
+                        running = 0;
+                    } else {
+                        // Process still running - rescan it periodically to catch memory changes
+                        time_t now = time(NULL);
+                        if (now - last_sandbox_scan >= 1) {
+                            // Rescan sandbox process every second
+                            queue_push(&event_queue, sandbox_root_pid, 0);
+                            
+                            // Also scan for any child processes of sandbox
+                            char task_path[256];
+                            snprintf(task_path, sizeof(task_path), "/proc/%d/task/%d/children", 
+                                     sandbox_root_pid, sandbox_root_pid);
+                            FILE *children_file = fopen(task_path, "r");
+                            if (children_file) {
+                                char line[1024];
+                                if (fgets(line, sizeof(line), children_file)) {
+                                    // Parse space-separated PIDs
+                                    char *token = strtok(line, " \n");
+                                    while (token) {
+                                        pid_t child_pid = atoi(token);
+                                        if (child_pid > 0) {
+                                            queue_push(&event_queue, child_pid, sandbox_root_pid);
+                                        }
+                                        token = strtok(NULL, " \n");
+                                    }
+                                }
+                                fclose(children_file);
+                            }
+                            
+                            last_sandbox_scan = now;
+                        }
+                    }
+                }
+                
                 if (continuous_scan) {
                     time_t now = time(NULL);
                     if (now - last_full_scan >= 30) {

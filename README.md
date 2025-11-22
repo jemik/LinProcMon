@@ -18,6 +18,7 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 ## Features
 
 - ✅ **Multi-threaded architecture** - Producer-consumer pattern prevents buffer overflow in high-load environments
+- ✅ **Sandbox mode** - Execute and monitor specific binaries, Python scripts, or bash scripts with full process tree tracking
 - ✅ Real-time process monitoring via netlink connector (16MB kernel buffer)
 - ✅ Comprehensive memory injection detection
 - ✅ Optional memory dumping (--mem_dump flag)
@@ -150,10 +151,58 @@ sudo ./realtime_memdump_tool --continuous --quiet
 ./realtime_memdump_tool --help
 ```
 
+### Sandbox Mode (New!)
+
+Execute and monitor a specific binary or script for malicious behavior:
+
+**Monitor binary execution:**
+```bash
+sudo ./realtime_memdump_tool --sandbox ./malware
+```
+
+**With command-line arguments:**
+```bash
+sudo ./realtime_memdump_tool --sandbox ./malware arg1 arg2
+```
+
+**Monitor Python script:**
+```bash
+sudo ./realtime_memdump_tool --sandbox python3 script.py arg1
+# Or with .py extension auto-detection:
+sudo ./realtime_memdump_tool --sandbox script.py arg1
+```
+
+**Monitor bash script:**
+```bash
+sudo ./realtime_memdump_tool --sandbox bash script.sh
+# Or with .sh extension auto-detection:
+sudo ./realtime_memdump_tool --sandbox script.sh
+```
+
+**Sandbox with memory dumping:**
+```bash
+sudo ./realtime_memdump_tool --sandbox --mem_dump ./suspicious_binary
+```
+
+**Sandbox with YARA scanning:**
+```bash
+sudo ./realtime_memdump_tool --sandbox --mem_dump --yara rules.yar ./malware
+```
+
+**What sandbox mode monitors:**
+- All processes in the sandbox process tree (parent, children, grandchildren)
+- Memory injection, RWX regions, memfd execution, process hollowing
+- File creation in suspicious directories (/tmp, /dev/shm, /var/tmp)
+- Network socket creation
+- Spawned child processes and their behavior
+
+The tool automatically exits when the sandbox process and all its children terminate.
+
 ### Command-Line Options
 
 | Option | Description |
 |--------|-------------|
+| `--sandbox <bin>` | **Sandbox mode**: Execute and monitor specific binary/script with full process tree tracking |
 | `--quiet, -q` | Quiet mode (suppress non-critical messages, compact alerts) |
 | `--threads <N>` | Number of worker threads (1-8, default: 4) |
 | `--mem_dump` | Enable memory dumping to disk (default: off for performance) |
@@ -162,6 +211,11 @@ sudo ./realtime_memdump_tool --continuous --quiet
 | `--help, -h` | Show help message |
 
 ### Recommended Configurations
+
+**Malware Analysis (sandbox mode):**
+```bash
+sudo ./realtime_memdump_tool --sandbox --mem_dump --yara rules.yar ./malware.bin
+```
 
 **SOC/SIEM Integration (maximum performance):**
 ```bash
@@ -216,6 +270,27 @@ sudo ./realtime_memdump_tool --quiet --threads 8
     Race conditions (normal): 128
     Queue drops (overload): 0
 ```
+
+### Sandbox Mode Statistics
+
+When running in sandbox mode, additional statistics are shown:
+
+```
+[!] Exiting...
+[*] Statistics:
+    Total events processed: 47
+    Suspicious findings: 2
+    Race conditions (normal): 0
+    Queue drops (overload): 0
+    Sandbox events: 47
+    Files created: 3
+    Sockets created: 1
+```
+
+**Metrics:**
+- `Sandbox events`: Number of events from the monitored process tree
+- `Files created`: Files created in suspicious directories (/tmp, /dev/shm, /var/tmp)
+- `Sockets created`: Network sockets opened by the sandbox process tree
 
 ### Memory Dumps (when --mem_dump is enabled)
 
@@ -428,6 +503,15 @@ If still seeing noise, add custom filtering in `should_ignore_process()` functio
 - Capture decrypted payloads from memory
 - Study malware injection techniques
 - Multi-threaded processing handles high analysis workload
+- **Sandbox mode**: Execute specific samples and monitor their complete behavior (file/network operations, process tree)
+
+### Malware Sandbox (New!)
+- Execute suspicious binaries in isolated environment with full monitoring
+- Track all spawned processes and their behavior
+- Monitor file creation in temporary directories
+- Detect network connections and C2 communication attempts
+- Automatically capture memory dumps of suspicious regions
+- Support for Python/bash script analysis
 
 ### Threat Hunting
 - Continuous monitoring mode to detect dormant threats
