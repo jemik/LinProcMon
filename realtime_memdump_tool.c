@@ -37,6 +37,7 @@ const char* yara_rules_path = NULL;
 int continuous_scan = 0;  // Flag for continuous monitoring of all processes
 int quiet_mode = 0;  // Suppress non-critical messages
 int mem_dump = 0;  // Enable memory dumping to disk
+int full_dump = 0;  // Enable full process memory dump (all regions)
 int sandbox_mode = 0;  // Sandbox mode: monitor specific process tree
 pid_t sandbox_root_pid = 0;  // Root PID for sandbox monitoring
 char* sandbox_binary = NULL;  // Binary to execute in sandbox mode
@@ -74,6 +75,69 @@ typedef struct {
 event_queue_t event_queue;
 pthread_mutex_t stats_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Asynchronous memory dump queue
+#define DUMP_QUEUE_SIZE 32
+typedef struct {
+    pid_t pids[DUMP_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    int shutdown;
+} dump_queue_t;
+
+dump_queue_t dump_queue;
+pthread_t dump_worker_thread;
+
+// Initialize dump queue
+void dump_queue_init(dump_queue_t *q) {
+    memset(q, 0, sizeof(dump_queue_t));
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    q->shutdown = 0;
+}
+
+// Queue a PID for background memory dumping
+int dump_queue_push(dump_queue_t *q, pid_t pid) {
+    pthread_mutex_lock(&q->mutex);
+    
+    if (q->count >= DUMP_QUEUE_SIZE) {
+        // Queue full - drop request
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    
+    q->pids[q->tail] = pid;
+    q->tail = (q->tail + 1) % DUMP_QUEUE_SIZE;
+    q->count++;
+    
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+// Dequeue a PID for dumping (blocking)
+int dump_queue_pop(dump_queue_t *q, pid_t *pid) {
+    pthread_mutex_lock(&q->mutex);
+    
+    while (q->count == 0 && !q->shutdown) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+    
+    if (q->shutdown && q->count == 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    
+    *pid = q->pids[q->head];
+    q->head = (q->head + 1) % DUMP_QUEUE_SIZE;
+    q->count--;
+    
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
 void cleanup(int sig) {
     running = 0;  // Signal main loop to exit
     printf("\n[!] Exiting...\n");
@@ -83,6 +147,14 @@ void cleanup(int sig) {
     event_queue.shutdown = 1;
     pthread_cond_broadcast(&event_queue.not_empty);
     pthread_mutex_unlock(&event_queue.mutex);
+    
+    // Signal dump thread to shutdown
+    if (full_dump) {
+        pthread_mutex_lock(&dump_queue.mutex);
+        dump_queue.shutdown = 1;
+        pthread_cond_signal(&dump_queue.not_empty);
+        pthread_mutex_unlock(&dump_queue.mutex);
+    }
     
     printf("[*] Statistics:\n");
     printf("    Total events processed: %lu\n", total_events);
@@ -210,7 +282,12 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int s
         return;
     }
 
-    lseek(mem_fd, start, SEEK_SET);
+    if (lseek(mem_fd, start, SEEK_SET) == -1) {
+        perror("[-] lseek");
+        close(mem_fd);
+        close(out_fd);
+        return;
+    }
     
     char *buffer = malloc(size);
     if (!buffer) {
@@ -222,15 +299,192 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int s
 
     ssize_t bytes = read(mem_fd, buffer, size);
     if (bytes > 0) {
-        write(out_fd, buffer, bytes);
-        printf("[+] Dumped %ld bytes to %s\n", bytes, out_filename);
-        if (yara_rules_path)
-            scan_with_yara(out_filename);
+        ssize_t written = write(out_fd, buffer, bytes);
+        if (written == bytes) {
+            printf("[+] Dumped %ld bytes to %s\n", bytes, out_filename);
+            if (yara_rules_path)
+                scan_with_yara(out_filename);
+        } else {
+            fprintf(stderr, "[-] Partial write: %ld/%ld bytes\n", written, bytes);
+        }
+    } else if (bytes < 0) {
+        perror("[-] read mem");
     }
 
     free(buffer);
     close(mem_fd);
     close(out_fd);
+}
+
+// Dump all memory regions of a process for dynamic unpacking analysis
+void dump_full_process_memory(pid_t pid) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    
+    FILE *maps = fopen(maps_path, "r");
+    if (!maps) {
+        perror("[-] open maps");
+        return;
+    }
+
+    // Create directory for this PID's dumps
+    char dump_dir[128];
+    snprintf(dump_dir, sizeof(dump_dir), "memdump_%d", pid);
+    mkdir(dump_dir, 0755);
+
+    // Get process name for dump metadata
+    char comm[256] = "unknown";
+    char comm_path[64];
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    FILE *comm_file = fopen(comm_path, "r");
+    if (comm_file) {
+        if (fgets(comm, sizeof(comm), comm_file)) {
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n')
+                comm[len-1] = '\0';
+        }
+        fclose(comm_file);
+    }
+
+    printf("[+] Dumping full memory for PID %d (%s) to %s/\n", pid, comm, dump_dir);
+
+    // Create map file for reference
+    char mapfile_path[256];
+    snprintf(mapfile_path, sizeof(mapfile_path), "%s/memory.map", dump_dir);
+    FILE *mapfile = fopen(mapfile_path, "w");
+    if (mapfile) {
+        fprintf(mapfile, "Memory map for PID %d (%s)\n", pid, comm);
+        fprintf(mapfile, "========================================\n\n");
+    }
+
+    int mem_fd = -1;
+    char mem_path[64];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+    mem_fd = open(mem_path, O_RDONLY);
+    if (mem_fd < 0) {
+        perror("[-] open /proc/PID/mem");
+        fclose(maps);
+        if (mapfile) fclose(mapfile);
+        return;
+    }
+
+    char line[512];
+    int region_count = 0;
+    size_t total_dumped = 0;
+
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start, end;
+        char perms[5], path[256] = "";
+        
+        int items = sscanf(line, "%lx-%lx %4s %*x %*s %*d %255[^\n]", &start, &end, perms, path);
+        if (items < 3) continue;
+
+        // Skip regions without read permission
+        if (perms[0] != 'r') continue;
+
+        size_t size = end - start;
+        if (size == 0 || size > 1024*1024*1024) continue;  // Skip invalid/huge regions
+
+        // Create filename based on region type
+        char region_name[128];
+        if (strlen(path) > 0 && path[0] == '/') {
+            // File-backed: use sanitized path
+            const char *basename = strrchr(path, '/');
+            snprintf(region_name, sizeof(region_name), "%04d_%s_0x%lx", region_count, basename ? basename+1 : "file", start);
+        } else if (strlen(path) > 0 && path[0] == '[') {
+            // Special region: [heap], [stack], [vdso], etc.
+            char clean_name[64];
+            strncpy(clean_name, path + 1, sizeof(clean_name) - 1);
+            char *bracket = strchr(clean_name, ']');
+            if (bracket) *bracket = '\0';
+            snprintf(region_name, sizeof(region_name), "%04d_%s_0x%lx", region_count, clean_name, start);
+        } else if (strstr(path, "memfd:") != NULL) {
+            // Fileless execution - CRITICAL for malware analysis
+            snprintf(region_name, sizeof(region_name), "%04d_MEMFD_0x%lx", region_count, start);
+        } else {
+            // Anonymous mapping
+            snprintf(region_name, sizeof(region_name), "%04d_anon_0x%lx", region_count, start);
+        }
+
+        char out_path[384];
+        snprintf(out_path, sizeof(out_path), "%s/%s.bin", dump_dir, region_name);
+
+        // Write to map file
+        if (mapfile) {
+            fprintf(mapfile, "[%04d] 0x%016lx-0x%016lx %s %10zu bytes %s -> %s.bin\n",
+                    region_count, start, end, perms, size, path, region_name);
+        }
+
+        // Dump the region
+        if (lseek(mem_fd, start, SEEK_SET) == -1) {
+            if (mapfile) fprintf(mapfile, "       [SEEK FAILED]\n");
+            region_count++;
+            continue;
+        }
+
+        int out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out_fd < 0) {
+            if (mapfile) fprintf(mapfile, "       [CREATE FAILED]\n");
+            region_count++;
+            continue;
+        }
+
+        // Read in chunks to handle large regions
+        size_t chunk_size = (size > 16*1024*1024) ? 16*1024*1024 : size;
+        char *buffer = malloc(chunk_size);
+        if (!buffer) {
+            close(out_fd);
+            if (mapfile) fprintf(mapfile, "       [MALLOC FAILED]\n");
+            region_count++;
+            continue;
+        }
+
+        size_t bytes_dumped = 0;
+        size_t remaining = size;
+        while (remaining > 0) {
+            size_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
+            ssize_t bytes = read(mem_fd, buffer, to_read);
+            if (bytes <= 0) break;
+            
+            ssize_t written = write(out_fd, buffer, bytes);
+            if (written != bytes) break;
+            
+            bytes_dumped += bytes;
+            remaining -= bytes;
+        }
+
+        free(buffer);
+        close(out_fd);
+
+        if (bytes_dumped > 0) {
+            total_dumped += bytes_dumped;
+            if (mapfile) {
+                fprintf(mapfile, "       [DUMPED %zu bytes]\n", bytes_dumped);
+            }
+            
+            // Scan with YARA if enabled and region looks interesting
+            if (yara_rules_path && (perms[2] == 'x' || strstr(path, "memfd:") || strlen(path) == 0)) {
+                scan_with_yara(out_path);
+            }
+        } else {
+            if (mapfile) fprintf(mapfile, "       [READ FAILED]\n");
+        }
+
+        region_count++;
+    }
+
+    close(mem_fd);
+    fclose(maps);
+    
+    if (mapfile) {
+        fprintf(mapfile, "\n========================================\n");
+        fprintf(mapfile, "Total regions: %d\n", region_count);
+        fprintf(mapfile, "Total dumped: %.2f MB\n", total_dumped / (1024.0 * 1024.0));
+        fclose(mapfile);
+    }
+
+    printf("[+] Full memory dump complete: %d regions, %.2f MB dumped\n", region_count, total_dumped / (1024.0 * 1024.0));
+    printf("[+] Memory map saved to: %s\n", mapfile_path);
 }
 
 void print_process_info(pid_t pid) {
@@ -613,6 +867,17 @@ void scan_maps_and_dump(pid_t pid) {
     }
     fclose(maps);
     
+    // If full_dump is enabled, queue for async memory dumping (non-blocking)
+    if (full_dump && suspicious_count > 0) {
+        if (dump_queue_push(&dump_queue, pid) < 0) {
+            if (!quiet_mode) {
+                printf("[WARN] Dump queue full, skipping full dump for PID %d\n", pid);
+            }
+        } else if (!quiet_mode) {
+            printf("[INFO] Queued PID %d for full memory dump (background)\n", pid);
+        }
+    }
+    
     if (suspicious_count > 0 && !quiet_mode) {
         printf("[!] Total suspicious regions found: %d\n", suspicious_count);
     }
@@ -749,6 +1014,32 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
     }
 }
 
+// Background thread for memory dumping (doesn't block monitoring)
+void* dump_worker(void *arg) {
+    (void)arg;
+    
+    while (1) {
+        pid_t pid;
+        if (dump_queue_pop(&dump_queue, &pid) < 0) {
+            // Shutdown signal received
+            break;
+        }
+        
+        // Check if process still exists before dumping
+        char proc_check[64];
+        snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+        if (access(proc_check, F_OK) != 0) {
+            printf("[WARN] PID %d exited before dump could start\n", pid);
+            continue;
+        }
+        
+        printf("[+] Starting background full memory dump for PID %d...\n", pid);
+        dump_full_process_memory(pid);
+    }
+    
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT, cleanup);
 
@@ -777,6 +1068,9 @@ int main(int argc, char **argv) {
             printf("[+] Using %d worker threads\n", num_threads);
         } else if (strcmp(argv[i], "--mem_dump") == 0) {
             mem_dump = 1;
+        } else if (strcmp(argv[i], "--full_dump") == 0) {
+            full_dump = 1;
+            mem_dump = 1;  // full_dump implies mem_dump
             printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
         } else if (strcmp(argv[i], "--sandbox-timeout") == 0 && i + 1 < argc) {
             sandbox_timeout = atoi(argv[++i]) * 60;  // Convert minutes to seconds
@@ -809,6 +1103,8 @@ int main(int argc, char **argv) {
             printf("  --quiet, -q       Quiet mode (suppress non-critical messages)\n");
             printf("  --threads <N>     Number of worker threads (1-%d, default: 4)\n", MAX_WORKER_THREADS);
             printf("  --mem_dump        Enable memory dumping to disk (default: off)\n");
+            printf("  --full_dump       Dump entire process memory (implies --mem_dump)\n");
+            printf("                    Creates memdump_PID/ directory with all regions\n");
             printf("  --sandbox <bin>   Sandbox mode: execute and monitor specific binary\n");
             printf("                    All remaining arguments are passed to the binary\n");
             printf("  --help, -h        Show this help message\n\n");
@@ -838,6 +1134,16 @@ int main(int argc, char **argv) {
 
     // Initialize event queue
     queue_init(&event_queue);
+
+    // Initialize dump queue if full_dump enabled
+    if (full_dump) {
+        dump_queue_init(&dump_queue);
+        if (pthread_create(&dump_worker_thread, NULL, dump_worker, NULL) != 0) {
+            perror("pthread_create dump_worker");
+            return 1;
+        }
+        printf("[+] Started background memory dump thread\n");
+    }
 
     // Create worker threads
     pthread_t workers[MAX_WORKER_THREADS];
