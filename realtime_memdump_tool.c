@@ -1013,6 +1013,7 @@ int main(int argc, char **argv) {
                     time_t now = time(NULL);
                     char proc_check[64];
                     snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
+                    int process_exists = (access(proc_check, F_OK) == 0);
                     
                     // Check if timeout expired
                     if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
@@ -1021,21 +1022,17 @@ int main(int argc, char **argv) {
                         running = 0;
                     }
                     // If no timeout set, check if root process exited
-                    else if (sandbox_timeout == 0) {
-                        if (access(proc_check, F_OK) != 0) {
-                            printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                            printf("[+] Sandbox monitoring complete. Shutting down...\n");
-                            running = 0;
-                        }
+                    else if (sandbox_timeout == 0 && !process_exists) {
+                        printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                        printf("[+] Sandbox monitoring complete. Shutting down...\n");
+                        running = 0;
                     }
                     
-                    // Periodic rescanning
-                    if (running) {
+                    // Periodic rescanning (only if process still exists)
+                    if (running && process_exists) {
                         if (now - last_sandbox_scan >= 1) {
                             // Rescan sandbox process every second
-                            if (access(proc_check, F_OK) == 0) {
-                                queue_push(&event_queue, sandbox_root_pid, 0);
-                            }
+                            queue_push(&event_queue, sandbox_root_pid, 0);
                             
                             // Also scan for any child processes of sandbox
                             char task_path[256];
