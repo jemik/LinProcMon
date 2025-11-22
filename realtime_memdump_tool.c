@@ -42,6 +42,8 @@ pid_t sandbox_root_pid = 0;  // Root PID for sandbox monitoring
 char* sandbox_binary = NULL;  // Binary to execute in sandbox mode
 char** sandbox_args = NULL;  // Arguments for sandbox binary
 int sandbox_args_count = 0;  // Number of arguments
+int sandbox_timeout = 0;  // Sandbox timeout in seconds (0 = wait for process exit)
+time_t sandbox_start_time = 0;  // When sandbox started
 
 // Statistics (now protected by mutex)
 static unsigned long total_events = 0;
@@ -776,6 +778,8 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "--mem_dump") == 0) {
             mem_dump = 1;
             printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
+        } else if (strcmp(argv[i], "--sandbox-timeout") == 0 && i + 1 < argc) {
+            sandbox_timeout = atoi(argv[++i]) * 60;  // Convert minutes to seconds
         } else if (strcmp(argv[i], "--sandbox") == 0 && i + 1 < argc) {
             sandbox_mode = 1;
             sandbox_binary = argv[++i];
@@ -819,6 +823,7 @@ int main(int argc, char **argv) {
             printf("  - Network socket creation (sandbox mode)\n\n");
             printf("Sandbox mode examples:\n");
             printf("  Monitor binary:      %s --sandbox ./malware\n", argv[0]);
+            printf("  With timeout:        %s --sandbox --sandbox-timeout 5 ./malware\n", argv[0]);
             printf("  With arguments:      %s --sandbox ./malware arg1 arg2\n", argv[0]);
             printf("  Python script:       %s --sandbox python3 script.py arg1\n", argv[0]);
             printf("  Bash script:         %s --sandbox bash script.sh\n", argv[0]);
@@ -977,7 +982,11 @@ int main(int argc, char **argv) {
         
         // Parent process - store sandbox root PID
         sandbox_root_pid = child_pid;
+        sandbox_start_time = time(NULL);
         printf("[+] Sandbox process started with PID %d\n", sandbox_root_pid);
+        if (sandbox_timeout > 0) {
+            printf("[+] Analysis timeout: %d minutes\n", sandbox_timeout / 60);
+        }
         printf("[+] Monitoring process tree...\n");
         
         // Give the process a moment to start and then scan it
@@ -999,37 +1008,34 @@ int main(int argc, char **argv) {
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 // No data available - check if we should do a full scan
                 
-                // Check if sandbox process has exited
+                // Check sandbox timeout or process exit
                 if (sandbox_mode && sandbox_root_pid > 0) {
-                    // Check if process still exists
-                    char proc_check[64];
-                    snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
-                    if (access(proc_check, F_OK) != 0) {
-                        printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                        printf("[+] Sandbox monitoring complete. Shutting down...\n");
+                    time_t now = time(NULL);
+                    
+                    // Check if timeout expired
+                    if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
+                        printf("\n[+] Sandbox analysis timeout reached (%d minutes)\n", sandbox_timeout / 60);
+                        printf("[+] Shutting down...\n");
                         running = 0;
-                    } else {
-                        // Try waitpid
-                        int status;
-                        pid_t result = waitpid(sandbox_root_pid, &status, WNOHANG);
-                        if (result == sandbox_root_pid) {
+                    }
+                    // If no timeout set, check if root process exited
+                    else if (sandbox_timeout == 0) {
+                        char proc_check[64];
+                        snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
+                        if (access(proc_check, F_OK) != 0) {
                             printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                            if (WIFEXITED(status)) {
-                                printf("[+] Exit code: %d\n", WEXITSTATUS(status));
-                            } else if (WIFSIGNALED(status)) {
-                                printf("[+] Killed by signal: %d\n", WTERMSIG(status));
-                            }
                             printf("[+] Sandbox monitoring complete. Shutting down...\n");
                             running = 0;
-                        } else if (result == -1 && errno == ECHILD) {
-                            printf("\n[+] Sandbox process has terminated\n");
-                            running = 0;
-                        } else {
-                            // Process still running - rescan it periodically to catch memory changes
-                            time_t now = time(NULL);
-                            if (now - last_sandbox_scan >= 1) {
+                        }
+                    }
+                    
+                    // Periodic rescanning
+                    if (running) {
+                        if (now - last_sandbox_scan >= 1) {
                             // Rescan sandbox process every second
-                            queue_push(&event_queue, sandbox_root_pid, 0);
+                            if (access(proc_check, F_OK) == 0) {
+                                queue_push(&event_queue, sandbox_root_pid, 0);
+                            }
                             
                             // Also scan for any child processes of sandbox
                             char task_path[256];
@@ -1051,14 +1057,11 @@ int main(int argc, char **argv) {
                                 }
                                 fclose(children_file);
                             }
-                            
+                        
                             last_sandbox_scan = now;
                         }
                     }
-                    }
-                }
-                
-                if (continuous_scan) {
+                }                if (continuous_scan) {
                     time_t now = time(NULL);
                     if (now - last_full_scan >= 30) {
                         if (!quiet_mode) {
