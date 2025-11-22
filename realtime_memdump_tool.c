@@ -984,6 +984,7 @@ int main(int argc, char **argv) {
         sandbox_root_pid = child_pid;
         sandbox_start_time = time(NULL);
         printf("[+] Sandbox process started with PID %d\n", sandbox_root_pid);
+        printf("[+] Sandbox binary: %s\n", sandbox_binary);
         if (sandbox_timeout > 0) {
             printf("[+] Analysis timeout: %d minutes\n", sandbox_timeout / 60);
         }
@@ -991,6 +992,17 @@ int main(int argc, char **argv) {
         
         // Give the process a moment to start and then scan it
         usleep(100000); // 100ms
+        
+        // Read what the child actually executed
+        char exe_path[256];
+        snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", sandbox_root_pid);
+        char exe_link[256] = {0};
+        ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
+        if (len > 0) {
+            exe_link[len] = '\0';
+            printf("[+] Child process executing: %s\n", exe_link);
+        }
+        
         queue_push(&event_queue, sandbox_root_pid, 0);
     }
 
