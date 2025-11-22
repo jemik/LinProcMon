@@ -709,31 +709,9 @@ void *worker_thread(void *arg) {
 void handle_proc_event(struct cn_msg *cn_hdr) {
     struct proc_event *ev = (struct proc_event *)cn_hdr->data;
 
-    // Debug: always log that we got an event
-    static int event_count = 0;
-    event_count++;
-    if (sandbox_mode && event_count < 20) {  // Limit spam
-        fprintf(stderr, "[DEBUG] handle_proc_event called, event type=%d\n", ev->what);
-        fflush(stderr);
-    }
-
-    // Debug: log event types in sandbox mode
-    if (sandbox_mode && !quiet_mode) {
-        if (ev->what != PROC_EVENT_EXEC && ev->what != PROC_EVENT_FORK) {
-            // Uncomment to debug other event types:
-            // printf("[DEBUG] Event type: %d\n", ev->what);
-        }
-    }
-
     if (ev->what == PROC_EVENT_EXEC) {
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
-        
-        // Debug sandbox events - force flush
-        if (sandbox_mode) {
-            fprintf(stderr, "[DEBUG] EXEC event: PID=%d PPID=%d sandbox_root=%d\n", pid, ppid, sandbox_root_pid);
-            fflush(stderr);
-        }
         
         pthread_mutex_lock(&stats_mutex);
         total_events++;
@@ -1014,13 +992,6 @@ int main(int argc, char **argv) {
         char buf[65536];  // 64KB buffer to handle many events at once
         ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
         
-        // Debug netlink activity
-        static int recv_count = 0;
-        if (sandbox_mode && len > 0 && recv_count++ < 10) {
-            fprintf(stderr, "[DEBUG] Received %zd bytes from netlink\n", len);
-            fflush(stderr);
-        }
-        
         if (len == -1) {
             if (errno == EINTR) {
                 continue;  // Interrupted by signal, retry
@@ -1030,25 +1001,33 @@ int main(int argc, char **argv) {
                 
                 // Check if sandbox process has exited
                 if (sandbox_mode && sandbox_root_pid > 0) {
-                    int status;
-                    pid_t result = waitpid(sandbox_root_pid, &status, WNOHANG);
-                    if (result == sandbox_root_pid) {
+                    // Check if process still exists
+                    char proc_check[64];
+                    snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
+                    if (access(proc_check, F_OK) != 0) {
                         printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                        if (WIFEXITED(status)) {
-                            printf("[+] Exit code: %d\n", WEXITSTATUS(status));
-                        } else if (WIFSIGNALED(status)) {
-                            printf("[+] Killed by signal: %d\n", WTERMSIG(status));
-                        }
                         printf("[+] Sandbox monitoring complete. Shutting down...\n");
                         running = 0;
-                    } else if (result == -1 && errno == ECHILD) {
-                        // Child already exited
-                        printf("\n[+] Sandbox process has terminated\n");
-                        running = 0;
                     } else {
-                        // Process still running - rescan it periodically to catch memory changes
-                        time_t now = time(NULL);
-                        if (now - last_sandbox_scan >= 1) {
+                        // Try waitpid
+                        int status;
+                        pid_t result = waitpid(sandbox_root_pid, &status, WNOHANG);
+                        if (result == sandbox_root_pid) {
+                            printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                            if (WIFEXITED(status)) {
+                                printf("[+] Exit code: %d\n", WEXITSTATUS(status));
+                            } else if (WIFSIGNALED(status)) {
+                                printf("[+] Killed by signal: %d\n", WTERMSIG(status));
+                            }
+                            printf("[+] Sandbox monitoring complete. Shutting down...\n");
+                            running = 0;
+                        } else if (result == -1 && errno == ECHILD) {
+                            printf("\n[+] Sandbox process has terminated\n");
+                            running = 0;
+                        } else {
+                            // Process still running - rescan it periodically to catch memory changes
+                            time_t now = time(NULL);
+                            if (now - last_sandbox_scan >= 1) {
                             // Rescan sandbox process every second
                             queue_push(&event_queue, sandbox_root_pid, 0);
                             
@@ -1075,6 +1054,7 @@ int main(int argc, char **argv) {
                             
                             last_sandbox_scan = now;
                         }
+                    }
                     }
                 }
                 
