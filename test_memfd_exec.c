@@ -59,7 +59,7 @@ unsigned char elf_binary[] = {
 int main() {
     printf("[TEST] Starting memfd execution test...\n");
     printf("[TEST] This simulates fileless malware execution\n");
-    sleep(1);
+    //sleep(1);
     
     // Create anonymous memory file (memfd_create)
     printf("[TEST] Creating memfd...\n");
