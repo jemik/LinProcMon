@@ -1011,6 +1011,8 @@ int main(int argc, char **argv) {
                 // Check sandbox timeout or process exit
                 if (sandbox_mode && sandbox_root_pid > 0) {
                     time_t now = time(NULL);
+                    char proc_check[64];
+                    snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
                     
                     // Check if timeout expired
                     if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
@@ -1020,8 +1022,6 @@ int main(int argc, char **argv) {
                     }
                     // If no timeout set, check if root process exited
                     else if (sandbox_timeout == 0) {
-                        char proc_check[64];
-                        snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
                         if (access(proc_check, F_OK) != 0) {
                             printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
                             printf("[+] Sandbox monitoring complete. Shutting down...\n");
