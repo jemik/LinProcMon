@@ -949,6 +949,14 @@ int main(int argc, char **argv) {
         
         if (child_pid == 0) {
             // Child process - execute the sandbox binary
+            
+            // If the binary doesn't contain '/', prepend './' for relative path
+            char actual_path[512];
+            if (strchr(sandbox_binary, '/') == NULL) {
+                snprintf(actual_path, sizeof(actual_path), "./%s", sandbox_binary);
+                sandbox_args[0] = actual_path;
+            }
+            
             // Auto-detect scripts based on file extension
             if (strstr(sandbox_binary, ".py") != NULL) {
                 // Python script - prepend python3
@@ -971,9 +979,16 @@ int main(int argc, char **argv) {
                 execvp("bash", new_args);
                 perror("execvp bash");
             } else {
-                // Direct execution - use execvp to search PATH
-                execvp(sandbox_binary, sandbox_args);
-                perror("execvp");
+                // Direct execution
+                // If path contains '/' use execv (absolute/relative path)
+                // Otherwise use execvp (search PATH)
+                if (strchr(sandbox_binary, '/') != NULL) {
+                    execv(sandbox_binary, sandbox_args);
+                    perror("execv");
+                } else {
+                    execvp(sandbox_binary, sandbox_args);
+                    perror("execvp");
+                }
             }
             
             // If exec fails
