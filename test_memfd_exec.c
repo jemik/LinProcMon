@@ -82,7 +82,7 @@ int main() {
     printf("[TEST] Executing from memfd (should trigger alert!)...\n");
     
     // Give monitoring tool time to set up event listening
-    sleep(2);
+    //sleep(2);
     
     // Fork so parent can continue monitoring while child executes memfd
     pid_t child = fork();
