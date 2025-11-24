@@ -1101,7 +1101,19 @@ void dump_full_process_memory(pid_t pid) {
         // Report to JSON if in sandbox mode
         if (sandbox_mode && sandbox_json_report) {
             pthread_mutex_lock(&sandbox_proc_mutex);
-            if (sandbox_memdump_count < MAX_SANDBOX_MEMDUMPS) {
+            
+            // Check for duplicate (same PID and SHA-1 already reported)
+            int already_reported = 0;
+            for (int i = 0; i < sandbox_memdump_count; i++) {
+                if (sandbox_memdumps[i].pid == pid &&
+                    strcmp(sandbox_memdumps[i].sha1, sha1) == 0) {
+                    already_reported = 1;
+                    break;
+                }
+            }
+            
+            // Only add if not already reported
+            if (!already_reported && sandbox_memdump_count < MAX_SANDBOX_MEMDUMPS) {
                 const char *filename = strrchr(dump_file, '/');
                 filename = filename ? filename + 1 : dump_file;
                 
@@ -1112,6 +1124,7 @@ void dump_full_process_memory(pid_t pid) {
                 sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
                 sandbox_memdump_count++;
             }
+            
             pthread_mutex_unlock(&sandbox_proc_mutex);
         }
     }
@@ -2203,7 +2216,7 @@ int main(int argc, char **argv) {
         // Give the process a moment to start and then scan it
         usleep(100000); // 100ms
         
-        // Read what the child actually executed
+        // Read what the child actually executed and add to process tree
         char exe_path[256];
         snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", sandbox_root_pid);
         char exe_link[256] = {0};
@@ -2211,6 +2224,50 @@ int main(int argc, char **argv) {
         if (len > 0) {
             exe_link[len] = '\0';
             printf("[+] Child process executing: %s\n", exe_link);
+            
+            // Get parent process info
+            pid_t parent_ppid = 0;
+            char stat_path[64];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", sandbox_root_pid);
+            FILE *stat_file = fopen(stat_path, "r");
+            if (stat_file) {
+                fscanf(stat_file, "%*d %*s %*c %d", &parent_ppid);
+                fclose(stat_file);
+            }
+            
+            // Get process name
+            char comm[256] = "unknown";
+            char comm_path[64];
+            snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", sandbox_root_pid);
+            FILE *comm_file = fopen(comm_path, "r");
+            if (comm_file) {
+                if (fgets(comm, sizeof(comm), comm_file)) {
+                    size_t clen = strlen(comm);
+                    if (clen > 0 && comm[clen-1] == '\n')
+                        comm[clen-1] = '\0';
+                }
+                fclose(comm_file);
+            }
+            
+            // Get command line
+            char cmdline_buf[1024] = "";
+            char cmdline_path[64];
+            snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", sandbox_root_pid);
+            FILE *cmdline_file = fopen(cmdline_path, "r");
+            if (cmdline_file) {
+                size_t bytes = fread(cmdline_buf, 1, sizeof(cmdline_buf) - 1, cmdline_file);
+                if (bytes > 0) {
+                    // Replace nulls with spaces for readability
+                    for (size_t i = 0; i < bytes - 1; i++) {
+                        if (cmdline_buf[i] == '\0') cmdline_buf[i] = ' ';
+                    }
+                    cmdline_buf[bytes] = '\0';
+                }
+                fclose(cmdline_file);
+            }
+            
+            // Add parent/root process to report
+            report_sandbox_process(sandbox_root_pid, parent_ppid, comm, exe_link, cmdline_buf);
         }
         
         queue_push(&event_queue, sandbox_root_pid, 0);
