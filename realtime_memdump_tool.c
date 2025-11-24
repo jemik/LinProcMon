@@ -660,6 +660,16 @@ void finalize_sandbox_report() {
     pthread_mutex_unlock(&report_mutex);
 }
 
+// Flush current report data (for periodic saves or crash recovery)
+void flush_sandbox_report() {
+    if (!sandbox_json_report || !sandbox_mode) return;
+    
+    // Just flush the file buffer to disk without closing
+    pthread_mutex_lock(&report_mutex);
+    fflush(sandbox_json_report);
+    pthread_mutex_unlock(&report_mutex);
+}
+
 // ============================================================================
 // END SANDBOX REPORTING
 // ============================================================================
@@ -1423,6 +1433,13 @@ static int is_suspicious_file_location(const char *path, int *risk_score, char *
 static void check_file_operations(pid_t pid) {
     if (!sandbox_mode || !is_sandbox_process(pid)) return;
     
+    // Verify process still exists before proceeding
+    char proc_check[64];
+    snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+    if (access(proc_check, F_OK) != 0) {
+        return;  // Process exited, skip
+    }
+    
     char fd_path[64];
     snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
     
@@ -1497,6 +1514,13 @@ static void check_file_operations(pid_t pid) {
 static void check_network_connections(pid_t pid) {
     if (!sandbox_mode || !is_sandbox_process(pid)) return;
     
+    // Verify process still exists before proceeding
+    char proc_check[64];
+    snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+    if (access(proc_check, F_OK) != 0) {
+        return;  // Process exited, skip
+    }
+    
     // Parse /proc/net/tcp and /proc/net/udp for actual network connections
     const char *net_files[] = {"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"};
     
@@ -1526,7 +1550,11 @@ static void check_network_connections(pid_t pid) {
                 snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
                 
                 DIR *fd_dir = opendir(fd_path);
-                if (!fd_dir) break;
+                if (!fd_dir) {
+                    // Process likely exited during scan
+                    fclose(f);
+                    return;
+                }
                 
                 struct dirent *entry;
                 while ((entry = readdir(fd_dir)) != NULL) {
@@ -1594,6 +1622,14 @@ void scan_maps_and_dump(pid_t pid) {
 
     // Check if this is a sandbox process
     if (sandbox_mode && is_sandbox_process(pid)) {
+        // Verify process still exists before collecting info
+        char proc_check[64];
+        snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+        if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;  // Process exited during scan
+        }
+        
         pthread_mutex_lock(&stats_mutex);
         sandbox_events++;
         pthread_mutex_unlock(&stats_mutex);
@@ -1926,6 +1962,9 @@ int main(int argc, char **argv) {
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
     signal(SIGHUP, cleanup);
+    signal(SIGSEGV, cleanup);  // Handle segmentation faults
+    signal(SIGABRT, cleanup);  // Handle abort signals
+    signal(SIGBUS, cleanup);   // Handle bus errors
 
     int num_threads = 4;  // Default number of worker threads
 
@@ -2312,6 +2351,14 @@ int main(int argc, char **argv) {
                         if (now - last_sandbox_scan >= 1) {
                             // Rescan sandbox process every second
                             queue_push(&event_queue, sandbox_root_pid, 0);
+                            
+                            // Flush report data every 5 seconds for crash recovery
+                            static time_t last_flush = 0;
+                            if (last_flush == 0) last_flush = now;
+                            if (now - last_flush >= 5) {
+                                flush_sandbox_report();
+                                last_flush = now;
+                            }
                             
                             // Also scan for any child processes of sandbox
                             char task_path[256];
