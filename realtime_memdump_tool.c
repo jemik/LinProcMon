@@ -76,6 +76,42 @@ sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// File operations and network activity tracking for JSON report
+#define MAX_SANDBOX_FILE_OPS 512
+typedef struct {
+    pid_t pid;
+    char operation[32];
+    char filepath[512];
+    int risk_score;
+    char category[64];
+    time_t timestamp;
+} sandbox_file_op_t;
+
+#define MAX_SANDBOX_NETWORK 256
+typedef struct {
+    pid_t pid;
+    char protocol[16];
+    char local_addr[128];
+    char remote_addr[128];
+    time_t timestamp;
+} sandbox_network_t;
+
+#define MAX_SANDBOX_MEMDUMPS 64
+typedef struct {
+    pid_t pid;
+    char filename[256];
+    size_t size;
+    char sha1[41];
+    time_t timestamp;
+} sandbox_memdump_t;
+
+sandbox_file_op_t sandbox_file_ops[MAX_SANDBOX_FILE_OPS];
+int sandbox_file_op_count = 0;
+sandbox_network_t sandbox_network[MAX_SANDBOX_NETWORK];
+int sandbox_network_count = 0;
+sandbox_memdump_t sandbox_memdumps[MAX_SANDBOX_MEMDUMPS];
+int sandbox_memdump_count = 0;
+
 // Async file operation queue for sandbox reporting (non-blocking)
 #define FILE_OP_QUEUE_SIZE 128
 typedef struct {
@@ -453,6 +489,17 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     
     // Only need one mutex - just tracking in memory, no I/O
     pthread_mutex_lock(&sandbox_proc_mutex);
+    
+    // Check if this PID already exists (prevent duplicates from periodic rescans)
+    for (int i = 0; i < sandbox_process_count; i++) {
+        if (sandbox_processes[i].pid == pid) {
+            // Process already tracked, skip
+            pthread_mutex_unlock(&sandbox_proc_mutex);
+            return;
+        }
+    }
+    
+    // Add new process
     if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
         sandbox_processes[sandbox_process_count].pid = pid;
         sandbox_processes[sandbox_process_count].ppid = ppid;
@@ -468,14 +515,27 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
 
 // Add file operation to report
 // Add file operation to report (async - non-blocking)
-void report_file_operation(pid_t pid, const char *operation, const char *filepath) {
+void report_file_operation(pid_t pid, const char *operation, const char *filepath, int risk_score, const char *category) {
     if (!sandbox_json_report) return;
     
-    // Queue for background processing instead of blocking
+    // Store in JSON report array immediately (in-memory, fast)
+    pthread_mutex_lock(&sandbox_proc_mutex);
+    if (sandbox_file_op_count < MAX_SANDBOX_FILE_OPS) {
+        sandbox_file_ops[sandbox_file_op_count].pid = pid;
+        strncpy(sandbox_file_ops[sandbox_file_op_count].operation, operation, sizeof(sandbox_file_ops[0].operation) - 1);
+        strncpy(sandbox_file_ops[sandbox_file_op_count].filepath, filepath, sizeof(sandbox_file_ops[0].filepath) - 1);
+        sandbox_file_ops[sandbox_file_op_count].risk_score = risk_score;
+        strncpy(sandbox_file_ops[sandbox_file_op_count].category, category, sizeof(sandbox_file_ops[0].category) - 1);
+        sandbox_file_ops[sandbox_file_op_count].timestamp = time(NULL);
+        sandbox_file_op_count++;
+    }
+    pthread_mutex_unlock(&sandbox_proc_mutex);
+    
+    // Queue for background processing (file copying, hashing) instead of blocking
     if (file_op_queue_push(&file_op_queue, pid, operation, filepath) < 0) {
         // Queue full, just log without blocking
         if (!quiet_mode) {
-            fprintf(stderr, "[WARN] File operation queue full, skipping: %s\n", filepath);
+            fprintf(stderr, "[WARN] File operation queue full, skipping copy: %s\n", filepath);
         }
     }
 }
@@ -484,15 +544,33 @@ void report_file_operation(pid_t pid, const char *operation, const char *filepat
 void report_network_activity(pid_t pid, const char *protocol, const char *local_addr, const char *remote_addr) {
     if (!sandbox_json_report) return;
     
-    pthread_mutex_lock(&report_mutex);
+    pthread_mutex_lock(&sandbox_proc_mutex);
     
-    char escaped_local[256], escaped_remote[256];
-    json_escape(local_addr, escaped_local, sizeof(escaped_local));
-    json_escape(remote_addr, escaped_remote, sizeof(escaped_remote));
+    // Check for duplicates (same connection already logged)
+    for (int i = 0; i < sandbox_network_count; i++) {
+        if (sandbox_network[i].pid == pid &&
+            strcmp(sandbox_network[i].protocol, protocol) == 0 &&
+            strcmp(sandbox_network[i].local_addr, local_addr) == 0 &&
+            strcmp(sandbox_network[i].remote_addr, remote_addr) == 0) {
+            // Already logged
+            pthread_mutex_unlock(&sandbox_proc_mutex);
+            return;
+        }
+    }
+    
+    // Add new network activity
+    if (sandbox_network_count < MAX_SANDBOX_NETWORK) {
+        sandbox_network[sandbox_network_count].pid = pid;
+        strncpy(sandbox_network[sandbox_network_count].protocol, protocol, sizeof(sandbox_network[0].protocol) - 1);
+        strncpy(sandbox_network[sandbox_network_count].local_addr, local_addr, sizeof(sandbox_network[0].local_addr) - 1);
+        strncpy(sandbox_network[sandbox_network_count].remote_addr, remote_addr, sizeof(sandbox_network[0].remote_addr) - 1);
+        sandbox_network[sandbox_network_count].timestamp = time(NULL);
+        sandbox_network_count++;
+    }
+    
+    pthread_mutex_unlock(&sandbox_proc_mutex);
     
     printf("[SANDBOX] Network: PID=%d %s %s -> %s\n", pid, protocol, local_addr, remote_addr);
-    
-    pthread_mutex_unlock(&report_mutex);
 }
 
 // Finalize sandbox report
@@ -517,6 +595,49 @@ void finalize_sandbox_report() {
         fprintf(sandbox_json_report, "      \"cmdline\": \"%s\",\n", escaped_cmdline);
         fprintf(sandbox_json_report, "      \"start_time\": %ld\n", sandbox_processes[i].start_time);
         fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_process_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
+    // Write file operations
+    fprintf(sandbox_json_report, "  \"file_operations\": [\n");
+    for (int i = 0; i < sandbox_file_op_count; i++) {
+        char escaped_filepath[1024];
+        json_escape(sandbox_file_ops[i].filepath, escaped_filepath, sizeof(escaped_filepath));
+        
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_file_ops[i].pid);
+        fprintf(sandbox_json_report, "      \"operation\": \"%s\",\n", sandbox_file_ops[i].operation);
+        fprintf(sandbox_json_report, "      \"filepath\": \"%s\",\n", escaped_filepath);
+        fprintf(sandbox_json_report, "      \"risk_score\": %d,\n", sandbox_file_ops[i].risk_score);
+        fprintf(sandbox_json_report, "      \"category\": \"%s\",\n", sandbox_file_ops[i].category);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_file_ops[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_file_op_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
+    // Write network activity
+    fprintf(sandbox_json_report, "  \"network_activity\": [\n");
+    for (int i = 0; i < sandbox_network_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_network[i].pid);
+        fprintf(sandbox_json_report, "      \"protocol\": \"%s\",\n", sandbox_network[i].protocol);
+        fprintf(sandbox_json_report, "      \"local_address\": \"%s\",\n", sandbox_network[i].local_addr);
+        fprintf(sandbox_json_report, "      \"remote_address\": \"%s\",\n", sandbox_network[i].remote_addr);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_network[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_network_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
+    // Write memory dumps
+    fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
+    for (int i = 0; i < sandbox_memdump_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_memdumps[i].pid);
+        fprintf(sandbox_json_report, "      \"filename\": \"%s\",\n", sandbox_memdumps[i].filename);
+        fprintf(sandbox_json_report, "      \"size\": %zu,\n", sandbox_memdumps[i].size);
+        fprintf(sandbox_json_report, "      \"sha1\": \"%s\",\n", sandbox_memdumps[i].sha1);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_memdumps[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_memdump_count - 1) ? "," : "");
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -976,6 +1097,23 @@ void dump_full_process_memory(pid_t pid) {
     char sha1[41], sha256[65];
     if (calculate_sha1(dump_file, sha1) == 0) {
         printf("[+] Memory dump SHA-1: %s\n", sha1);
+        
+        // Report to JSON if in sandbox mode
+        if (sandbox_mode && sandbox_json_report) {
+            pthread_mutex_lock(&sandbox_proc_mutex);
+            if (sandbox_memdump_count < MAX_SANDBOX_MEMDUMPS) {
+                const char *filename = strrchr(dump_file, '/');
+                filename = filename ? filename + 1 : dump_file;
+                
+                sandbox_memdumps[sandbox_memdump_count].pid = pid;
+                strncpy(sandbox_memdumps[sandbox_memdump_count].filename, filename, sizeof(sandbox_memdumps[0].filename) - 1);
+                sandbox_memdumps[sandbox_memdump_count].size = total_dumped;
+                strncpy(sandbox_memdumps[sandbox_memdump_count].sha1, sha1, sizeof(sandbox_memdumps[0].sha1) - 1);
+                sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
+                sandbox_memdump_count++;
+            }
+            pthread_mutex_unlock(&sandbox_proc_mutex);
+        }
     }
     if (calculate_sha256(dump_file, sha256) == 0) {
         printf("[+] Memory dump SHA-256: %s\n", sha256);
@@ -1328,7 +1466,7 @@ static void check_file_operations(pid_t pid) {
                 printf("[SANDBOX] File %s: %s (PID=%d, Risk=%d, Category=%s)\n", 
                        op_type, target, pid, risk_score, category);
                        
-                report_file_operation(pid, op_type, target);
+                report_file_operation(pid, op_type, target, risk_score, category);
                 
                 pthread_mutex_lock(&stats_mutex);
                 files_created++;
@@ -1346,34 +1484,86 @@ static void check_file_operations(pid_t pid) {
 static void check_network_connections(pid_t pid) {
     if (!sandbox_mode || !is_sandbox_process(pid)) return;
     
-    char fd_path[64];
-    snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
+    // Parse /proc/net/tcp and /proc/net/udp for actual network connections
+    const char *net_files[] = {"/proc/net/tcp", "/proc/net/tcp6", "/proc/net/udp", "/proc/net/udp6"};
     
-    DIR *fd_dir = opendir(fd_path);
-    if (!fd_dir) return;
-    
-    struct dirent *entry;
-    while ((entry = readdir(fd_dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
+    for (int i = 0; i < 4; i++) {
+        FILE *f = fopen(net_files[i], "r");
+        if (!f) continue;
         
-        char link_path[128];
-        char target[PATH_MAX];
-        snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
+        char line[512];
+        // Skip header
+        if (fgets(line, sizeof(line), f) == NULL) {
+            fclose(f);
+            continue;
+        }
         
-        ssize_t len = readlink(link_path, target, sizeof(target) - 1);
-        if (len > 0) {
-            target[len] = '\0';
+        // Parse each connection
+        while (fgets(line, sizeof(line), f)) {
+            unsigned long local_addr, rem_addr;
+            unsigned int local_port, rem_port, inode, uid;
             
-            // Check for socket creation
-            if (strstr(target, "socket:") != NULL) {
-                printf("[SANDBOX] Socket created: %s (PID=%d)\n", target, pid);
-                pthread_mutex_lock(&stats_mutex);
-                sockets_created++;
-                pthread_mutex_unlock(&stats_mutex);
+            // Parse line format: sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode
+            int parsed = sscanf(line, "%*d: %lx:%x %lx:%x %*x %*x:%*x %*x:%*x %*x %u %*d %u",
+                              &local_addr, &local_port, &rem_addr, &rem_port, &uid, &inode);
+            
+            if (parsed >= 6 && inode > 0) {
+                // Check if this inode belongs to our PID
+                char fd_path[64];
+                snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd", pid);
+                
+                DIR *fd_dir = opendir(fd_path);
+                if (!fd_dir) break;
+                
+                struct dirent *entry;
+                while ((entry = readdir(fd_dir)) != NULL) {
+                    if (entry->d_name[0] == '.') continue;
+                    
+                    char link_path[128], target[256];
+                    snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
+                    
+                    ssize_t len = readlink(link_path, target, sizeof(target) - 1);
+                    if (len > 0) {
+                        target[len] = '\0';
+                        
+                        // Check if this socket inode matches
+                        char socket_str[64];
+                        snprintf(socket_str, sizeof(socket_str), "socket:[%u]", inode);
+                        
+                        if (strstr(target, socket_str) != NULL) {
+                            // Found a real network connection for this PID
+                            const char *proto = (i < 2) ? "TCP" : "UDP";
+                            char local_str[64], remote_str[64];
+                            
+                            // Format addresses (IPv4 only for now - IPv6 needs different parsing)
+                            snprintf(local_str, sizeof(local_str), "%lu.%lu.%lu.%lu:%u",
+                                    local_addr & 0xFF, (local_addr >> 8) & 0xFF,
+                                    (local_addr >> 16) & 0xFF, (local_addr >> 24) & 0xFF,
+                                    local_port);
+                            snprintf(remote_str, sizeof(remote_str), "%lu.%lu.%lu.%lu:%u",
+                                    rem_addr & 0xFF, (rem_addr >> 8) & 0xFF,
+                                    (rem_addr >> 16) & 0xFF, (rem_addr >> 24) & 0xFF,
+                                    rem_port);
+                            
+                            // Only log if remote address is not 0.0.0.0 (actual connection, not listening)
+                            if (rem_addr != 0) {
+                                printf("[SANDBOX] Network connection: PID=%d %s %s -> %s\n",
+                                       pid, proto, local_str, remote_str);
+                                report_network_activity(pid, proto, local_str, remote_str);
+                                
+                                pthread_mutex_lock(&stats_mutex);
+                                sockets_created++;
+                                pthread_mutex_unlock(&stats_mutex);
+                            }
+                            break;
+                        }
+                    }
+                }
+                closedir(fd_dir);
             }
         }
+        fclose(f);
     }
-    closedir(fd_dir);
 }
 
 void scan_maps_and_dump(pid_t pid) {
