@@ -2502,11 +2502,19 @@ int main(int argc, char **argv) {
                         printf("[+] Shutting down...\n");
                         running = 0;
                     }
-                    // If no timeout set, check if root process exited
-                    else if (sandbox_timeout == 0 && !process_exists) {
-                        printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                        printf("[+] Sandbox monitoring complete. Shutting down...\n");
-                        running = 0;
+                    // If process has exited, wait 2 seconds for final data collection then exit
+                    else if (!process_exists) {
+                        static time_t exit_detected = 0;
+                        if (exit_detected == 0) {
+                            printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                            printf("[+] Collecting final data...\n");
+                            exit_detected = now;
+                        }
+                        // Wait 2 seconds after exit detection to collect remaining events
+                        if (now - exit_detected >= 2) {
+                            printf("[+] Sandbox monitoring complete. Finalizing report...\n");
+                            running = 0;
+                        }
                     }
                     
                     // Periodic rescanning (only if process still exists)
