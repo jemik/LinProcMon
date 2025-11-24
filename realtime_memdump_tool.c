@@ -560,7 +560,8 @@ int init_sandbox_reporting(const char *sample_path) {
 
 // Add process to sandbox report (fast - just in-memory tracking)
 void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char *path, const char *cmdline) {
-    if (!sandbox_json_report) return;
+    // Always write to temp file in sandbox mode
+    if (!sandbox_mode) return;
     
     // Only need one mutex - just tracking in memory, no I/O
     pthread_mutex_lock(&sandbox_proc_mutex);
@@ -602,7 +603,8 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
 // Add file operation to report
 // Add file operation to report (async - non-blocking)
 void report_file_operation(pid_t pid, const char *operation, const char *filepath, int risk_score, const char *category) {
-    if (!sandbox_json_report) return;
+    // Always write to temp file in sandbox mode
+    if (!sandbox_mode) return;
     
     // Store in JSON report array immediately (in-memory, fast)
     pthread_mutex_lock(&sandbox_proc_mutex);
@@ -639,7 +641,8 @@ void report_file_operation(pid_t pid, const char *operation, const char *filepat
 
 // Add network activity to report  
 void report_network_activity(pid_t pid, const char *protocol, const char *local_addr, const char *remote_addr) {
-    if (!sandbox_json_report) return;
+    // Always write to temp file in sandbox mode
+    if (!sandbox_mode) return;
     
     pthread_mutex_lock(&sandbox_proc_mutex);
     
