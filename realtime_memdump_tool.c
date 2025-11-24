@@ -2866,55 +2866,76 @@ int main(int argc, char **argv) {
                 // Check sandbox timeout or process exit
                 if (sandbox_mode && sandbox_root_pid > 0) {
                     time_t now = time(NULL);
-                    char proc_check[64];
-                    snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
-                    int process_exists = (access(proc_check, F_OK) == 0);
+                    int process_exists = 1;  // Assume exists until proven otherwise
                     
+                    // FIRST: Try to reap child process and get exit status (non-blocking)
+                    // This must be done BEFORE checking /proc, because once process exits,
+                    // the exit status is only available via waitpid() until it's reaped
+                    int status;
+                    pid_t wait_result = waitpid(sandbox_root_pid, &status, WNOHANG);
+                    
+                    if (wait_result == sandbox_root_pid) {
+                        // Process has exited - capture exit status
+                        process_exists = 0;
+                        static int exit_logged = 0;
+                        if (!exit_logged) {
+                            printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                            
+                            if (WIFEXITED(status)) {
+                                sandbox_exit_code = WEXITSTATUS(status);
+                                if (sandbox_exit_code == 0) {
+                                    strncpy(sandbox_termination_status, "completed", sizeof(sandbox_termination_status) - 1);
+                                    printf("[+] Sample exited normally with code %d\n", sandbox_exit_code);
+                                } else {
+                                    strncpy(sandbox_termination_status, "error", sizeof(sandbox_termination_status) - 1);
+                                    printf("[+] Sample exited with error code %d\n", sandbox_exit_code);
+                                }
+                            } else if (WIFSIGNALED(status)) {
+                                sandbox_exit_code = WTERMSIG(status);
+                                strncpy(sandbox_termination_status, "sample_crashed", sizeof(sandbox_termination_status) - 1);
+                                const char* sig_name = 
+                                    sandbox_exit_code == 11 ? "SIGSEGV (segmentation fault)" :
+                                    sandbox_exit_code == 6 ? "SIGABRT (aborted)" :
+                                    sandbox_exit_code == 9 ? "SIGKILL (killed)" :
+                                    sandbox_exit_code == 15 ? "SIGTERM (terminated)" : "unknown signal";
+                                printf("[+] Sample terminated by signal %d (%s)\n", sandbox_exit_code, sig_name);
+                            }
+                            
+                            printf("[+] Collecting final data...\n");
+                            exit_logged = 1;
+                        }
+                        
+                        // Wait 2 seconds after exit to collect remaining events
+                        static time_t exit_time = 0;
+                        if (exit_time == 0) exit_time = now;
+                        if (now - exit_time >= 2) {
+                            printf("[+] Sandbox monitoring complete. Finalizing report...\n");
+                            running = 0;
+                        }
+                    }
                     // Check if timeout expired
-                    if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
+                    else if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
                         printf("\n[+] Sandbox analysis timeout reached (%d minutes)\n", sandbox_timeout / 60);
                         printf("[+] Shutting down...\n");
                         strncpy(sandbox_termination_status, "timeout", sizeof(sandbox_termination_status) - 1);
                         running = 0;
                     }
-                    // If process has exited, wait 2 seconds for final data collection then exit
-                    else if (!process_exists) {
-                        static time_t exit_detected = 0;
-                        if (exit_detected == 0) {
-                            printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
-                            printf("[+] Collecting final data...\n");
-                            
-                            // Try to determine exit status using waitpid (non-blocking)
-                            int status;
-                            pid_t wait_result = waitpid(sandbox_root_pid, &status, WNOHANG);
-                            
-                            if (wait_result == sandbox_root_pid) {
-                                if (WIFEXITED(status)) {
-                                    sandbox_exit_code = WEXITSTATUS(status);
-                                    if (sandbox_exit_code == 0) {
-                                        strncpy(sandbox_termination_status, "completed", sizeof(sandbox_termination_status) - 1);
-                                        printf("[+] Process exited normally with code %d\n", sandbox_exit_code);
-                                    } else {
-                                        strncpy(sandbox_termination_status, "error", sizeof(sandbox_termination_status) - 1);
-                                        printf("[+] Process exited with error code %d\n", sandbox_exit_code);
-                                    }
-                                } else if (WIFSIGNALED(status)) {
-                                    sandbox_exit_code = WTERMSIG(status);
-                                    strncpy(sandbox_termination_status, "crashed", sizeof(sandbox_termination_status) - 1);
-                                    printf("[+] Process terminated by signal %d\n", sandbox_exit_code);
-                                }
-                            } else {
-                                // Process exited but we couldn't get status - assume normal completion
+                    // Check if process disappeared without waitpid catching it
+                    else {
+                        char proc_check[64];
+                        snprintf(proc_check, sizeof(proc_check), "/proc/%d", sandbox_root_pid);
+                        process_exists = (access(proc_check, F_OK) == 0);
+                        
+                        if (!process_exists) {
+                            static time_t fallback_exit = 0;
+                            if (fallback_exit == 0) {
+                                printf("\n[+] Sandbox process disappeared (waitpid missed it)\n");
                                 strncpy(sandbox_termination_status, "completed", sizeof(sandbox_termination_status) - 1);
-                                printf("[+] Process terminated (status unavailable)\n");
+                                fallback_exit = now;
                             }
-                            
-                            exit_detected = now;
-                        }
-                        // Wait 2 seconds after exit detection to collect remaining events
-                        if (now - exit_detected >= 2) {
-                            printf("[+] Sandbox monitoring complete. Finalizing report...\n");
-                            running = 0;
+                            if (now - fallback_exit >= 2) {
+                                running = 0;
+                            }
                         }
                     }
                     
