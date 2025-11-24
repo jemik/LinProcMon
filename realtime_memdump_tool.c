@@ -830,6 +830,25 @@ void finalize_sandbox_report() {
     }
     fprintf(sandbox_json_report, "  ],\n");
     
+    // Write alerts/suspicious findings
+    fprintf(sandbox_json_report, "  \"alerts\": [\n");
+    snprintf(temp_file, sizeof(temp_file), "%s/.alerts.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            // Strip newline
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
     // Write summary
     fprintf(sandbox_json_report, "  \"summary\": {\n");
     fprintf(sandbox_json_report, "    \"end_time\": %ld,\n", time(NULL));
@@ -2128,6 +2147,19 @@ void scan_maps_and_dump(pid_t pid) {
             } else {
                 printf("[!] ALERT: %s in PID %d\n", reason, pid);
                 printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
+            }
+            
+            // Report to sandbox JSON if in sandbox mode
+            if (sandbox_mode && strlen(sandbox_report_dir) > 0) {
+                char alert_tmp[600];
+                snprintf(alert_tmp, sizeof(alert_tmp), "%s/.alerts.tmp", sandbox_report_dir);
+                FILE *af = fopen(alert_tmp, "a");
+                if (af) {
+                    fprintf(af, "{\"pid\":%d,\"type\":\"%s\",\"region\":\"%lx-%lx\",\"perms\":\"%s\",\"path\":\"%s\",\"timestamp\":%ld}\n",
+                            pid, reason, start, end, perms, path, time(NULL));
+                    fflush(af);
+                    fclose(af);
+                }
             }
             
             // Only dump individual regions if --mem_dump is enabled (but not full_dump)
