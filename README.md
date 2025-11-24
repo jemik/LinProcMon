@@ -19,6 +19,8 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 
 - ✅ **Multi-threaded architecture** - Producer-consumer pattern prevents buffer overflow in high-load environments
 - ✅ **Sandbox mode** - Execute and monitor specific binaries, Python scripts, or bash scripts with full process tree tracking
+- ✅ **Sandbox timeout** - Configure analysis duration for malware that kills parent processes
+- ✅ **Full memory dump** - Single contiguous dump for easy reverse engineering (unpacking analysis)
 - ✅ Real-time process monitoring via netlink connector (16MB kernel buffer)
 - ✅ Comprehensive memory injection detection
 - ✅ Optional memory dumping (--mem_dump flag)
@@ -151,9 +153,9 @@ sudo ./realtime_memdump_tool --continuous --quiet
 ./realtime_memdump_tool --help
 ```
 
-### Sandbox Mode (New!)
+### Sandbox Mode
 
-Execute and monitor a specific binary or script for malicious behavior:
+Execute and monitor a specific binary or script for malicious behavior. **IMPORTANT**: `--sandbox` must always be the LAST argument, as everything after it is passed to the sandboxed program.
 
 **Monitor binary execution:**
 ```bash
@@ -165,28 +167,40 @@ sudo ./realtime_memdump_tool --sandbox ./malware
 sudo ./realtime_memdump_tool --sandbox ./malware arg1 arg2
 ```
 
+**With timeout (for malware that kills parent process):**
+```bash
+sudo ./realtime_memdump_tool --sandbox-timeout 5 --sandbox ./malware
+# Monitors for 5 minutes regardless of process state
+```
+
 **Monitor Python script:**
 ```bash
-sudo ./realtime_memdump_tool --sandbox python3 script.py arg1
-# Or with .py extension auto-detection:
 sudo ./realtime_memdump_tool --sandbox script.py arg1
+# Auto-detects .py extension and uses python3
 ```
 
 **Monitor bash script:**
 ```bash
-sudo ./realtime_memdump_tool --sandbox bash script.sh
-# Or with .sh extension auto-detection:
 sudo ./realtime_memdump_tool --sandbox script.sh
+# Auto-detects .sh extension and uses bash
 ```
 
-**Sandbox with memory dumping:**
+**Sandbox with full memory dump (recommended for unpacking analysis):**
 ```bash
-sudo ./realtime_memdump_tool --sandbox --mem_dump ./suspicious_binary
+sudo ./realtime_memdump_tool --full_dump --sandbox ./packed_malware
+# Creates single contiguous dump file: memdump_PID_name.bin
 ```
 
-**Sandbox with YARA scanning:**
+**Sandbox with individual region dumps:**
 ```bash
-sudo ./realtime_memdump_tool --sandbox --mem_dump --yara rules.yar ./malware
+sudo ./realtime_memdump_tool --mem_dump --sandbox ./suspicious_binary
+# Creates dump_PID_0xSTART-0xEND.bin for each suspicious region
+```
+
+**Complete malware analysis:**
+```bash
+sudo ./realtime_memdump_tool --full_dump --sandbox-timeout 10 --yara rules.yar --sandbox ./malware
+# 10-minute timeout, full memory dump, YARA scanning
 ```
 
 **What sandbox mode monitors:**
@@ -196,25 +210,34 @@ sudo ./realtime_memdump_tool --sandbox --mem_dump --yara rules.yar ./malware
 - Network socket creation
 - Spawned child processes and their behavior
 
-The tool automatically exits when the sandbox process and all its children terminate.
+**Automatic exit conditions:**
+- Without timeout: Exits when sandbox process tree terminates
+- With timeout: Exits after specified duration (catches persistent payloads)
 
 ### Command-Line Options
 
 | Option | Description |
 |--------|-------------|
-| `--sandbox <bin>` | **Sandbox mode**: Execute and monitor specific binary/script with full process tree tracking |
+| `--sandbox <bin>` | **Sandbox mode**: Execute and monitor specific binary/script. **Must be last argument!** |
+| `--sandbox-timeout <min>` | Sandbox timeout in minutes (0=wait for exit, default: 0) |
+| `--full_dump` | Dump entire process memory to single file (implies --mem_dump) |
+| `--mem_dump` | Dump individual suspicious memory regions to separate files |
 | `--quiet, -q` | Quiet mode (suppress non-critical messages, compact alerts) |
 | `--threads <N>` | Number of worker threads (1-8, default: 4) |
-| `--mem_dump` | Enable memory dumping to disk (default: off for performance) |
-| `--yara <file>` | Enable YARA scanning with specified rules file (requires --mem_dump) |
+| `--yara <file>` | Enable YARA scanning with specified rules file (requires --mem_dump or --full_dump) |
 | `--continuous` | Enable continuous monitoring (rescan processes every 30s) |
 | `--help, -h` | Show help message |
 
 ### Recommended Configurations
 
-**Malware Analysis (sandbox mode):**
+**Malware Analysis (sandbox mode with full memory dump):**
 ```bash
-sudo ./realtime_memdump_tool --sandbox --mem_dump --yara rules.yar ./malware.bin
+sudo ./realtime_memdump_tool --full_dump --yara rules.yar --sandbox ./malware.bin
+```
+
+**Malware with timeout (for persistent payloads):**
+```bash
+sudo ./realtime_memdump_tool --full_dump --sandbox-timeout 10 --sandbox ./malware.bin
 ```
 
 **SOC/SIEM Integration (maximum performance):**
@@ -292,9 +315,10 @@ When running in sandbox mode, additional statistics are shown:
 - `Files created`: Files created in suspicious directories (/tmp, /dev/shm, /var/tmp)
 - `Sockets created`: Network sockets opened by the sandbox process tree
 
-### Memory Dumps (when --mem_dump is enabled)
+### Memory Dumps
 
-Suspicious memory regions are automatically dumped to files:
+**Individual region dumps (--mem_dump):**
+Suspicious memory regions are automatically dumped to separate files:
 ```
 dump_<PID>_0x<START>-0x<END>.bin
 ```
@@ -303,6 +327,28 @@ Example:
 ```
 dump_12345_0x7f8a2c000000-0x7f8a2c100000.bin
 ```
+
+**Full memory dump (--full_dump - recommended for reverse engineering):**
+Entire process memory dumped to single contiguous file:
+```
+memdump_<PID>_<processname>.bin
+memdump_<PID>_<processname>.map
+```
+
+Example:
+```
+memdump_12345_malware.bin  <- Load this into Ghidra/IDA
+memdump_12345_malware.map  <- Memory offset -> virtual address mapping
+```
+
+**Memory map file format:**
+```
+[0x00000000] -> 0x0000000000400000-0x0000000000401000 r-xp 4096 bytes /path/to/binary [DUMPED 4096 bytes]
+[0x00001000] -> 0x0000000000600000-0x0000000000601000 rwxp 4096 bytes  [DUMPED 4096 bytes]
+[0x00002000] -> 0x00007f1234567000-0x00007f1234568000 r-xp 4096 bytes /memfd:malware [DUMPED 4096 bytes]
+```
+
+The map file shows which file offset corresponds to which virtual address, making reverse engineering straightforward.
 
 ## Detection Capabilities
 
@@ -505,13 +551,26 @@ If still seeing noise, add custom filtering in `should_ignore_process()` functio
 - Multi-threaded processing handles high analysis workload
 - **Sandbox mode**: Execute specific samples and monitor their complete behavior (file/network operations, process tree)
 
-### Malware Sandbox (New!)
+### Malware Sandbox
 - Execute suspicious binaries in isolated environment with full monitoring
 - Track all spawned processes and their behavior
 - Monitor file creation in temporary directories
 - Detect network connections and C2 communication attempts
-- Automatically capture memory dumps of suspicious regions
+- Automatically capture full memory dumps for unpacking analysis
 - Support for Python/bash script analysis
+- Timeout-based analysis for malware that kills parent processes
+
+**Example workflow:**
+```bash
+# Step 1: Execute malware with full monitoring (10-minute timeout)
+sudo ./realtime_memdump_tool --full_dump --sandbox-timeout 10 --sandbox ./packed_malware
+
+# Step 2: Analyze the memory dump in Ghidra/IDA
+ghidra memdump_12345_packed_malware.bin
+
+# Step 3: Use the .map file to locate specific regions
+cat memdump_12345_packed_malware.map | grep -i memfd
+```
 
 ### Threat Hunting
 - Continuous monitoring mode to detect dormant threats
