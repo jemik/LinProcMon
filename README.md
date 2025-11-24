@@ -19,6 +19,9 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 
 - ✅ **Multi-threaded architecture** - Producer-consumer pattern prevents buffer overflow in high-load environments
 - ✅ **Sandbox mode** - Execute and monitor specific binaries, Python scripts, or bash scripts with full process tree tracking
+- ✅ **Enhanced file monitoring** - Tracks file operations in 15+ high-risk locations with risk scoring and categorization
+- ✅ **Hidden file detection** - Identifies concealment attempts (files starting with '.')
+- ✅ **Comprehensive JSON reporting** - Full sandbox analysis with SHA-1/SHA-256 hashes, file types, and dropped file collection
 - ✅ **Sandbox timeout** - Configure analysis duration for malware that kills parent processes
 - ✅ **Full memory dump** - Single contiguous dump for easy reverse engineering (unpacking analysis)
 - ✅ Real-time process monitoring via netlink connector (16MB kernel buffer)
@@ -233,9 +236,13 @@ sudo ./realtime_memdump_tool --full_dump --sandbox-timeout 10 --yara rules.yar -
 **What sandbox mode monitors:**
 - All processes in the sandbox process tree (parent, children, grandchildren)
 - Memory injection, RWX regions, memfd execution, process hollowing
-- File creation in suspicious directories (/tmp, /dev/shm, /var/tmp)
+- **File operations in 15+ high-risk locations** (persistence, staging, hidden files)
+- **Risk-scored file activity** with categorization (persistence, library_hijack, temp_staging, etc.)
+- **Automatic dropped file collection** with SHA-1/SHA-256 hashes and file type detection
 - Network socket creation
 - Spawned child processes and their behavior
+
+📋 **See [FILE_MONITORING.md](FILE_MONITORING.md) for complete documentation on enhanced file monitoring capabilities, risk scoring, and monitored locations.**
 
 **Automatic exit conditions:**
 - Without timeout: Exits when sandbox process tree terminates

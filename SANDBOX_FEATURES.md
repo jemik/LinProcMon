@@ -39,8 +39,35 @@ For each process in the sandbox tree:
 #### File Operations
 - Files created, opened, modified, deleted
 - Full path of each file
+- Risk scoring (0-100) based on location and characteristics
+- Category classification (persistence, temp_staging, library_hijack, etc.)
 - SHA-1 and SHA-256 hashes of dropped files
-- Files automatically copied to `dropped_files/` directory
+- File type detection for captured files
+- Files automatically copied to `dropped_files/` directory with sanitized names
+- Tracking of hidden files (starting with '.')
+
+##### Monitored High-Risk Locations
+
+| Location | Risk Score | Category | Purpose |
+|----------|-----------|----------|---------|
+| `/etc/cron.*`, `/var/spool/cron` | 95 | persistence | Scheduled task persistence |
+| `/etc/init.d/`, `/etc/systemd/system/` | 95 | persistence | Service-based persistence |
+| `/etc/ld.so.preload` | 95 | persistence | Dynamic linker hijacking |
+| `/boot/` | 100 | boot_persistence | Bootloader/kernel persistence |
+| Library dirs (`/lib`, `/usr/lib`) with `.so` | 90 | library_hijack | Shared library injection |
+| `/tmp/`, `/var/tmp/`, `/dev/shm/` | 70-85 | temp_staging | Temporary staging/execution |
+| `/run/`, `/proc/*/fd/`, `/proc/*/mem` | 80 | runtime_fileless | Fileless/memory-only execution |
+| `/root/` | 65-85 | root_staging | Root user staging area |
+| `~/.config/`, `~/.cache/`, `~/.local/share/` | 60-75 | user_persistence | User-level persistence |
+| `~/.bashrc`, `~/.profile`, `~/.ssh/` | 60-75 | user_persistence | Shell/SSH persistence |
+| `/home/<user>/` (scripts/hidden) | 55 | user_staging | User staging area |
+| Hidden files (`.filename`) anywhere | 50+ | hidden_file | Concealment attempt |
+
+##### File Operation Detection
+- **Created**: File opened with O_CREAT flag
+- **Written**: File opened with write access (O_WRONLY/O_RDWR)
+- **Accessed**: File opened in suspicious location (read-only)
+- Real-time monitoring via `/proc/<pid>/fd` and `/proc/<pid>/fdinfo`
 
 #### Network Activity
 - Socket creation events

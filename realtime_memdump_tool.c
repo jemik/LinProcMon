@@ -76,6 +76,27 @@ sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Async file operation queue for sandbox reporting (non-blocking)
+#define FILE_OP_QUEUE_SIZE 128
+typedef struct {
+    pid_t pid;
+    char operation[32];
+    char filepath[512];
+} file_op_t;
+
+typedef struct {
+    file_op_t ops[FILE_OP_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    int shutdown;
+} file_op_queue_t;
+
+file_op_queue_t file_op_queue;
+pthread_t file_worker_thread;
+
 // Statistics (now protected by mutex)
 static unsigned long total_events = 0;
 static unsigned long suspicious_found = 0;
@@ -233,6 +254,135 @@ void json_escape(const char *src, char *dst, size_t dst_size) {
     dst[j] = '\0';
 }
 
+// File operation queue functions (non-blocking)
+void file_op_queue_init(file_op_queue_t *q) {
+    memset(q, 0, sizeof(file_op_queue_t));
+    pthread_mutex_init(&q->mutex, NULL);
+    pthread_cond_init(&q->not_empty, NULL);
+    q->shutdown = 0;
+}
+
+int file_op_queue_push(file_op_queue_t *q, pid_t pid, const char *operation, const char *filepath) {
+    pthread_mutex_lock(&q->mutex);
+    
+    if (q->count >= FILE_OP_QUEUE_SIZE) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;  // Queue full, drop
+    }
+    
+    q->ops[q->tail].pid = pid;
+    strncpy(q->ops[q->tail].operation, operation, sizeof(q->ops[0].operation) - 1);
+    strncpy(q->ops[q->tail].filepath, filepath, sizeof(q->ops[0].filepath) - 1);
+    q->tail = (q->tail + 1) % FILE_OP_QUEUE_SIZE;
+    q->count++;
+    
+    pthread_cond_signal(&q->not_empty);
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+int file_op_queue_pop(file_op_queue_t *q, file_op_t *op) {
+    pthread_mutex_lock(&q->mutex);
+    
+    while (q->count == 0 && !q->shutdown) {
+        pthread_cond_wait(&q->not_empty, &q->mutex);
+    }
+    
+    if (q->shutdown && q->count == 0) {
+        pthread_mutex_unlock(&q->mutex);
+        return -1;
+    }
+    
+    *op = q->ops[q->head];
+    q->head = (q->head + 1) % FILE_OP_QUEUE_SIZE;
+    q->count--;
+    
+    pthread_mutex_unlock(&q->mutex);
+    return 0;
+}
+
+// Background worker for file operations (hashing, copying) - doesn't block monitoring
+void* file_operation_worker(void *arg) {
+    (void)arg;
+    
+    while (1) {
+        file_op_t op;
+        if (file_op_queue_pop(&file_op_queue, &op) < 0) {
+            break;  // Shutdown
+        }
+        
+        // Process file operation in background
+        if (strcmp(op.operation, "created") == 0 || strcmp(op.operation, "written") == 0) {
+            // Check if file still exists and is accessible
+            struct stat st;
+            if (stat(op.filepath, &st) < 0) {
+                // File deleted or inaccessible - still log it
+                printf("[SANDBOX] File %s but no longer accessible: %s (PID=%d)\n",
+                       op.operation, op.filepath, op.pid);
+                continue;
+            }
+            
+            // Generate safe filename preserving directory structure indicators
+            char safe_filename[1024];
+            const char *filepath_ptr = op.filepath;
+            
+            // Strip leading slashes
+            while (*filepath_ptr == '/') filepath_ptr++;
+            
+            // Replace remaining slashes with underscores
+            int i = 0;
+            for (const char *p = filepath_ptr; *p && i < 1000; p++) {
+                if (*p == '/') {
+                    safe_filename[i++] = '_';
+                } else {
+                    safe_filename[i++] = *p;
+                }
+            }
+            safe_filename[i] = '\0';
+            
+            char dest_path[1024];
+            snprintf(dest_path, sizeof(dest_path), "%s/%s", sandbox_dropped_dir, safe_filename);
+            
+            // Copy file
+            FILE *src = fopen(op.filepath, "rb");
+            if (src) {
+                FILE *dst = fopen(dest_path, "wb");
+                if (dst) {
+                    char buffer[8192];
+                    size_t bytes;
+                    size_t total_bytes = 0;
+                    while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+                        fwrite(buffer, 1, bytes, dst);
+                        total_bytes += bytes;
+                    }
+                    fclose(dst);
+                    
+                    // Calculate hashes (this is the slow part - now async!)
+                    char sha1[41], sha256[65];
+                    if (calculate_sha1(dest_path, sha1) == 0 && calculate_sha256(dest_path, sha256) == 0) {
+                        // Detect file type
+                        const char *ftype = get_file_type(dest_path);
+                        printf("[SANDBOX] Captured %s: %s (%zu bytes, type: %s, SHA-1: %s)\n",
+                               op.operation, op.filepath, total_bytes, ftype, sha1);
+                    }
+                } else {
+                    fprintf(stderr, "[WARN] Could not create %s: %s\n", dest_path, strerror(errno));
+                }
+                fclose(src);
+            } else {
+                // File exists but can't be read - log it
+                printf("[SANDBOX] File %s (no read access): %s (PID=%d, size=%ld)\n",
+                       op.operation, op.filepath, op.pid, (long)st.st_size);
+            }
+        } else if (strcmp(op.operation, "accessed") == 0) {
+            // Just log access to suspicious locations (no copy)
+            printf("[SANDBOX] File accessed: %s (PID=%d)\n", op.filepath, op.pid);
+        }
+    }
+    
+    return NULL;
+}
+
 // Initialize sandbox reporting
 int init_sandbox_reporting(const char *sample_path) {
     // Calculate SHA-1 of sample
@@ -297,13 +447,11 @@ int init_sandbox_reporting(const char *sample_path) {
     return 0;
 }
 
-// Add process to sandbox report
+// Add process to sandbox report (fast - just in-memory tracking)
 void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char *path, const char *cmdline) {
     if (!sandbox_json_report) return;
     
-    pthread_mutex_lock(&report_mutex);
-    
-    // Track process
+    // Only need one mutex - just tracking in memory, no I/O
     pthread_mutex_lock(&sandbox_proc_mutex);
     if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
         sandbox_processes[sandbox_process_count].pid = pid;
@@ -316,48 +464,20 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
         sandbox_process_count++;
     }
     pthread_mutex_unlock(&sandbox_proc_mutex);
-    
-    pthread_mutex_unlock(&report_mutex);
 }
 
 // Add file operation to report
+// Add file operation to report (async - non-blocking)
 void report_file_operation(pid_t pid, const char *operation, const char *filepath) {
     if (!sandbox_json_report) return;
     
-    pthread_mutex_lock(&report_mutex);
-    
-    // Copy file to dropped_files directory if it's a create/write operation
-    if (strcmp(operation, "created") == 0 || strcmp(operation, "written") == 0) {
-        const char *filename = strrchr(filepath, '/');
-        filename = filename ? filename + 1 : filepath;
-        
-        char dest_path[1024];
-        snprintf(dest_path, sizeof(dest_path), "%s/%s", sandbox_dropped_dir, filename);
-        
-        // Try to copy the file
-        FILE *src = fopen(filepath, "rb");
-        if (src) {
-            FILE *dst = fopen(dest_path, "wb");
-            if (dst) {
-                char buffer[8192];
-                size_t bytes;
-                while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-                    fwrite(buffer, 1, bytes, dst);
-                }
-                fclose(dst);
-                
-                // Calculate hashes
-                char sha1[41], sha256[65];
-                calculate_sha1(dest_path, sha1);
-                calculate_sha256(dest_path, sha256);
-                
-                printf("[SANDBOX] Captured dropped file: %s (SHA-1: %s)\n", filename, sha1);
-            }
-            fclose(src);
+    // Queue for background processing instead of blocking
+    if (file_op_queue_push(&file_op_queue, pid, operation, filepath) < 0) {
+        // Queue full, just log without blocking
+        if (!quiet_mode) {
+            fprintf(stderr, "[WARN] File operation queue full, skipping: %s\n", filepath);
         }
     }
-    
-    pthread_mutex_unlock(&report_mutex);
 }
 
 // Add network activity to report  
@@ -475,12 +595,7 @@ void cleanup(int sig) {
     running = 0;  // Signal main loop to exit
     printf("\n[!] Exiting...\n");
     
-    // Finalize sandbox report if in sandbox mode
-    if (sandbox_mode && sandbox_json_report) {
-        finalize_sandbox_report();
-    }
-    
-    // Signal shutdown and wake up worker threads
+    // Signal shutdown to all worker threads first
     pthread_mutex_lock(&event_queue.mutex);
     event_queue.shutdown = 1;
     pthread_cond_broadcast(&event_queue.not_empty);
@@ -492,6 +607,22 @@ void cleanup(int sig) {
         dump_queue.shutdown = 1;
         pthread_cond_signal(&dump_queue.not_empty);
         pthread_mutex_unlock(&dump_queue.mutex);
+    }
+    
+    // Signal file operation thread to shutdown
+    if (sandbox_mode) {
+        pthread_mutex_lock(&file_op_queue.mutex);
+        file_op_queue.shutdown = 1;
+        pthread_cond_signal(&file_op_queue.not_empty);
+        pthread_mutex_unlock(&file_op_queue.mutex);
+        
+        // Give file worker time to finish pending operations
+        usleep(100000);  // 100ms
+    }
+    
+    // Finalize sandbox report after workers are done
+    if (sandbox_mode && sandbox_json_report) {
+        finalize_sandbox_report();
     }
     
     printf("[*] Statistics:\n");
@@ -1019,7 +1150,105 @@ static int is_sandbox_process(pid_t pid) {
     return 0;
 }
 
-// Monitor file creation by sandbox process
+// Check if path matches high-risk malware locations
+static int is_suspicious_file_location(const char *path, int *risk_score, char *category) {
+    *risk_score = 0;
+    category[0] = '\0';
+    
+    // Extract filename to check for hidden files
+    const char *filename = strrchr(path, '/');
+    filename = filename ? filename + 1 : path;
+    int is_hidden = (filename[0] == '.');
+    
+    // Critical persistence locations (VERY HIGH risk)
+    if (strstr(path, "/etc/cron") || 
+        strstr(path, "/var/spool/cron") ||
+        strstr(path, "/etc/init.d/") ||
+        strstr(path, "/etc/rc.local") ||
+        strstr(path, "/etc/systemd/system/") ||
+        strstr(path, "/etc/ld.so.preload")) {
+        *risk_score = 95;
+        strcpy(category, "persistence");
+        return 1;
+    }
+    
+    // Temporary/staging locations (HIGH risk)
+    if (strstr(path, "/tmp/") || 
+        strstr(path, "/var/tmp/") ||
+        strstr(path, "/dev/shm/")) {
+        *risk_score = is_hidden ? 85 : 70;
+        strcpy(category, "temp_staging");
+        return 1;
+    }
+    
+    // Library hijacking (VERY HIGH risk)
+    if ((strstr(path, "/lib/") || strstr(path, "/lib64/") || 
+         strstr(path, "/usr/lib/") || strstr(path, "/usr/local/lib/")) &&
+        (strstr(path, ".so") != NULL)) {
+        // Check if it's in a writable subdirectory or hidden
+        if (is_hidden || strstr(path, "/tmp") || strstr(path, "local")) {
+            *risk_score = 90;
+            strcpy(category, "library_hijack");
+            return 1;
+        }
+    }
+    
+    // User-level persistence (MEDIUM-HIGH risk)
+    if (strstr(path, "/.config/") ||
+        strstr(path, "/.cache/") ||
+        strstr(path, "/.local/share/") ||
+        strstr(path, "/.bashrc") ||
+        strstr(path, "/.bash_profile") ||
+        strstr(path, "/.profile") ||
+        strstr(path, "/.ssh/")) {
+        *risk_score = is_hidden ? 75 : 60;
+        strcpy(category, "user_persistence");
+        return 1;
+    }
+    
+    // Boot persistence (CRITICAL)
+    if (strstr(path, "/boot/")) {
+        *risk_score = 100;
+        strcpy(category, "boot_persistence");
+        return 1;
+    }
+    
+    // Runtime/memory locations (HIGH risk)
+    if (strstr(path, "/run/") ||
+        (strstr(path, "/proc/") && (strstr(path, "/fd/") || strstr(path, "/mem")))) {
+        *risk_score = 80;
+        strcpy(category, "runtime_fileless");
+        return 1;
+    }
+    
+    // Root staging area (HIGH risk)
+    if (strstr(path, "/root/") && !strstr(path, "/root/.cache/")) {
+        *risk_score = is_hidden ? 85 : 65;
+        strcpy(category, "root_staging");
+        return 1;
+    }
+    
+    // Home directories (MEDIUM risk if suspicious)
+    if (strstr(path, "/home/")) {
+        // Higher risk for hidden files or scripts
+        if (is_hidden || strstr(path, ".sh") || strstr(path, ".py") || strstr(path, ".pl")) {
+            *risk_score = 55;
+            strcpy(category, "user_staging");
+            return 1;
+        }
+    }
+    
+    // Hidden files anywhere (MEDIUM risk)
+    if (is_hidden && strlen(filename) > 1) {  // Ignore single '.' entries
+        *risk_score = 50;
+        strcpy(category, "hidden_file");
+        return 1;
+    }
+    
+    return 0;
+}
+
+// Monitor file creation, modification, and access by sandbox process
 static void check_file_operations(pid_t pid) {
     if (!sandbox_mode || !is_sandbox_process(pid)) return;
     
@@ -1041,13 +1270,51 @@ static void check_file_operations(pid_t pid) {
         if (len > 0) {
             target[len] = '\0';
             
-            // Check for suspicious file creation
-            if (strstr(target, "/tmp/") || strstr(target, "/dev/shm/") || 
-                strstr(target, "/var/tmp/")) {
-                printf("[SANDBOX] File created: %s (PID=%d)\n", target, pid);
-                report_file_operation(pid, "created", target);
+            // Skip non-file descriptors
+            if (strstr(target, "socket:") || strstr(target, "pipe:") || 
+                strstr(target, "anon_inode:") || target[0] != '/') {
+                continue;
+            }
+            
+            // Check if this is a suspicious location
+            int risk_score;
+            char category[64];
+            if (is_suspicious_file_location(target, &risk_score, category)) {
+                // Check file access mode to determine operation type
+                char fdinfo_path[128];
+                snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/%s", pid, entry->d_name);
+                
+                FILE *fdinfo = fopen(fdinfo_path, "r");
+                const char *op_type = "accessed";
+                if (fdinfo) {
+                    char line[256];
+                    while (fgets(line, sizeof(line), fdinfo)) {
+                        if (strstr(line, "flags:")) {
+                            // O_WRONLY=01, O_RDWR=02, O_CREAT=0100
+                            unsigned int flags;
+                            if (sscanf(line, "flags: %o", &flags) == 1) {
+                                if (flags & 0100) {  // O_CREAT
+                                    op_type = "created";
+                                } else if (flags & 03) {  // O_WRONLY | O_RDWR
+                                    op_type = "written";
+                                }
+                            }
+                            break;
+                        }
+                    }
+                    fclose(fdinfo);
+                }
+                
+                printf("[SANDBOX] File %s: %s (PID=%d, Risk=%d, Category=%s)\n", 
+                       op_type, target, pid, risk_score, category);
+                       
+                report_file_operation(pid, op_type, target);
+                
                 pthread_mutex_lock(&stats_mutex);
                 files_created++;
+                if (risk_score >= 80) {
+                    suspicious_found++;  // High-risk file operation
+                }
                 pthread_mutex_unlock(&stats_mutex);
             }
         }
