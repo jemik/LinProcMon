@@ -900,6 +900,22 @@ void finalize_sandbox_report_signal_safe() {
     sandbox_json_report = NULL;
 }
 
+// Emergency exit handler - runs even if signals don't work
+void emergency_exit_handler() {
+    static int exit_called = 0;
+    if (exit_called) return;
+    exit_called = 1;
+    
+    // Only run in sandbox mode
+    if (!sandbox_mode) return;
+    
+    // Only finalize if directory is set
+    if (strlen(sandbox_report_dir) > 0) {
+        fprintf(stderr, "[EMERGENCY] atexit() handler running, finalizing report...\n");
+        finalize_sandbox_report();
+    }
+}
+
 // Flush current report data (for periodic saves or crash recovery)
 void flush_sandbox_report() {
     if (!sandbox_json_report || !sandbox_mode) return;
@@ -979,18 +995,13 @@ void cleanup(int sig) {
         int len = snprintf(msg, sizeof(msg), "\n[!] Caught signal %d, finalizing report...\n", sig);
         write(STDERR_FILENO, msg, len);
         
-        // CRITICAL: Finalize report FIRST before any other operations
-        if (sandbox_mode && sandbox_json_report) {
-            write(STDERR_FILENO, "[DEBUG] Calling finalize_sandbox_report_signal_safe()...\n", 57);
+        // CRITICAL: Always finalize report in sandbox mode (even if file pointer is NULL)
+        if (sandbox_mode) {
+            write(STDERR_FILENO, "[DEBUG] Calling finalize_sandbox_report_signal_safe()...\n", 59);
             finalize_sandbox_report_signal_safe();
-            write(STDERR_FILENO, "[DEBUG] Report finalized, flushing...\n", 39);
-            // Force flush to disk
-            fsync(fileno(stdout));
-            write(STDERR_FILENO, "[DEBUG] Flush complete, exiting...\n", 36);
+            write(STDERR_FILENO, "[DEBUG] Report finalized\n", 25);
         } else {
-            len = snprintf(msg, sizeof(msg), "[DEBUG] sandbox_mode=%d, sandbox_json_report=%p\n", 
-                          sandbox_mode, (void*)sandbox_json_report);
-            write(STDERR_FILENO, msg, len);
+            write(STDERR_FILENO, "[DEBUG] Not in sandbox mode, skipping report\n", 46);
         }
         
         write(STDERR_FILENO, "[!] Report saved, exiting...\n", 30);
@@ -2248,6 +2259,9 @@ void* dump_worker(void *arg) {
 }
 
 int main(int argc, char **argv) {
+    // Register emergency exit handler FIRST - runs even if signals fail
+    atexit(emergency_exit_handler);
+    
     signal(SIGINT, cleanup);
     signal(SIGTERM, cleanup);
     signal(SIGHUP, cleanup);
