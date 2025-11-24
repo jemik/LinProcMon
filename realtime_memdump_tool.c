@@ -52,6 +52,10 @@ char** sandbox_args = NULL;  // Arguments for sandbox binary
 int sandbox_args_count = 0;  // Number of arguments
 int sandbox_timeout = 0;  // Sandbox timeout in seconds (0 = wait for process exit)
 time_t sandbox_start_time = 0;  // When sandbox started
+char sandbox_termination_status[32] = "running";  // Termination status: running, completed, timeout, crashed
+int sandbox_exit_code = -1;  // Exit code or signal number
+int sandbox_tool_crashed = 0;  // Set to 1 if tool crashes due to sample
+char sandbox_crash_reason[128] = "";  // Reason for tool crash
 
 // Sandbox reporting infrastructure
 char sandbox_report_dir[512] = "";  // Base directory for sandbox output
@@ -563,7 +567,8 @@ int init_sandbox_reporting(const char *sample_path) {
     fprintf(sandbox_json_report, "    \"total_processes\": 0,\n");
     fprintf(sandbox_json_report, "    \"files_created\": 0,\n");
     fprintf(sandbox_json_report, "    \"sockets_created\": 0,\n");
-    fprintf(sandbox_json_report, "    \"suspicious_findings\": 0\n");
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": 0,\n");
+    fprintf(sandbox_json_report, "    \"termination_status\": \"running\"\n");
     fprintf(sandbox_json_report, "  }\n");
     fprintf(sandbox_json_report, "}\n");
     fflush(sandbox_json_report);
@@ -856,7 +861,16 @@ void finalize_sandbox_report() {
     fprintf(sandbox_json_report, "    \"total_processes\": %d,\n", sandbox_process_count);
     fprintf(sandbox_json_report, "    \"files_created\": %lu,\n", files_created);
     fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
-    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu\n", suspicious_found);
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu,\n", suspicious_found);
+    fprintf(sandbox_json_report, "    \"termination_status\": \"%s\"", sandbox_termination_status);
+    if (sandbox_exit_code >= 0) {
+        fprintf(sandbox_json_report, ",\n    \"exit_code\": %d", sandbox_exit_code);
+    }
+    if (sandbox_tool_crashed) {
+        fprintf(sandbox_json_report, ",\n    \"tool_crashed\": true,\n    \"crash_reason\": \"%s\"\n", sandbox_crash_reason);
+    } else {
+        fprintf(sandbox_json_report, "\n");
+    }
     fprintf(sandbox_json_report, "  }\n");
     
     fprintf(sandbox_json_report, "}\n");
@@ -967,7 +981,16 @@ void finalize_sandbox_report_signal_safe() {
     fprintf(sandbox_json_report, "    \"total_processes\": %d,\n", sandbox_process_count);
     fprintf(sandbox_json_report, "    \"files_created\": %lu,\n", files_created);
     fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
-    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu\n", suspicious_found);
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu,\n", suspicious_found);
+    fprintf(sandbox_json_report, "    \"termination_status\": \"%s\"", sandbox_termination_status);
+    if (sandbox_exit_code >= 0) {
+        fprintf(sandbox_json_report, ",\n    \"exit_code\": %d", sandbox_exit_code);
+    }
+    if (sandbox_tool_crashed) {
+        fprintf(sandbox_json_report, ",\n    \"tool_crashed\": true,\n    \"crash_reason\": \"%s\"\n", sandbox_crash_reason);
+    } else {
+        fprintf(sandbox_json_report, "\n");
+    }
     fprintf(sandbox_json_report, "  }\n");
     
     fprintf(sandbox_json_report, "}\n");
@@ -988,6 +1011,14 @@ void emergency_exit_handler() {
     
     // Only run in sandbox mode
     if (!sandbox_mode) return;
+    
+    // If termination status is still running, the tool likely crashed
+    if (strcmp(sandbox_termination_status, "running") == 0) {
+        sandbox_tool_crashed = 1;
+        strncpy(sandbox_crash_reason, "Monitoring tool terminated unexpectedly (atexit handler)", 
+                sizeof(sandbox_crash_reason) - 1);
+        strncpy(sandbox_termination_status, "tool_crashed", sizeof(sandbox_termination_status) - 1);
+    }
     
     // Only finalize if directory is set
     if (strlen(sandbox_report_dir) > 0) {
@@ -1074,6 +1105,17 @@ void cleanup(int sig) {
         char msg[256];
         int len = snprintf(msg, sizeof(msg), "\n[!] Caught signal %d, finalizing report...\n", sig);
         write(STDERR_FILENO, msg, len);
+        
+        // Record that the tool crashed if it's not a normal termination signal
+        if (sandbox_mode && sig != SIGINT && sig != SIGTERM) {
+            sandbox_tool_crashed = 1;
+            snprintf(sandbox_crash_reason, sizeof(sandbox_crash_reason), 
+                     "Monitoring tool crashed with signal %d (%s)", sig,
+                     sig == SIGSEGV ? "SIGSEGV" : 
+                     sig == SIGABRT ? "SIGABRT" : 
+                     sig == SIGBUS ? "SIGBUS" : "UNKNOWN");
+            strncpy(sandbox_termination_status, "tool_crashed", sizeof(sandbox_termination_status) - 1);
+        }
         
         // CRITICAL: Always finalize report in sandbox mode (even if file pointer is NULL)
         if (sandbox_mode) {
@@ -2772,6 +2814,7 @@ int main(int argc, char **argv) {
                     if (sandbox_timeout > 0 && (now - sandbox_start_time) >= sandbox_timeout) {
                         printf("\n[+] Sandbox analysis timeout reached (%d minutes)\n", sandbox_timeout / 60);
                         printf("[+] Shutting down...\n");
+                        strncpy(sandbox_termination_status, "timeout", sizeof(sandbox_termination_status) - 1);
                         running = 0;
                     }
                     // If process has exited, wait 2 seconds for final data collection then exit
@@ -2780,6 +2823,32 @@ int main(int argc, char **argv) {
                         if (exit_detected == 0) {
                             printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
                             printf("[+] Collecting final data...\n");
+                            
+                            // Try to determine exit status using waitpid (non-blocking)
+                            int status;
+                            pid_t wait_result = waitpid(sandbox_root_pid, &status, WNOHANG);
+                            
+                            if (wait_result == sandbox_root_pid) {
+                                if (WIFEXITED(status)) {
+                                    sandbox_exit_code = WEXITSTATUS(status);
+                                    if (sandbox_exit_code == 0) {
+                                        strncpy(sandbox_termination_status, "completed", sizeof(sandbox_termination_status) - 1);
+                                        printf("[+] Process exited normally with code %d\n", sandbox_exit_code);
+                                    } else {
+                                        strncpy(sandbox_termination_status, "error", sizeof(sandbox_termination_status) - 1);
+                                        printf("[+] Process exited with error code %d\n", sandbox_exit_code);
+                                    }
+                                } else if (WIFSIGNALED(status)) {
+                                    sandbox_exit_code = WTERMSIG(status);
+                                    strncpy(sandbox_termination_status, "crashed", sizeof(sandbox_termination_status) - 1);
+                                    printf("[+] Process terminated by signal %d\n", sandbox_exit_code);
+                                }
+                            } else {
+                                // Process exited but we couldn't get status - assume normal completion
+                                strncpy(sandbox_termination_status, "completed", sizeof(sandbox_termination_status) - 1);
+                                printf("[+] Process terminated (status unavailable)\n");
+                            }
+                            
                             exit_detected = now;
                         }
                         // Wait 2 seconds after exit detection to collect remaining events
