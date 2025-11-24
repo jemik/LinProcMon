@@ -722,6 +722,9 @@ void finalize_sandbox_report() {
 void finalize_sandbox_report_signal_safe() {
     if (!sandbox_json_report) return;
     
+    // Get file descriptor for low-level operations
+    int fd = fileno(sandbox_json_report);
+    
     // Write all sections without locking (signal-safe)
     fprintf(sandbox_json_report, "  \"processes\": [\n");
     for (int i = 0; i < sandbox_process_count; i++) {
@@ -783,11 +786,13 @@ void finalize_sandbox_report_signal_safe() {
     fprintf(sandbox_json_report, "  }\n");
     
     fprintf(sandbox_json_report, "}\n");
+    
+    // CRITICAL: Force all buffered data to disk immediately
     fflush(sandbox_json_report);
+    fsync(fd);  // Ensure kernel writes to disk
+    
     fclose(sandbox_json_report);
     sandbox_json_report = NULL;
-    
-    printf("[+] Sandbox report finalized (signal-safe): %s/report.json\n", sandbox_report_dir);
 }
 
 // Flush current report data (for periodic saves or crash recovery)
@@ -864,10 +869,20 @@ void cleanup(int sig) {
     running = 0;  // Signal main loop to exit
     
     if (sig != 0) {
-        printf("\n[!] Caught signal %d, exiting...\n", sig);
-    } else {
-        printf("\n[!] Shutting down...\n");
+        // CRITICAL: In signal handler - must finalize report FIRST before any other operations
+        // that might fail or hang
+        if (sandbox_mode && sandbox_json_report) {
+            finalize_sandbox_report_signal_safe();
+            // Force flush to disk
+            fsync(fileno(stdout));
+        }
+        
+        printf("\n[!] Caught signal %d, report saved, exiting...\n", sig);
+        _exit(0);  // Use _exit() for immediate termination from signal handler
     }
+    
+    // Normal shutdown path (not from signal)
+    printf("\n[!] Shutting down...\n");
     
     // Signal shutdown to all worker threads first
     pthread_mutex_lock(&event_queue.mutex);
@@ -896,12 +911,7 @@ void cleanup(int sig) {
     
     // Finalize sandbox report after workers are done
     if (sandbox_mode && sandbox_json_report) {
-        if (sig != 0) {
-            // If called from signal handler, use signal-safe finalization
-            finalize_sandbox_report_signal_safe();
-        } else {
-            finalize_sandbox_report();
-        }
+        finalize_sandbox_report();
     }
     
     printf("[*] Statistics:\n");
@@ -917,11 +927,6 @@ void cleanup(int sig) {
     
     if (nl_sock >= 0) {
         close(nl_sock);
-    }
-    
-    // Only call exit if we were called from a signal handler
-    if (sig != 0) {
-        exit(0);
     }
 }
 
