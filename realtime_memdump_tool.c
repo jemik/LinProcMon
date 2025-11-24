@@ -685,9 +685,6 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
 void finalize_sandbox_report() {
     pthread_mutex_lock(&report_mutex);
     
-    printf("[DEBUG] Finalize called, sandbox_report_dir='%s'\n", sandbox_report_dir);
-    printf("[DEBUG] sandbox_json_report=%p\n", (void*)sandbox_json_report);
-    
     // Check if sandbox directory is valid
     if (strlen(sandbox_report_dir) == 0) {
         fprintf(stderr, "[!] ERROR: sandbox_report_dir is empty!\n");
@@ -695,19 +692,30 @@ void finalize_sandbox_report() {
         return;
     }
     
-    // If file was closed/NULL, reopen for appending
+    // If file was closed/NULL, reopen for writing (truncate mode)
     if (!sandbox_json_report) {
         char report_path[600];
         snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
-        printf("[DEBUG] Reopening report file: %s\n", report_path);
-        sandbox_json_report = fopen(report_path, "a");
+        sandbox_json_report = fopen(report_path, "w");
         if (!sandbox_json_report) {
             fprintf(stderr, "[!] ERROR: Cannot open report.json for finalization: %s\n", strerror(errno));
             pthread_mutex_unlock(&report_mutex);
             return;
         }
-        printf("[DEBUG] File reopened successfully\n");
+    } else {
+        // File is open - rewind and truncate to rewrite from scratch
+        rewind(sandbox_json_report);
+        if (ftruncate(fileno(sandbox_json_report), 0) != 0) {
+            fprintf(stderr, "[!] WARN: Could not truncate report file\n");
+        }
     }
+    
+    // Write complete JSON from scratch
+    fprintf(sandbox_json_report, "{\n");
+    fprintf(sandbox_json_report, "  \"analysis\": {\n");
+    fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time);
+    fprintf(sandbox_json_report, "    \"sample_sha1\": \"%s\"\n", sample_sha1);
+    fprintf(sandbox_json_report, "  },\n");
     
     // Write process tree - read from temp file if exists
     fprintf(sandbox_json_report, "  \"processes\": [\n");
@@ -797,8 +805,8 @@ void finalize_sandbox_report() {
     fprintf(sandbox_json_report, "  }\n");
     
     fprintf(sandbox_json_report, "}\n");
-    fclose(sandbox_json_report);
-    sandbox_json_report = NULL;
+    fflush(sandbox_json_report);
+    // DO NOT close or set to NULL - keep file open for periodic updates
     
     printf("[+] Sandbox report finalized: %s/report.json\n", sandbox_report_dir);
     
