@@ -1,3 +1,67 @@
+// Signal-safe finalization: no mutexes, best-effort write
+void finalize_sandbox_report_signal_safe() {
+    if (!sandbox_json_report) return;
+    // Write all sections without locking
+    fprintf(sandbox_json_report, "  \"processes\": [\n");
+    for (int i = 0; i < sandbox_process_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_processes[i].pid);
+        fprintf(sandbox_json_report, "      \"ppid\": %d,\n", sandbox_processes[i].ppid);
+        fprintf(sandbox_json_report, "      \"name\": \"%s\",\n", sandbox_processes[i].name);
+        fprintf(sandbox_json_report, "      \"path\": \"%s\",\n", sandbox_processes[i].path);
+        fprintf(sandbox_json_report, "      \"cmdline\": \"%s\",\n", sandbox_processes[i].cmdline);
+        fprintf(sandbox_json_report, "      \"start_time\": %ld\n", sandbox_processes[i].start_time);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_process_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    fprintf(sandbox_json_report, "  \"file_operations\": [\n");
+    for (int i = 0; i < sandbox_file_op_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_file_ops[i].pid);
+        fprintf(sandbox_json_report, "      \"operation\": \"%s\",\n", sandbox_file_ops[i].operation);
+        fprintf(sandbox_json_report, "      \"filepath\": \"%s\",\n", sandbox_file_ops[i].filepath);
+        fprintf(sandbox_json_report, "      \"risk_score\": %d,\n", sandbox_file_ops[i].risk_score);
+        fprintf(sandbox_json_report, "      \"category\": \"%s\",\n", sandbox_file_ops[i].category);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_file_ops[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_file_op_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    fprintf(sandbox_json_report, "  \"network_activity\": [\n");
+    for (int i = 0; i < sandbox_network_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_network[i].pid);
+        fprintf(sandbox_json_report, "      \"protocol\": \"%s\",\n", sandbox_network[i].protocol);
+        fprintf(sandbox_json_report, "      \"local_address\": \"%s\",\n", sandbox_network[i].local_addr);
+        fprintf(sandbox_json_report, "      \"remote_address\": \"%s\",\n", sandbox_network[i].remote_addr);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_network[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_network_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
+    for (int i = 0; i < sandbox_memdump_count; i++) {
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_memdumps[i].pid);
+        fprintf(sandbox_json_report, "      \"filename\": \"%s\",\n", sandbox_memdumps[i].filename);
+        fprintf(sandbox_json_report, "      \"size\": %zu,\n", sandbox_memdumps[i].size);
+        fprintf(sandbox_json_report, "      \"sha1\": \"%s\",\n", sandbox_memdumps[i].sha1);
+        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_memdumps[i].timestamp);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_memdump_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    fprintf(sandbox_json_report, "  \"summary\": {\n");
+    fprintf(sandbox_json_report, "    \"end_time\": %ld,\n", time(NULL));
+    fprintf(sandbox_json_report, "    \"duration\": %ld,\n", time(NULL) - sandbox_start_time);
+    fprintf(sandbox_json_report, "    \"total_processes\": %d,\n", sandbox_process_count);
+    fprintf(sandbox_json_report, "    \"files_created\": %lu,\n", files_created);
+    fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu\n", suspicious_found);
+    fprintf(sandbox_json_report, "  }\n");
+    fprintf(sandbox_json_report, "}\n");
+    fflush(sandbox_json_report);
+    fclose(sandbox_json_report);
+    sandbox_json_report = NULL;
+    printf("[+] Sandbox report finalized (signal-safe): %s/report.json\n", sandbox_report_dir);
+}
 // realtime_memdump_tool.c
 // Linux C tool for real-time process monitoring + memory injection detection + dumping + YARA scan + env check
 
@@ -24,6 +88,8 @@
 #include <openssl/sha.h>
 #include <sys/inotify.h>
 #include <ctype.h>
+
+#include <stddef.h> // For NULL
 
 #ifdef ENABLE_YARA
 #include <yara.h>
@@ -177,9 +243,65 @@ typedef struct {
 dump_queue_t dump_queue;
 pthread_t dump_worker_thread;
 
+// Track PIDs that have already been dumped (prevent duplicate dumps)
+#define MAX_DUMPED_PIDS 512
+pid_t dumped_pids[MAX_DUMPED_PIDS];
+int dumped_pids_count = 0;
+pthread_mutex_t dumped_pids_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Track PIDs that have been processed (prevent duplicate EXEC processing)
+#define MAX_PROCESSED_PIDS 1024
+pid_t processed_pids[MAX_PROCESSED_PIDS];
+int processed_pids_count = 0;
+pthread_mutex_t processed_pids_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ============================================================================
 // SANDBOX REPORTING FUNCTIONS
 // ============================================================================
+
+// Check if PID has already been dumped
+int is_already_dumped(pid_t pid) {
+    pthread_mutex_lock(&dumped_pids_mutex);
+    for (int i = 0; i < dumped_pids_count; i++) {
+        if (dumped_pids[i] == pid) {
+            pthread_mutex_unlock(&dumped_pids_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&dumped_pids_mutex);
+    return 0;
+}
+
+// Mark PID as dumped
+void mark_as_dumped(pid_t pid) {
+    pthread_mutex_lock(&dumped_pids_mutex);
+    if (dumped_pids_count < MAX_DUMPED_PIDS) {
+        dumped_pids[dumped_pids_count++] = pid;
+    }
+    pthread_mutex_unlock(&dumped_pids_mutex);
+}
+
+// Check if PID has already been processed
+int is_already_processed(pid_t pid) {
+    pthread_mutex_lock(&processed_pids_mutex);
+    for (int i = 0; i < processed_pids_count; i++) {
+        if (processed_pids[i] == pid) {
+            pthread_mutex_unlock(&processed_pids_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&processed_pids_mutex);
+    return 0;
+}
+
+// Mark PID as processed
+void mark_as_processed(pid_t pid) {
+    pthread_mutex_lock(&processed_pids_mutex);
+    if (processed_pids_count < MAX_PROCESSED_PIDS) {
+        processed_pids[processed_pids_count++] = pid;
+    }
+    pthread_mutex_unlock(&processed_pids_mutex);
+}
 
 // Calculate SHA-1 hash of a file
 int calculate_sha1(const char *filename, char *output_hex) {
@@ -766,7 +888,12 @@ void cleanup(int sig) {
     
     // Finalize sandbox report after workers are done
     if (sandbox_mode && sandbox_json_report) {
-        finalize_sandbox_report();
+        if (sig != 0) {
+            // If called from signal handler, use signal-safe finalization
+            finalize_sandbox_report_signal_safe();
+        } else {
+            finalize_sandbox_report();
+        }
     }
     
     printf("[*] Statistics:\n");
@@ -1102,6 +1229,9 @@ void dump_full_process_memory(pid_t pid) {
     printf("[+] Full memory dump complete: %d regions, %.2f MB dumped\n", region_count, total_dumped / (1024.0 * 1024.0));
     printf("[+] Dump file: %s\n", dump_file);
     printf("[+] Memory map: %s\n", map_file);
+    
+    // Mark this PID as dumped to prevent duplicates
+    mark_as_dumped(pid);
     
     // Calculate hashes of memory dump
     char sha1[41], sha256[65];
@@ -1787,7 +1917,10 @@ void scan_maps_and_dump(pid_t pid) {
     
     // If full_dump is enabled, queue for async memory dumping (non-blocking)
     if (full_dump && suspicious_count > 0) {
-        if (dump_queue_push(&dump_queue, pid) < 0) {
+        // Check if already dumped to prevent duplicates
+        if (is_already_dumped(pid)) {
+            // Already dumped, skip
+        } else if (dump_queue_push(&dump_queue, pid) < 0) {
             if (!quiet_mode) {
                 printf("[WARN] Dump queue full, skipping full dump for PID %d\n", pid);
             }
@@ -1901,6 +2034,12 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
         pthread_mutex_lock(&stats_mutex);
         total_events++;
         pthread_mutex_unlock(&stats_mutex);
+        
+        // Check if we've already processed this PID (prevent duplicate EXEC events)
+        if (is_already_processed(pid)) {
+            return;  // Skip duplicate EXEC event
+        }
+        mark_as_processed(pid);
         
         // Non-blocking push to queue - if queue is full, event is dropped (tracked in stats)
         if (queue_push(&event_queue, pid, ppid) < 0) {
