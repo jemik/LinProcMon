@@ -80,25 +80,49 @@ sudo ldconfig
 This creates a portable binary that works on any Linux system:
 
 ```bash
-gcc -o realtime_memdump_tool realtime_memdump_tool.c -static -pthread -O2
+gcc -o realtime_memdump_tool realtime_memdump_tool.c -static -pthread -lssl -lcrypto -O2
 ```
 
-**Pros:** Works on any Linux system without installing dependencies, optimized performance  
-**Cons:** No YARA scanning support, larger binary size (~1.5MB)
+**Pros:** Works on any Linux system, optimized performance  
+**Cons:** No YARA scanning support, larger binary size (~2MB), requires OpenSSL for sandbox features
 
 ### Option 2: With YARA Support (Dynamic Linking)
 
 ```bash
-gcc -o realtime_memdump_tool realtime_memdump_tool.c -DENABLE_YARA -lyara -pthread -O2
+gcc -o realtime_memdump_tool realtime_memdump_tool.c -DENABLE_YARA -lyara -pthread -lssl -lcrypto -O2
 ```
 
-**Pros:** Full YARA malware scanning capabilities  
-**Cons:** Requires libyara installed on target system
+**Pros:** Full YARA malware scanning capabilities + complete sandbox reporting  
+**Cons:** Requires libyara and OpenSSL installed on target system
 
-### Option 3: Debug Build with Warnings
+### Option 3: Minimal Build (Without Sandbox Reporting)
+
+If you don't need the enhanced sandbox features with JSON reporting:
 
 ```bash
-gcc -o realtime_memdump_tool realtime_memdump_tool.c -DENABLE_YARA -lyara -pthread -g -Wall -Wextra
+gcc -o realtime_memdump_tool realtime_memdump_tool.c -pthread -O2
+```
+
+**Note:** This disables file hashing and JSON reporting in sandbox mode.
+
+### Option 4: Debug Build with Warnings
+
+```bash
+gcc -o realtime_memdump_tool realtime_memdump_tool.c -DENABLE_YARA -lyara -pthread -lssl -lcrypto -g -Wall -Wextra
+```
+
+### Dependencies for Enhanced Sandbox Features
+
+For comprehensive sandbox reporting with JSON output, file hashing, and dropped file collection:
+
+**Ubuntu/Debian:**
+```bash
+sudo apt-get install libssl-dev
+```
+
+**RHEL/CentOS/Fedora:**
+```bash
+sudo yum install openssl-devel
 ```
 
 ## Usage
@@ -155,11 +179,14 @@ sudo ./realtime_memdump_tool --continuous --quiet
 
 ### Sandbox Mode
 
-Execute and monitor a specific binary or script for malicious behavior. **IMPORTANT**: `--sandbox` must always be the LAST argument, as everything after it is passed to the sandboxed program.
+Execute and monitor a specific binary or script for malicious behavior with **comprehensive JSON reporting**. **IMPORTANT**: `--sandbox` must always be the LAST argument, as everything after it is passed to the sandboxed program.
+
+📋 **See [SANDBOX_FEATURES.md](SANDBOX_FEATURES.md) for complete documentation on enhanced sandbox features including JSON reporting, file collection, and analysis workflow.**
 
 **Monitor binary execution:**
 ```bash
 sudo ./realtime_memdump_tool --sandbox ./malware
+# Creates: sandbox_<SHA1>/ directory with full JSON report
 ```
 
 **With command-line arguments:**

@@ -19,6 +19,11 @@
 #include <dirent.h>
 #include <time.h>
 #include <pthread.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <openssl/sha.h>
+#include <sys/inotify.h>
+#include <ctype.h>
 
 #ifdef ENABLE_YARA
 #include <yara.h>
@@ -45,6 +50,31 @@ char** sandbox_args = NULL;  // Arguments for sandbox binary
 int sandbox_args_count = 0;  // Number of arguments
 int sandbox_timeout = 0;  // Sandbox timeout in seconds (0 = wait for process exit)
 time_t sandbox_start_time = 0;  // When sandbox started
+
+// Sandbox reporting infrastructure
+char sandbox_report_dir[512] = "";  // Base directory for sandbox output
+char sandbox_dropped_dir[512] = "";  // Directory for dropped files
+char sandbox_memdump_dir[512] = "";  // Directory for memory dumps
+char sample_sha1[41] = "";  // SHA-1 of sample being analyzed
+FILE *sandbox_json_report = NULL;  // JSON report file
+pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;
+int json_first_item = 1;  // Track if we need comma before next JSON item
+
+// Process tracking for sandbox
+#define MAX_SANDBOX_PROCESSES 256
+typedef struct {
+    pid_t pid;
+    pid_t ppid;
+    char name[256];
+    char path[512];
+    char cmdline[1024];
+    time_t start_time;
+    int active;
+} sandbox_process_t;
+
+sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
+int sandbox_process_count = 0;
+pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Statistics (now protected by mutex)
 static unsigned long total_events = 0;
@@ -89,6 +119,309 @@ typedef struct {
 
 dump_queue_t dump_queue;
 pthread_t dump_worker_thread;
+
+// ============================================================================
+// SANDBOX REPORTING FUNCTIONS
+// ============================================================================
+
+// Calculate SHA-1 hash of a file
+int calculate_sha1(const char *filename, char *output_hex) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return -1;
+    
+    SHA_CTX sha1;
+    SHA1_Init(&sha1);
+    
+    unsigned char buffer[8192];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        SHA1_Update(&sha1, buffer, bytes);
+    }
+    
+    unsigned char hash[SHA_DIGEST_LENGTH];
+    SHA1_Final(hash, &sha1);
+    fclose(file);
+    
+    for (int i = 0; i < SHA_DIGEST_LENGTH; i++) {
+        sprintf(output_hex + (i * 2), "%02x", hash[i]);
+    }
+    output_hex[40] = '\0';
+    
+    return 0;
+}
+
+// Calculate SHA-256 hash of a file
+int calculate_sha256(const char *filename, char *output_hex) {
+    FILE *file = fopen(filename, "rb");
+    if (!file) return -1;
+    
+    SHA256_CTX sha256;
+    SHA256_Init(&sha256);
+    
+    unsigned char buffer[8192];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        SHA256_Update(&sha256, buffer, bytes);
+    }
+    
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256_Final(hash, &sha256);
+    fclose(file);
+    
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(output_hex + (i * 2), "%02x", hash[i]);
+    }
+    output_hex[64] = '\0';
+    
+    return 0;
+}
+
+// Get file type using basic magic number detection
+const char* get_file_type(const char *filename) {
+    FILE *f = fopen(filename, "rb");
+    if (!f) return "unknown";
+    
+    unsigned char magic[16];
+    size_t bytes = fread(magic, 1, sizeof(magic), f);
+    fclose(f);
+    
+    if (bytes < 4) return "empty";
+    
+    // ELF
+    if (magic[0] == 0x7F && magic[1] == 'E' && magic[2] == 'L' && magic[3] == 'F')
+        return "ELF";
+    // PE/COFF
+    if (magic[0] == 'M' && magic[1] == 'Z')
+        return "PE";
+    // Shell script
+    if (magic[0] == '#' && magic[1] == '!')
+        return "script";
+    // Python
+    if (bytes > 10 && strstr((char*)magic, "python"))
+        return "python";
+    // Text
+    int is_text = 1;
+    for (size_t i = 0; i < bytes && i < 256; i++) {
+        if (magic[i] < 32 && magic[i] != '\n' && magic[i] != '\r' && magic[i] != '\t') {
+            is_text = 0;
+            break;
+        }
+    }
+    if (is_text) return "text";
+    
+    return "binary";
+}
+
+// JSON escape string
+void json_escape(const char *src, char *dst, size_t dst_size) {
+    size_t j = 0;
+    for (size_t i = 0; src[i] && j < dst_size - 2; i++) {
+        switch (src[i]) {
+            case '"':  dst[j++] = '\\'; dst[j++] = '"'; break;
+            case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+            case '\n': dst[j++] = '\\'; dst[j++] = 'n'; break;
+            case '\r': dst[j++] = '\\'; dst[j++] = 'r'; break;
+            case '\t': dst[j++] = '\\'; dst[j++] = 't'; break;
+            default:
+                if (src[i] < 32) {
+                    j += snprintf(dst + j, dst_size - j, "\\u%04x", (unsigned char)src[i]);
+                } else {
+                    dst[j++] = src[i];
+                }
+        }
+    }
+    dst[j] = '\0';
+}
+
+// Initialize sandbox reporting
+int init_sandbox_reporting(const char *sample_path) {
+    // Calculate SHA-1 of sample
+    if (calculate_sha1(sample_path, sample_sha1) < 0) {
+        fprintf(stderr, "[!] Warning: Could not calculate SHA-1 of sample\n");
+        snprintf(sample_sha1, sizeof(sample_sha1), "unknown_%ld", time(NULL));
+    }
+    
+    // Create base directory
+    snprintf(sandbox_report_dir, sizeof(sandbox_report_dir), "sandbox_%s", sample_sha1);
+    if (mkdir(sandbox_report_dir, 0755) < 0 && errno != EEXIST) {
+        perror("mkdir sandbox dir");
+        return -1;
+    }
+    
+    // Create subdirectories
+    snprintf(sandbox_dropped_dir, sizeof(sandbox_dropped_dir), "%s/dropped_files", sandbox_report_dir);
+    mkdir(sandbox_dropped_dir, 0755);
+    
+    snprintf(sandbox_memdump_dir, sizeof(sandbox_memdump_dir), "%s/memory_dumps", sandbox_report_dir);
+    mkdir(sandbox_memdump_dir, 0755);
+    
+    // Create JSON report file
+    char report_path[600];
+    snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
+    sandbox_json_report = fopen(report_path, "w");
+    if (!sandbox_json_report) {
+        perror("fopen report.json");
+        return -1;
+    }
+    
+    // Start JSON structure
+    fprintf(sandbox_json_report, "{\n");
+    fprintf(sandbox_json_report, "  \"analysis\": {\n");
+    fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", time(NULL));
+    fprintf(sandbox_json_report, "    \"sample_path\": \"%s\",\n", sample_path);
+    fprintf(sandbox_json_report, "    \"sample_sha1\": \"%s\",\n", sample_sha1);
+    
+    // Calculate SHA-256
+    char sha256[65];
+    if (calculate_sha256(sample_path, sha256) == 0) {
+        fprintf(sandbox_json_report, "    \"sample_sha256\": \"%s\",\n", sha256);
+    }
+    
+    // File type
+    fprintf(sandbox_json_report, "    \"sample_type\": \"%s\",\n", get_file_type(sample_path));
+    
+    // Get file size
+    struct stat st;
+    if (stat(sample_path, &st) == 0) {
+        fprintf(sandbox_json_report, "    \"sample_size\": %ld,\n", st.st_size);
+    }
+    
+    fprintf(sandbox_json_report, "    \"timeout\": %d\n", sandbox_timeout);
+    fprintf(sandbox_json_report, "  },\n");
+    
+    fflush(sandbox_json_report);
+    
+    printf("[+] Sandbox report directory: %s/\n", sandbox_report_dir);
+    printf("[+] Sample SHA-1: %s\n", sample_sha1);
+    
+    return 0;
+}
+
+// Add process to sandbox report
+void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char *path, const char *cmdline) {
+    if (!sandbox_json_report) return;
+    
+    pthread_mutex_lock(&report_mutex);
+    
+    // Track process
+    pthread_mutex_lock(&sandbox_proc_mutex);
+    if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
+        sandbox_processes[sandbox_process_count].pid = pid;
+        sandbox_processes[sandbox_process_count].ppid = ppid;
+        strncpy(sandbox_processes[sandbox_process_count].name, name, sizeof(sandbox_processes[0].name) - 1);
+        strncpy(sandbox_processes[sandbox_process_count].path, path, sizeof(sandbox_processes[0].path) - 1);
+        strncpy(sandbox_processes[sandbox_process_count].cmdline, cmdline, sizeof(sandbox_processes[0].cmdline) - 1);
+        sandbox_processes[sandbox_process_count].start_time = time(NULL);
+        sandbox_processes[sandbox_process_count].active = 1;
+        sandbox_process_count++;
+    }
+    pthread_mutex_unlock(&sandbox_proc_mutex);
+    
+    pthread_mutex_unlock(&report_mutex);
+}
+
+// Add file operation to report
+void report_file_operation(pid_t pid, const char *operation, const char *filepath) {
+    if (!sandbox_json_report) return;
+    
+    pthread_mutex_lock(&report_mutex);
+    
+    // Copy file to dropped_files directory if it's a create/write operation
+    if (strcmp(operation, "created") == 0 || strcmp(operation, "written") == 0) {
+        const char *filename = strrchr(filepath, '/');
+        filename = filename ? filename + 1 : filepath;
+        
+        char dest_path[1024];
+        snprintf(dest_path, sizeof(dest_path), "%s/%s", sandbox_dropped_dir, filename);
+        
+        // Try to copy the file
+        FILE *src = fopen(filepath, "rb");
+        if (src) {
+            FILE *dst = fopen(dest_path, "wb");
+            if (dst) {
+                char buffer[8192];
+                size_t bytes;
+                while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+                    fwrite(buffer, 1, bytes, dst);
+                }
+                fclose(dst);
+                
+                // Calculate hashes
+                char sha1[41], sha256[65];
+                calculate_sha1(dest_path, sha1);
+                calculate_sha256(dest_path, sha256);
+                
+                printf("[SANDBOX] Captured dropped file: %s (SHA-1: %s)\n", filename, sha1);
+            }
+            fclose(src);
+        }
+    }
+    
+    pthread_mutex_unlock(&report_mutex);
+}
+
+// Add network activity to report  
+void report_network_activity(pid_t pid, const char *protocol, const char *local_addr, const char *remote_addr) {
+    if (!sandbox_json_report) return;
+    
+    pthread_mutex_lock(&report_mutex);
+    
+    char escaped_local[256], escaped_remote[256];
+    json_escape(local_addr, escaped_local, sizeof(escaped_local));
+    json_escape(remote_addr, escaped_remote, sizeof(escaped_remote));
+    
+    printf("[SANDBOX] Network: PID=%d %s %s -> %s\n", pid, protocol, local_addr, remote_addr);
+    
+    pthread_mutex_unlock(&report_mutex);
+}
+
+// Finalize sandbox report
+void finalize_sandbox_report() {
+    if (!sandbox_json_report) return;
+    
+    pthread_mutex_lock(&report_mutex);
+    
+    // Write process tree
+    fprintf(sandbox_json_report, "  \"processes\": [\n");
+    for (int i = 0; i < sandbox_process_count; i++) {
+        char escaped_name[512], escaped_path[1024], escaped_cmdline[2048];
+        json_escape(sandbox_processes[i].name, escaped_name, sizeof(escaped_name));
+        json_escape(sandbox_processes[i].path, escaped_path, sizeof(escaped_path));
+        json_escape(sandbox_processes[i].cmdline, escaped_cmdline, sizeof(escaped_cmdline));
+        
+        fprintf(sandbox_json_report, "    {\n");
+        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_processes[i].pid);
+        fprintf(sandbox_json_report, "      \"ppid\": %d,\n", sandbox_processes[i].ppid);
+        fprintf(sandbox_json_report, "      \"name\": \"%s\",\n", escaped_name);
+        fprintf(sandbox_json_report, "      \"path\": \"%s\",\n", escaped_path);
+        fprintf(sandbox_json_report, "      \"cmdline\": \"%s\",\n", escaped_cmdline);
+        fprintf(sandbox_json_report, "      \"start_time\": %ld\n", sandbox_processes[i].start_time);
+        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_process_count - 1) ? "," : "");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
+    // Write summary
+    fprintf(sandbox_json_report, "  \"summary\": {\n");
+    fprintf(sandbox_json_report, "    \"end_time\": %ld,\n", time(NULL));
+    fprintf(sandbox_json_report, "    \"duration\": %ld,\n", time(NULL) - sandbox_start_time);
+    fprintf(sandbox_json_report, "    \"total_processes\": %d,\n", sandbox_process_count);
+    fprintf(sandbox_json_report, "    \"files_created\": %lu,\n", files_created);
+    fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu\n", suspicious_found);
+    fprintf(sandbox_json_report, "  }\n");
+    
+    fprintf(sandbox_json_report, "}\n");
+    fclose(sandbox_json_report);
+    sandbox_json_report = NULL;
+    
+    printf("[+] Sandbox report finalized: %s/report.json\n", sandbox_report_dir);
+    
+    pthread_mutex_unlock(&report_mutex);
+}
+
+// ============================================================================
+// END SANDBOX REPORTING
+// ============================================================================
 
 // Initialize dump queue
 void dump_queue_init(dump_queue_t *q) {
@@ -141,6 +474,11 @@ int dump_queue_pop(dump_queue_t *q, pid_t *pid) {
 void cleanup(int sig) {
     running = 0;  // Signal main loop to exit
     printf("\n[!] Exiting...\n");
+    
+    // Finalize sandbox report if in sandbox mode
+    if (sandbox_mode && sandbox_json_report) {
+        finalize_sandbox_report();
+    }
     
     // Signal shutdown and wake up worker threads
     pthread_mutex_lock(&event_queue.mutex);
@@ -343,9 +681,16 @@ void dump_full_process_memory(pid_t pid) {
     }
 
     // Create single dump file and map file
-    char dump_file[128], map_file[128];
-    snprintf(dump_file, sizeof(dump_file), "memdump_%d_%s.bin", pid, comm);
-    snprintf(map_file, sizeof(map_file), "memdump_%d_%s.map", pid, comm);
+    char dump_file[512], map_file[512];
+    
+    // If sandbox mode, save to sandbox directory
+    if (sandbox_mode && strlen(sandbox_memdump_dir) > 0) {
+        snprintf(dump_file, sizeof(dump_file), "%s/memdump_%d_%s.bin", sandbox_memdump_dir, pid, comm);
+        snprintf(map_file, sizeof(map_file), "%s/memdump_%d_%s.map", sandbox_memdump_dir, pid, comm);
+    } else {
+        snprintf(dump_file, sizeof(dump_file), "memdump_%d_%s.bin", pid, comm);
+        snprintf(map_file, sizeof(map_file), "memdump_%d_%s.map", pid, comm);
+    }
     
     printf("[+] Dumping full memory for PID %d (%s) to %s\n", pid, comm, dump_file);
 
@@ -475,6 +820,15 @@ void dump_full_process_memory(pid_t pid) {
     printf("[+] Full memory dump complete: %d regions, %.2f MB dumped\n", region_count, total_dumped / (1024.0 * 1024.0));
     printf("[+] Dump file: %s\n", dump_file);
     printf("[+] Memory map: %s\n", map_file);
+    
+    // Calculate hashes of memory dump
+    char sha1[41], sha256[65];
+    if (calculate_sha1(dump_file, sha1) == 0) {
+        printf("[+] Memory dump SHA-1: %s\n", sha1);
+    }
+    if (calculate_sha256(dump_file, sha256) == 0) {
+        printf("[+] Memory dump SHA-256: %s\n", sha256);
+    }
     
     // Optionally scan the full dump with YARA
     if (yara_rules_path) {
@@ -691,6 +1045,7 @@ static void check_file_operations(pid_t pid) {
             if (strstr(target, "/tmp/") || strstr(target, "/dev/shm/") || 
                 strstr(target, "/var/tmp/")) {
                 printf("[SANDBOX] File created: %s (PID=%d)\n", target, pid);
+                report_file_operation(pid, "created", target);
                 pthread_mutex_lock(&stats_mutex);
                 files_created++;
                 pthread_mutex_unlock(&stats_mutex);
@@ -753,6 +1108,46 @@ void scan_maps_and_dump(pid_t pid) {
         sandbox_events++;
         pthread_mutex_unlock(&stats_mutex);
         printf("[SANDBOX] Monitoring PID %d\n", pid);
+        
+        // Get process info for reporting
+        char comm[256] = "", cmdline[1024] = "", exe_path[512] = "";
+        char comm_path[64], cmdline_path[64], exe_link[64];
+        
+        snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+        FILE *comm_file = fopen(comm_path, "r");
+        if (comm_file) {
+            fgets(comm, sizeof(comm), comm_file);
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+            fclose(comm_file);
+        }
+        
+        snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", pid);
+        FILE *cmdline_file = fopen(cmdline_path, "r");
+        if (cmdline_file) {
+            size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, cmdline_file);
+            for (size_t i = 0; i < len - 1; i++) {
+                if (cmdline[i] == '\0') cmdline[i] = ' ';
+            }
+            fclose(cmdline_file);
+        }
+        
+        snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", pid);
+        ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (len > 0) exe_path[len] = '\0';
+        
+        // Get PPID
+        pid_t ppid = 0;
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+        FILE *stat_file = fopen(stat_path, "r");
+        if (stat_file) {
+            fscanf(stat_file, "%*d %*s %*c %d", &ppid);
+            fclose(stat_file);
+        }
+        
+        report_sandbox_process(pid, ppid, comm, exe_path, cmdline);
+        
         check_file_operations(pid);
         check_network_connections(pid);
     }
@@ -1242,6 +1637,24 @@ int main(int argc, char **argv) {
 
     // If sandbox mode, execute the binary and monitor its process tree
     if (sandbox_mode) {
+        // Initialize sandbox reporting
+        char sample_full_path[1024];
+        if (sandbox_binary[0] == '/') {
+            strncpy(sample_full_path, sandbox_binary, sizeof(sample_full_path) - 1);
+        } else {
+            char cwd[512];
+            getcwd(cwd, sizeof(cwd));
+            if (strchr(sandbox_binary, '/')) {
+                snprintf(sample_full_path, sizeof(sample_full_path), "%s/%s", cwd, sandbox_binary);
+            } else {
+                snprintf(sample_full_path, sizeof(sample_full_path), "%s/./%s", cwd, sandbox_binary);
+            }
+        }
+        
+        if (init_sandbox_reporting(sample_full_path) < 0) {
+            fprintf(stderr, "[!] Warning: Sandbox reporting initialization failed, continuing without JSON report\n");
+        }
+        
         printf("[+] Launching sandbox process...\n");
         
         pid_t child_pid = fork();
