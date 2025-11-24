@@ -533,6 +533,24 @@ int init_sandbox_reporting(const char *sample_path) {
     fprintf(sandbox_json_report, "    \"timeout\": %d\n", sandbox_timeout);
     fprintf(sandbox_json_report, "  },\n");
     
+    // Save analysis section to temp file for later reconstruction
+    char analysis_tmp[600];
+    snprintf(analysis_tmp, sizeof(analysis_tmp), "%s/.analysis.tmp", sandbox_report_dir);
+    FILE *atmp = fopen(analysis_tmp, "w");
+    if (atmp) {
+        fprintf(atmp, "\"sample_path\": \"%s\",\n", sample_path);
+        fprintf(atmp, "\"sample_sha1\": \"%s\",\n", sample_sha1);
+        if (calculate_sha256(sample_path, sha256) == 0) {
+            fprintf(atmp, "\"sample_sha256\": \"%s\",\n", sha256);
+        }
+        fprintf(atmp, "\"sample_type\": \"%s\",\n", get_file_type(sample_path));
+        if (stat(sample_path, &st) == 0) {
+            fprintf(atmp, "\"sample_size\": %ld,\n", st.st_size);
+        }
+        fprintf(atmp, "\"timeout\": %d\n", sandbox_timeout);
+        fclose(atmp);
+    }
+    
     // IMMEDIATELY write a minimal complete JSON in case of crash
     // This creates a valid JSON that can be updated later
     fprintf(sandbox_json_report, "  \"processes\": [],\n");
@@ -717,7 +735,22 @@ void finalize_sandbox_report() {
     fprintf(sandbox_json_report, "{\n");
     fprintf(sandbox_json_report, "  \"analysis\": {\n");
     fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time);
-    fprintf(sandbox_json_report, "    \"sample_sha1\": \"%s\"\n", sample_sha1);
+    
+    // Read full analysis from initial report or reconstruct
+    char initial_report[600];
+    snprintf(initial_report, sizeof(initial_report), "%s/.analysis.tmp", sandbox_report_dir);
+    FILE *af = fopen(initial_report, "r");
+    if (af) {
+        // Read and write all analysis fields from temp file
+        char line[1024];
+        while (fgets(line, sizeof(line), af)) {
+            fprintf(sandbox_json_report, "    %s", line);
+        }
+        fclose(af);
+    } else {
+        // Fallback: write minimal analysis
+        fprintf(sandbox_json_report, "    \"sample_sha1\": \"%s\"\n", sample_sha1);
+    }
     fprintf(sandbox_json_report, "  },\n");
     
     // Write process tree - read from temp file if exists
@@ -1443,6 +1476,9 @@ void dump_full_process_memory(pid_t pid) {
                             pid, filename, total_dumped, sha1, time(NULL));
                     fflush(tf);
                     fclose(tf);
+                    fprintf(stderr, "[DEBUG] Wrote memory dump to temp file: %s\n", temp_file);
+                } else {
+                    fprintf(stderr, "[DEBUG] ERROR: Could not open memdumps temp file: %s\n", temp_file);
                 }
             }
             
