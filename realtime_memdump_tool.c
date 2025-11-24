@@ -533,7 +533,24 @@ int init_sandbox_reporting(const char *sample_path) {
     fprintf(sandbox_json_report, "    \"timeout\": %d\n", sandbox_timeout);
     fprintf(sandbox_json_report, "  },\n");
     
+    // IMMEDIATELY write a minimal complete JSON in case of crash
+    // This creates a valid JSON that can be updated later
+    fprintf(sandbox_json_report, "  \"processes\": [],\n");
+    fprintf(sandbox_json_report, "  \"file_operations\": [],\n");
+    fprintf(sandbox_json_report, "  \"network_activity\": [],\n");
+    fprintf(sandbox_json_report, "  \"memory_dumps\": [],\n");
+    fprintf(sandbox_json_report, "  \"summary\": {\n");
+    fprintf(sandbox_json_report, "    \"end_time\": %ld,\n", time(NULL));
+    fprintf(sandbox_json_report, "    \"duration\": 0,\n");
+    fprintf(sandbox_json_report, "    \"total_processes\": 0,\n");
+    fprintf(sandbox_json_report, "    \"files_created\": 0,\n");
+    fprintf(sandbox_json_report, "    \"sockets_created\": 0,\n");
+    fprintf(sandbox_json_report, "    \"suspicious_findings\": 0\n");
+    fprintf(sandbox_json_report, "  }\n");
+    fprintf(sandbox_json_report, "}\n");
     fflush(sandbox_json_report);
+    fclose(sandbox_json_report);
+    sandbox_json_report = NULL;  // Will be reopened when needed
     
     printf("[+] Sandbox report directory: %s/\n", sandbox_report_dir);
     printf("[+] Sample SHA-1: %s\n", sample_sha1);
@@ -2258,6 +2275,22 @@ void* dump_worker(void *arg) {
     return NULL;
 }
 
+// Periodic report updater - rewrites report.json from temp files every 2 seconds
+void *periodic_report_writer(void *arg) {
+    (void)arg;  // Unused
+    
+    while (running && sandbox_mode) {
+        sleep(2);  // Update every 2 seconds
+        
+        if (strlen(sandbox_report_dir) > 0) {
+            // Rewrite the complete report from temp files
+            finalize_sandbox_report();
+        }
+    }
+    
+    return NULL;
+}
+
 int main(int argc, char **argv) {
     // Register emergency exit handler FIRST - runs even if signals fail
     atexit(emergency_exit_handler);
@@ -2487,6 +2520,14 @@ int main(int argc, char **argv) {
         
         if (init_sandbox_reporting(sample_full_path) < 0) {
             fprintf(stderr, "[!] Warning: Sandbox reporting initialization failed, continuing without JSON report\n");
+        } else {
+            // Start periodic report writer thread
+            pthread_t report_writer_thread;
+            if (pthread_create(&report_writer_thread, NULL, periodic_report_writer, NULL) != 0) {
+                perror("pthread_create report_writer");
+            } else {
+                printf("[+] Started periodic report writer (updates every 2 seconds)\n");
+            }
         }
         
         printf("[+] Launching sandbox process...\n");
