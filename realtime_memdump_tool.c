@@ -1028,6 +1028,14 @@ void finalize_sandbox_report_signal_safe() {
     fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
     fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu,\n", suspicious_found);
     fprintf(sandbox_json_report, "    \"termination_status\": \"%s\"", sandbox_termination_status);
+    
+    // Debug output to stderr
+    char debug_msg[512];
+    int debug_len = snprintf(debug_msg, sizeof(debug_msg),
+                            "[DEBUG] Signal-safe writing summary: status=%s, crashed=%d, exit_code=%d\n",
+                            sandbox_termination_status, sandbox_tool_crashed, sandbox_exit_code);
+    write(STDERR_FILENO, debug_msg, debug_len);
+    
     if (sandbox_exit_code >= 0) {
         fprintf(sandbox_json_report, ",\n    \"exit_code\": %d", sandbox_exit_code);
     }
@@ -1160,6 +1168,13 @@ void cleanup(int sig) {
                      sig == SIGABRT ? "SIGABRT" : 
                      sig == SIGBUS ? "SIGBUS" : "UNKNOWN");
             strncpy(sandbox_termination_status, "tool_crashed", sizeof(sandbox_termination_status) - 1);
+            
+            // Debug output
+            char debug[256];
+            int dlen = snprintf(debug, sizeof(debug), 
+                               "[DEBUG] Set tool_crashed=1, status=%s, reason=%s\n",
+                               sandbox_termination_status, sandbox_crash_reason);
+            write(STDERR_FILENO, debug, dlen);
         }
         
         // CRITICAL: Always finalize report in sandbox mode (even if file pointer is NULL)
