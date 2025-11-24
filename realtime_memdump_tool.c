@@ -893,17 +893,46 @@ void finalize_sandbox_report_signal_safe() {
         
         char report_path[600];
         snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
-        sandbox_json_report = fopen(report_path, "a");
+        sandbox_json_report = fopen(report_path, "w");  // CHANGED: Use "w" to truncate/rewrite
         if (!sandbox_json_report) {
             char err[256];
             int len = snprintf(err, sizeof(err), "[!] ERROR: Cannot reopen report.json in signal handler\n");
             write(STDERR_FILENO, err, len);
             return;
         }
+    } else {
+        // File is open - rewind and truncate to rewrite from scratch
+        rewind(sandbox_json_report);
+        int fd = fileno(sandbox_json_report);
+        if (ftruncate(fd, 0) != 0) {
+            write(STDERR_FILENO, "[!] WARN: Could not truncate report file in signal handler\n", 60);
+        }
     }
     
     // Get file descriptor for low-level operations
     int fd = fileno(sandbox_json_report);
+    
+    // Write complete JSON from scratch
+    fprintf(sandbox_json_report, "{\n");
+    
+    // Write analysis section
+    fprintf(sandbox_json_report, "  \"analysis\": {\n");
+    fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time);
+    
+    // Read full analysis from temp file
+    char temp_file[600];
+    snprintf(temp_file, sizeof(temp_file), "%s/.analysis.tmp", sandbox_report_dir);
+    FILE *af = fopen(temp_file, "r");
+    if (af) {
+        char line[1024];
+        while (fgets(line, sizeof(line), af)) {
+            fprintf(sandbox_json_report, "    %s", line);
+        }
+        fclose(af);
+    } else {
+        fprintf(sandbox_json_report, "    \"sample_sha1\": \"%s\"\n", sample_sha1);
+    }
+    fprintf(sandbox_json_report, "  },\n");
     
     // Write sections by reading from temp files (bulletproof - data already on disk)
     fprintf(sandbox_json_report, "  \"processes\": [\n");
@@ -960,6 +989,23 @@ void finalize_sandbox_report_signal_safe() {
     
     fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
     snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");
+    }
+    fprintf(sandbox_json_report, "  ],\n");
+    
+    fprintf(sandbox_json_report, "  \"alerts\": [\n");
+    snprintf(temp_file, sizeof(temp_file), "%s/.alerts.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
         char line[4096];
