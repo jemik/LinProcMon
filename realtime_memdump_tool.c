@@ -1442,7 +1442,7 @@ void dump_full_process_memory(pid_t pid) {
         printf("[+] Memory dump SHA-1: %s\n", sha1);
         
         // Report to JSON if in sandbox mode
-        if (sandbox_mode && sandbox_json_report) {
+        if (sandbox_mode) {
             pthread_mutex_lock(&sandbox_proc_mutex);
             
             // Check for duplicate (same PID and SHA-1 already reported)
