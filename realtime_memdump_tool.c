@@ -936,7 +936,6 @@ void finalize_sandbox_report_signal_safe() {
     
     // Write sections by reading from temp files (bulletproof - data already on disk)
     fprintf(sandbox_json_report, "  \"processes\": [\n");
-    char temp_file[600];
     snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
     FILE *tf = fopen(temp_file, "r");
     if (tf) {
