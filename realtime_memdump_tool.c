@@ -869,15 +869,26 @@ void cleanup(int sig) {
     running = 0;  // Signal main loop to exit
     
     if (sig != 0) {
-        // CRITICAL: In signal handler - must finalize report FIRST before any other operations
-        // that might fail or hang
+        // CRITICAL: In signal handler - use write() for signal-safe output
+        char msg[256];
+        int len = snprintf(msg, sizeof(msg), "\n[!] Caught signal %d, finalizing report...\n", sig);
+        write(STDERR_FILENO, msg, len);
+        
+        // CRITICAL: Finalize report FIRST before any other operations
         if (sandbox_mode && sandbox_json_report) {
+            write(STDERR_FILENO, "[DEBUG] Calling finalize_sandbox_report_signal_safe()...\n", 57);
             finalize_sandbox_report_signal_safe();
+            write(STDERR_FILENO, "[DEBUG] Report finalized, flushing...\n", 39);
             // Force flush to disk
             fsync(fileno(stdout));
+            write(STDERR_FILENO, "[DEBUG] Flush complete, exiting...\n", 36);
+        } else {
+            len = snprintf(msg, sizeof(msg), "[DEBUG] sandbox_mode=%d, sandbox_json_report=%p\n", 
+                          sandbox_mode, (void*)sandbox_json_report);
+            write(STDERR_FILENO, msg, len);
         }
         
-        printf("\n[!] Caught signal %d, report saved, exiting...\n", sig);
+        write(STDERR_FILENO, "[!] Report saved, exiting...\n", 30);
         _exit(0);  // Use _exit() for immediate termination from signal handler
     }
     
