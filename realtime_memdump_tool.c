@@ -679,11 +679,14 @@ void finalize_sandbox_report() {
         char line[4096];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
+            // Strip newline
+            line[strcspn(line, "\n")] = 0;
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
         }
         fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -695,11 +698,14 @@ void finalize_sandbox_report() {
         char line[4096];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
+            // Strip newline
+            line[strcspn(line, "\n")] = 0;
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
         }
         fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -711,45 +717,16 @@ void finalize_sandbox_report() {
         char line[4096];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
+            // Strip newline
+            line[strcspn(line, "\n")] = 0;
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
         }
         fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
-    
-    // Write memory dumps
-    fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
-    for (int i = 0; i < sandbox_memdump_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_memdumps[i].pid);
-        fprintf(sandbox_json_report, "      \"filename\": \"%s\",\n", sandbox_memdumps[i].filename);
-        fprintf(sandbox_json_report, "      \"size\": %zu,\n", sandbox_memdumps[i].size);
-        fprintf(sandbox_json_report, "      \"sha1\": \"%s\",\n", sandbox_memdumps[i].sha1);
-        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_memdumps[i].timestamp);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_memdump_count - 1) ? "," : "");
-    }
-    fprintf(sandbox_json_report, "  ],\n");
-    
-    // Write summary
-    fprintf(sandbox_json_report, "  \"summary\": {\n");
-    fprintf(sandbox_json_report, "    \"end_time\": %ld,\n", time(NULL));
-    fprintf(sandbox_json_report, "    \"duration\": %ld,\n", time(NULL) - sandbox_start_time);
-    fprintf(sandbox_json_report, "    \"total_processes\": %d,\n", sandbox_process_count);
-    fprintf(sandbox_json_report, "    \"files_created\": %lu,\n", files_created);
-    fprintf(sandbox_json_report, "    \"sockets_created\": %lu,\n", sockets_created);
-    fprintf(sandbox_json_report, "    \"suspicious_findings\": %lu\n", suspicious_found);
-    fprintf(sandbox_json_report, "  }\n");
-    
-    fprintf(sandbox_json_report, "}\n");
-    fclose(sandbox_json_report);
-    sandbox_json_report = NULL;
-    
-    printf("[+] Sandbox report finalized: %s/report.json\n", sandbox_report_dir);
-    
-    pthread_mutex_unlock(&report_mutex);
-}
     
     // Write memory dumps
     fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
