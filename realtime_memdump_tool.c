@@ -668,16 +668,28 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
 void finalize_sandbox_report() {
     pthread_mutex_lock(&report_mutex);
     
+    printf("[DEBUG] Finalize called, sandbox_report_dir='%s'\n", sandbox_report_dir);
+    printf("[DEBUG] sandbox_json_report=%p\n", (void*)sandbox_json_report);
+    
+    // Check if sandbox directory is valid
+    if (strlen(sandbox_report_dir) == 0) {
+        fprintf(stderr, "[!] ERROR: sandbox_report_dir is empty!\n");
+        pthread_mutex_unlock(&report_mutex);
+        return;
+    }
+    
     // If file was closed/NULL, reopen for appending
     if (!sandbox_json_report) {
         char report_path[600];
         snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
+        printf("[DEBUG] Reopening report file: %s\n", report_path);
         sandbox_json_report = fopen(report_path, "a");
         if (!sandbox_json_report) {
-            fprintf(stderr, "[!] ERROR: Cannot open report.json for finalization\n");
+            fprintf(stderr, "[!] ERROR: Cannot open report.json for finalization: %s\n", strerror(errno));
             pthread_mutex_unlock(&report_mutex);
             return;
         }
+        printf("[DEBUG] File reopened successfully\n");
     }
     
     // Write process tree - read from temp file if exists
@@ -979,7 +991,9 @@ void cleanup(int sig) {
     }
     
     // Finalize sandbox report after workers are done
-    if (sandbox_mode && sandbox_json_report) {
+    // Always call finalization in sandbox mode - it will reopen file if needed
+    if (sandbox_mode) {
+        printf("[*] Finalizing sandbox report...\n");
         finalize_sandbox_report();
     }
     
