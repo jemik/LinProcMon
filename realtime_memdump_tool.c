@@ -2880,6 +2880,8 @@ int main(int argc, char **argv) {
                         static int exit_logged = 0;
                         if (!exit_logged) {
                             printf("\n[+] Sandbox process (PID %d) has exited\n", sandbox_root_pid);
+                            printf("[DEBUG] Raw status=0x%x, WIFEXITED=%d, WIFSIGNALED=%d\n", 
+                                   status, WIFEXITED(status), WIFSIGNALED(status));
                             
                             if (WIFEXITED(status)) {
                                 sandbox_exit_code = WEXITSTATUS(status);
@@ -2899,6 +2901,9 @@ int main(int argc, char **argv) {
                                     sandbox_exit_code == 9 ? "SIGKILL (killed)" :
                                     sandbox_exit_code == 15 ? "SIGTERM (terminated)" : "unknown signal";
                                 printf("[+] Sample terminated by signal %d (%s)\n", sandbox_exit_code, sig_name);
+                            } else {
+                                printf("[+] Sample exited with unknown status (neither normal exit nor signal)\n");
+                                strncpy(sandbox_termination_status, "unknown", sizeof(sandbox_termination_status) - 1);
                             }
                             
                             printf("[+] Collecting final data...\n");
