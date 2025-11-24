@@ -592,8 +592,21 @@ int dump_queue_pop(dump_queue_t *q, pid_t *pid) {
 }
 
 void cleanup(int sig) {
+    static int cleanup_called = 0;
+    
+    // Prevent double cleanup
+    if (cleanup_called) {
+        return;
+    }
+    cleanup_called = 1;
+    
     running = 0;  // Signal main loop to exit
-    printf("\n[!] Exiting...\n");
+    
+    if (sig != 0) {
+        printf("\n[!] Caught signal %d, exiting...\n", sig);
+    } else {
+        printf("\n[!] Shutting down...\n");
+    }
     
     // Signal shutdown to all worker threads first
     pthread_mutex_lock(&event_queue.mutex);
@@ -617,7 +630,7 @@ void cleanup(int sig) {
         pthread_mutex_unlock(&file_op_queue.mutex);
         
         // Give file worker time to finish pending operations
-        usleep(100000);  // 100ms
+        usleep(200000);  // 200ms - increased to ensure all operations complete
     }
     
     // Finalize sandbox report after workers are done
@@ -635,8 +648,15 @@ void cleanup(int sig) {
         printf("    Files created: %lu\n", files_created);
         printf("    Sockets created: %lu\n", sockets_created);
     }
-    close(nl_sock);
-    exit(0);
+    
+    if (nl_sock >= 0) {
+        close(nl_sock);
+    }
+    
+    // Only call exit if we were called from a signal handler
+    if (sig != 0) {
+        exit(0);
+    }
 }
 
 #ifdef ENABLE_YARA
@@ -1701,6 +1721,8 @@ void* dump_worker(void *arg) {
 
 int main(int argc, char **argv) {
     signal(SIGINT, cleanup);
+    signal(SIGTERM, cleanup);
+    signal(SIGHUP, cleanup);
 
     int num_threads = 4;  // Default number of worker threads
 
@@ -2126,5 +2148,7 @@ int main(int argc, char **argv) {
         // without sleeping to prevent kernel buffer overflow
     }
 
+    // Normal exit - call cleanup to finalize reports
+    cleanup(0);
     return 0;
 }
