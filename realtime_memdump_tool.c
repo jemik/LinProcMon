@@ -790,59 +790,94 @@ void finalize_sandbox_report() {
 
 // Signal-safe finalization: no mutexes, best-effort write
 void finalize_sandbox_report_signal_safe() {
-    if (!sandbox_json_report) return;
+    // Try to reopen file if closed
+    if (!sandbox_json_report) {
+        if (strlen(sandbox_report_dir) == 0) {
+            write(STDERR_FILENO, "[!] ERROR: sandbox_report_dir empty in signal handler\n", 56);
+            return;
+        }
+        
+        char report_path[600];
+        snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
+        sandbox_json_report = fopen(report_path, "a");
+        if (!sandbox_json_report) {
+            char err[256];
+            int len = snprintf(err, sizeof(err), "[!] ERROR: Cannot reopen report.json in signal handler\n");
+            write(STDERR_FILENO, err, len);
+            return;
+        }
+    }
     
     // Get file descriptor for low-level operations
     int fd = fileno(sandbox_json_report);
     
-    // Write all sections without locking (signal-safe)
+    // Write sections by reading from temp files (bulletproof - data already on disk)
     fprintf(sandbox_json_report, "  \"processes\": [\n");
-    for (int i = 0; i < sandbox_process_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_processes[i].pid);
-        fprintf(sandbox_json_report, "      \"ppid\": %d,\n", sandbox_processes[i].ppid);
-        fprintf(sandbox_json_report, "      \"name\": \"%s\",\n", sandbox_processes[i].name);
-        fprintf(sandbox_json_report, "      \"path\": \"%s\",\n", sandbox_processes[i].path);
-        fprintf(sandbox_json_report, "      \"cmdline\": \"%s\",\n", sandbox_processes[i].cmdline);
-        fprintf(sandbox_json_report, "      \"start_time\": %ld\n", sandbox_processes[i].start_time);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_process_count - 1) ? "," : "");
+    char temp_file[600];
+    snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
+    FILE *tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");
     }
     fprintf(sandbox_json_report, "  ],\n");
     
     fprintf(sandbox_json_report, "  \"file_operations\": [\n");
-    for (int i = 0; i < sandbox_file_op_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_file_ops[i].pid);
-        fprintf(sandbox_json_report, "      \"operation\": \"%s\",\n", sandbox_file_ops[i].operation);
-        fprintf(sandbox_json_report, "      \"filepath\": \"%s\",\n", sandbox_file_ops[i].filepath);
-        fprintf(sandbox_json_report, "      \"risk_score\": %d,\n", sandbox_file_ops[i].risk_score);
-        fprintf(sandbox_json_report, "      \"category\": \"%s\",\n", sandbox_file_ops[i].category);
-        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_file_ops[i].timestamp);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_file_op_count - 1) ? "," : "");
+    snprintf(temp_file, sizeof(temp_file), "%s/.fileops.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");
     }
     fprintf(sandbox_json_report, "  ],\n");
     
     fprintf(sandbox_json_report, "  \"network_activity\": [\n");
-    for (int i = 0; i < sandbox_network_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_network[i].pid);
-        fprintf(sandbox_json_report, "      \"protocol\": \"%s\",\n", sandbox_network[i].protocol);
-        fprintf(sandbox_json_report, "      \"local_address\": \"%s\",\n", sandbox_network[i].local_addr);
-        fprintf(sandbox_json_report, "      \"remote_address\": \"%s\",\n", sandbox_network[i].remote_addr);
-        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_network[i].timestamp);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_network_count - 1) ? "," : "");
+    snprintf(temp_file, sizeof(temp_file), "%s/.network.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");
     }
     fprintf(sandbox_json_report, "  ],\n");
     
     fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
-    for (int i = 0; i < sandbox_memdump_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_memdumps[i].pid);
-        fprintf(sandbox_json_report, "      \"filename\": \"%s\",\n", sandbox_memdumps[i].filename);
-        fprintf(sandbox_json_report, "      \"size\": %zu,\n", sandbox_memdumps[i].size);
-        fprintf(sandbox_json_report, "      \"sha1\": \"%s\",\n", sandbox_memdumps[i].sha1);
-        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_memdumps[i].timestamp);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_memdump_count - 1) ? "," : "");
+    snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");
     }
     fprintf(sandbox_json_report, "  ],\n");
     
