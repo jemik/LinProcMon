@@ -317,6 +317,7 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int s
 }
 
 // Dump all memory regions of a process for dynamic unpacking analysis
+// Creates a single contiguous dump file for easy reverse engineering
 void dump_full_process_memory(pid_t pid) {
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
@@ -326,11 +327,6 @@ void dump_full_process_memory(pid_t pid) {
         perror("[-] open maps");
         return;
     }
-
-    // Create directory for this PID's dumps
-    char dump_dir[128];
-    snprintf(dump_dir, sizeof(dump_dir), "memdump_%d", pid);
-    mkdir(dump_dir, 0755);
 
     // Get process name for dump metadata
     char comm[256] = "unknown";
@@ -346,15 +342,27 @@ void dump_full_process_memory(pid_t pid) {
         fclose(comm_file);
     }
 
-    printf("[+] Dumping full memory for PID %d (%s) to %s/\n", pid, comm, dump_dir);
+    // Create single dump file and map file
+    char dump_file[128], map_file[128];
+    snprintf(dump_file, sizeof(dump_file), "memdump_%d_%s.bin", pid, comm);
+    snprintf(map_file, sizeof(map_file), "memdump_%d_%s.map", pid, comm);
+    
+    printf("[+] Dumping full memory for PID %d (%s) to %s\n", pid, comm, dump_file);
 
-    // Create map file for reference
-    char mapfile_path[256];
-    snprintf(mapfile_path, sizeof(mapfile_path), "%s/memory.map", dump_dir);
-    FILE *mapfile = fopen(mapfile_path, "w");
+    int dump_fd = open(dump_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dump_fd < 0) {
+        perror("[-] create dump file");
+        fclose(maps);
+        return;
+    }
+
+    // Create map file for reference (shows offset -> address mapping)
+    FILE *mapfile = fopen(map_file, "w");
     if (mapfile) {
-        fprintf(mapfile, "Memory map for PID %d (%s)\n", pid, comm);
+        fprintf(mapfile, "Memory dump for PID %d (%s)\n", pid, comm);
+        fprintf(mapfile, "Dump file: %s\n", dump_file);
         fprintf(mapfile, "========================================\n\n");
+        fprintf(mapfile, "Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]\n\n");
     }
 
     int mem_fd = -1;
@@ -364,6 +372,7 @@ void dump_full_process_memory(pid_t pid) {
     if (mem_fd < 0) {
         perror("[-] open /proc/PID/mem");
         fclose(maps);
+        close(dump_fd);
         if (mapfile) fclose(mapfile);
         return;
     }
@@ -371,6 +380,17 @@ void dump_full_process_memory(pid_t pid) {
     char line[512];
     int region_count = 0;
     size_t total_dumped = 0;
+    size_t current_offset = 0;
+    char *buffer = malloc(16 * 1024 * 1024);  // 16MB reusable buffer
+    
+    if (!buffer) {
+        perror("[-] malloc buffer");
+        close(mem_fd);
+        close(dump_fd);
+        fclose(maps);
+        if (mapfile) fclose(mapfile);
+        return;
+    }
 
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
@@ -385,106 +405,82 @@ void dump_full_process_memory(pid_t pid) {
         size_t size = end - start;
         if (size == 0 || size > 1024*1024*1024) continue;  // Skip invalid/huge regions
 
-        // Create filename based on region type
-        char region_name[128];
-        if (strlen(path) > 0 && path[0] == '/') {
-            // File-backed: use sanitized path
-            const char *basename = strrchr(path, '/');
-            snprintf(region_name, sizeof(region_name), "%04d_%s_0x%lx", region_count, basename ? basename+1 : "file", start);
-        } else if (strlen(path) > 0 && path[0] == '[') {
-            // Special region: [heap], [stack], [vdso], etc.
-            char clean_name[64];
-            strncpy(clean_name, path + 1, sizeof(clean_name) - 1);
-            char *bracket = strchr(clean_name, ']');
-            if (bracket) *bracket = '\0';
-            snprintf(region_name, sizeof(region_name), "%04d_%s_0x%lx", region_count, clean_name, start);
-        } else if (strstr(path, "memfd:") != NULL) {
-            // Fileless execution - CRITICAL for malware analysis
-            snprintf(region_name, sizeof(region_name), "%04d_MEMFD_0x%lx", region_count, start);
-        } else {
-            // Anonymous mapping
-            snprintf(region_name, sizeof(region_name), "%04d_anon_0x%lx", region_count, start);
-        }
-
-        char out_path[384];
-        snprintf(out_path, sizeof(out_path), "%s/%s.bin", dump_dir, region_name);
-
-        // Write to map file
+        // Write to map file with current offset in dump
         if (mapfile) {
-            fprintf(mapfile, "[%04d] 0x%016lx-0x%016lx %s %10zu bytes %s -> %s.bin\n",
-                    region_count, start, end, perms, size, path, region_name);
+            fprintf(mapfile, "[0x%016zx] -> 0x%016lx-0x%016lx %s %10zu bytes %s",
+                    current_offset, start, end, perms, size, path);
         }
 
-        // Dump the region
+        // Seek to region start in process memory
         if (lseek(mem_fd, start, SEEK_SET) == -1) {
-            if (mapfile) fprintf(mapfile, "       [SEEK FAILED]\n");
+            if (mapfile) fprintf(mapfile, " [SEEK FAILED]\n");
             region_count++;
             continue;
         }
 
-        int out_fd = open(out_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (out_fd < 0) {
-            if (mapfile) fprintf(mapfile, "       [CREATE FAILED]\n");
-            region_count++;
-            continue;
-        }
-
-        // Read in chunks to handle large regions
-        size_t chunk_size = (size > 16*1024*1024) ? 16*1024*1024 : size;
-        char *buffer = malloc(chunk_size);
-        if (!buffer) {
-            close(out_fd);
-            if (mapfile) fprintf(mapfile, "       [MALLOC FAILED]\n");
-            region_count++;
-            continue;
-        }
-
+        // Read and write region in chunks
         size_t bytes_dumped = 0;
         size_t remaining = size;
-        while (remaining > 0) {
-            size_t to_read = (remaining > chunk_size) ? chunk_size : remaining;
-            ssize_t bytes = read(mem_fd, buffer, to_read);
-            if (bytes <= 0) break;
+        int read_failed = 0;
+        
+        while (remaining > 0 && !read_failed) {
+            size_t chunk_size = (remaining > 16*1024*1024) ? 16*1024*1024 : remaining;
+            ssize_t bytes = read(mem_fd, buffer, chunk_size);
             
-            ssize_t written = write(out_fd, buffer, bytes);
-            if (written != bytes) break;
+            if (bytes <= 0) {
+                read_failed = 1;
+                break;
+            }
+            
+            ssize_t written = write(dump_fd, buffer, bytes);
+            if (written != bytes) {
+                read_failed = 1;
+                break;
+            }
             
             bytes_dumped += bytes;
             remaining -= bytes;
         }
 
-        free(buffer);
-        close(out_fd);
-
         if (bytes_dumped > 0) {
             total_dumped += bytes_dumped;
-            if (mapfile) {
-                fprintf(mapfile, "       [DUMPED %zu bytes]\n", bytes_dumped);
-            }
+            current_offset += bytes_dumped;
             
-            // Scan with YARA if enabled and region looks interesting
-            if (yara_rules_path && (perms[2] == 'x' || strstr(path, "memfd:") || strlen(path) == 0)) {
-                scan_with_yara(out_path);
+            if (mapfile) {
+                fprintf(mapfile, " [DUMPED %zu bytes]\n", bytes_dumped);
             }
         } else {
-            if (mapfile) fprintf(mapfile, "       [READ FAILED]\n");
+            if (mapfile) fprintf(mapfile, " [READ FAILED]\n");
         }
 
         region_count++;
     }
 
+    free(buffer);
     close(mem_fd);
+    close(dump_fd);
     fclose(maps);
     
     if (mapfile) {
         fprintf(mapfile, "\n========================================\n");
         fprintf(mapfile, "Total regions: %d\n", region_count);
         fprintf(mapfile, "Total dumped: %.2f MB\n", total_dumped / (1024.0 * 1024.0));
+        fprintf(mapfile, "\nUsage:\n");
+        fprintf(mapfile, "  - Load %s into your reverse engineering tool\n", dump_file);
+        fprintf(mapfile, "  - Use this map file to locate specific memory regions\n");
+        fprintf(mapfile, "  - Virtual address 0xADDR is at file offset shown in brackets\n");
         fclose(mapfile);
     }
 
     printf("[+] Full memory dump complete: %d regions, %.2f MB dumped\n", region_count, total_dumped / (1024.0 * 1024.0));
-    printf("[+] Memory map saved to: %s\n", mapfile_path);
+    printf("[+] Dump file: %s\n", dump_file);
+    printf("[+] Memory map: %s\n", map_file);
+    
+    // Optionally scan the full dump with YARA
+    if (yara_rules_path) {
+        printf("[+] Scanning full dump with YARA...\n");
+        scan_with_yara(dump_file);
+    }
 }
 
 void print_process_info(pid_t pid) {
