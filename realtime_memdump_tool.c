@@ -2290,15 +2290,27 @@ void* dump_worker(void *arg) {
 void *periodic_report_writer(void *arg) {
     (void)arg;  // Unused
     
+    fprintf(stderr, "[DEBUG] Periodic report writer thread started\n");
+    
+    // Do first update immediately (don't wait 2 seconds)
+    if (strlen(sandbox_report_dir) > 0) {
+        sleep(1);  // Brief delay to let initial events get written
+        fprintf(stderr, "[DEBUG] Periodic writer: initial update...\n");
+        finalize_sandbox_report();
+    }
+    
     while (running && sandbox_mode) {
         sleep(2);  // Update every 2 seconds
         
         if (strlen(sandbox_report_dir) > 0) {
+            fprintf(stderr, "[DEBUG] Periodic writer: updating report...\n");
             // Rewrite the complete report from temp files
             finalize_sandbox_report();
+            fprintf(stderr, "[DEBUG] Periodic writer: update complete\n");
         }
     }
     
+    fprintf(stderr, "[DEBUG] Periodic report writer thread exiting\n");
     return NULL;
 }
 
