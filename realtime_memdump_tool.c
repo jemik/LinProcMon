@@ -854,8 +854,9 @@ void scan_maps_and_dump(pid_t pid) {
                 printf("[!]   Region: %lx-%lx (%s) %s\n", start, end, perms, path);
             }
             
-            // Only dump memory if --mem_dump flag is enabled
-            if (mem_dump) {
+            // Only dump individual regions if --mem_dump is enabled (but not full_dump)
+            // full_dump will handle everything in one file later
+            if (mem_dump && !full_dump) {
                 // In quiet mode, skip dumping large regions to prevent I/O blocking
                 dump_memory_region(pid, start, end, quiet_mode);
             }
