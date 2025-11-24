@@ -666,9 +666,19 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
 
 // Finalize sandbox report
 void finalize_sandbox_report() {
-    if (!sandbox_json_report) return;
-    
     pthread_mutex_lock(&report_mutex);
+    
+    // If file was closed/NULL, reopen for appending
+    if (!sandbox_json_report) {
+        char report_path[600];
+        snprintf(report_path, sizeof(report_path), "%s/report.json", sandbox_report_dir);
+        sandbox_json_report = fopen(report_path, "a");
+        if (!sandbox_json_report) {
+            fprintf(stderr, "[!] ERROR: Cannot open report.json for finalization\n");
+            pthread_mutex_unlock(&report_mutex);
+            return;
+        }
+    }
     
     // Write process tree - read from temp file if exists
     fprintf(sandbox_json_report, "  \"processes\": [\n");
@@ -728,16 +738,22 @@ void finalize_sandbox_report() {
     }
     fprintf(sandbox_json_report, "  ],\n");
     
-    // Write memory dumps
+    // Write memory dumps - read from temp file
     fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
-    for (int i = 0; i < sandbox_memdump_count; i++) {
-        fprintf(sandbox_json_report, "    {\n");
-        fprintf(sandbox_json_report, "      \"pid\": %d,\n", sandbox_memdumps[i].pid);
-        fprintf(sandbox_json_report, "      \"filename\": \"%s\",\n", sandbox_memdumps[i].filename);
-        fprintf(sandbox_json_report, "      \"size\": %zu,\n", sandbox_memdumps[i].size);
-        fprintf(sandbox_json_report, "      \"sha1\": \"%s\",\n", sandbox_memdumps[i].sha1);
-        fprintf(sandbox_json_report, "      \"timestamp\": %ld\n", sandbox_memdumps[i].timestamp);
-        fprintf(sandbox_json_report, "    }%s\n", (i < sandbox_memdump_count - 1) ? "," : "");
+    snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+    tf = fopen(temp_file, "r");
+    if (tf) {
+        char line[4096];
+        int first = 1;
+        while (fgets(line, sizeof(line), tf)) {
+            // Strip newline
+            line[strcspn(line, "\n")] = 0;
+            if (!first) fprintf(sandbox_json_report, ",\n");
+            fprintf(sandbox_json_report, "    %s", line);
+            first = 0;
+        }
+        fclose(tf);
+        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -1329,6 +1345,17 @@ void dump_full_process_memory(pid_t pid) {
                 strncpy(sandbox_memdumps[sandbox_memdump_count].sha1, sha1, sizeof(sandbox_memdumps[0].sha1) - 1);
                 sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
                 sandbox_memdump_count++;
+                
+                // BULLETPROOF: Write immediately to temp file
+                char temp_file[600];
+                snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+                FILE *tf = fopen(temp_file, "a");
+                if (tf) {
+                    fprintf(tf, "{\"pid\":%d,\"filename\":\"%s\",\"size\":%zu,\"sha1\":\"%s\",\"timestamp\":%ld}\n",
+                            pid, filename, total_dumped, sha1, time(NULL));
+                    fflush(tf);
+                    fclose(tf);
+                }
             }
             
             pthread_mutex_unlock(&sandbox_proc_mutex);
@@ -1858,13 +1885,21 @@ void scan_maps_and_dump(pid_t pid) {
         ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
         if (len > 0) exe_path[len] = '\0';
         
-        // Get PPID
+        // Get PPID - read entire stat line and parse carefully
         pid_t ppid = 0;
         char stat_path[64];
         snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
         FILE *stat_file = fopen(stat_path, "r");
         if (stat_file) {
-            fscanf(stat_file, "%*d %*s %*c %d", &ppid);
+            char stat_line[2048];
+            if (fgets(stat_line, sizeof(stat_line), stat_file)) {
+                // Format: pid (comm) state ppid ...
+                // Find last ')' to handle comm with spaces
+                char *p = strrchr(stat_line, ')');
+                if (p) {
+                    sscanf(p + 1, " %*c %d", &ppid);
+                }
+            }
             fclose(stat_file);
         }
         
