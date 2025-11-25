@@ -1721,12 +1721,26 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int s
 // Dump all memory regions of a process for dynamic unpacking analysis
 // Creates a single contiguous dump file for easy reverse engineering
 void dump_full_process_memory(pid_t pid) {
+    // Validate PID
+    if (pid <= 0 || pid > 4194304) {
+        fprintf(stderr, "[-] Invalid PID for memory dump: %d\n", pid);
+        return;
+    }
+    
+    // Check if process exists before attempting dump
+    char proc_check[64];
+    snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+    if (access(proc_check, F_OK) != 0) {
+        fprintf(stderr, "[-] Process %d does not exist, skipping dump\n", pid);
+        return;
+    }
+    
     char maps_path[64];
     snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     
     FILE *maps = fopen(maps_path, "r");
     if (!maps) {
-        perror("[-] open maps");
+        fprintf(stderr, "[-] Cannot open maps for PID %d (process may have exited)\n", pid);
         return;
     }
 
@@ -1788,6 +1802,7 @@ void dump_full_process_memory(pid_t pid) {
 
     char line[MAX_LINE];  // Use MAX_LINE (4096) instead of 512 for long paths
     int region_count = 0;
+    int max_regions = 500;  // Limit number of regions to dump to prevent excessive processing
     size_t total_dumped = 0;
     size_t current_offset = 0;
     
@@ -1804,7 +1819,15 @@ void dump_full_process_memory(pid_t pid) {
         return;
     }
 
-    while (fgets(line, sizeof(line), maps)) {
+    while (fgets(line, sizeof(line), maps) && region_count < max_regions) {
+        // Periodically check if process still exists
+        if (region_count % 50 == 0 && region_count > 0) {
+            if (access(proc_check, F_OK) != 0) {
+                fprintf(stderr, "[-] Process %d exited during dump\n", pid);
+                break;
+            }
+        }
+        
         unsigned long start, end;
         char perms[5], path[MAX_LINE] = "";
         
@@ -1837,10 +1860,22 @@ void dump_full_process_memory(pid_t pid) {
         
         while (remaining > 0 && !read_failed) {
             size_t chunk_size = (remaining > buffer_size) ? buffer_size : remaining;
+            
+            // Use errno to detect specific read errors
+            errno = 0;
             ssize_t bytes = read(mem_fd, buffer, chunk_size);
             
             if (bytes <= 0) {
-                read_failed = 1;
+                // EIO = I/O error (common when process is modifying memory)
+                // EFAULT = Bad address (process unmapped region)
+                if (errno == EIO || errno == EFAULT) {
+                    // Silent failure - this is expected for active processes
+                    read_failed = 1;
+                } else if (errno != 0) {
+                    // Other error - log it
+                    if (mapfile) fprintf(mapfile, " [READ ERROR: %s]", strerror(errno));
+                    read_failed = 1;
+                }
                 break;
             }
             
