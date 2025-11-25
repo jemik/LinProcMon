@@ -3130,10 +3130,11 @@ int main(int argc, char **argv) {
             char exe_path[256];
             snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", sandbox_root_pid);
             char exe_link[256] = {0};
-        ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
-        if (len > 0) {
-            exe_link[len] = '\0';
-            printf("[+] Child process executing: %s\n", exe_link);
+            ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
+            if (len > 0) {
+                exe_link[len] = '\0';
+                printf("[+] Child process executing: %s\n", exe_link);
+            }
             
             // Get parent process info
             pid_t parent_ppid = 0;
