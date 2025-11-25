@@ -2477,9 +2477,15 @@ void scan_maps_and_dump(pid_t pid) {
         pthread_mutex_unlock(&stats_mutex);
         printf("[SANDBOX] Monitoring PID %d\n", pid);
         
-        // Get process info for reporting
-        char comm[256] = "", cmdline[1024] = "", exe_path[512] = "";
+        // Get process info for reporting - with comprehensive error checking
+        char comm[256] = "unknown", cmdline[1024] = "", exe_path[512] = "";
         char comm_path[64], cmdline_path[64], exe_link[64];
+        
+        // Verify process still exists before reading files
+        if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;
+        }
         
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
         FILE *comm_file = fopen(comm_path, "r");
@@ -2494,36 +2500,66 @@ void scan_maps_and_dump(pid_t pid) {
             fclose(comm_file);
         }
         
+        // Check again before next read
+        if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;
+        }
+        
         snprintf(cmdline_path, sizeof(cmdline_path), "/proc/%d/cmdline", pid);
         FILE *cmdline_file = fopen(cmdline_path, "r");
         if (cmdline_file) {
             size_t len = fread(cmdline, 1, sizeof(cmdline) - 1, cmdline_file);
-            for (size_t i = 0; i < len - 1; i++) {
-                if (cmdline[i] == '\0') cmdline[i] = ' ';
+            if (len > 0 && len < sizeof(cmdline)) {
+                cmdline[len] = '\0';  // Null terminate
+                // Replace null bytes with spaces for display
+                for (size_t i = 0; i < len - 1 && i < sizeof(cmdline) - 1; i++) {
+                    if (cmdline[i] == '\0') cmdline[i] = ' ';
+                }
+            } else {
+                cmdline[0] = '\0';
             }
             fclose(cmdline_file);
         }
         
+        // Check again before readlink
+        if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;
+        }
+        
         snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", pid);
         ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
-        if (len > 0) exe_path[len] = '\0';
+        if (len > 0 && len < (ssize_t)sizeof(exe_path)) {
+            exe_path[len] = '\0';
+        } else {
+            exe_path[0] = '\0';
+        }
         
         // Get PPID - read entire stat line and parse carefully
         pid_t ppid = 0;
-        char stat_path[64];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
-        FILE *stat_file = fopen(stat_path, "r");
-        if (stat_file) {
-            char stat_line[2048];
-            if (fgets(stat_line, sizeof(stat_line), stat_file)) {
-                // Format: pid (comm) state ppid ...
-                // Find last ')' to handle comm with spaces
-                char *p = strrchr(stat_line, ')');
-                if (p) {
-                    sscanf(p + 1, " %*c %d", &ppid);
+        if (access(proc_check, F_OK) == 0) {
+            char stat_path[64];
+            snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+            FILE *stat_file = fopen(stat_path, "r");
+            if (stat_file) {
+                char stat_line[2048];
+                if (fgets(stat_line, sizeof(stat_line), stat_file)) {
+                    // Format: pid (comm) state ppid ...
+                    // Find last ')' to handle comm with spaces
+                    char *p = strrchr(stat_line, ')');
+                    if (p && (p - stat_line) < (ssize_t)sizeof(stat_line) - 10) {
+                        sscanf(p + 1, " %*c %d", &ppid);
+                    }
                 }
+                fclose(stat_file);
             }
-            fclose(stat_file);
+        }
+        
+        // Final check before reporting
+        if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;
         }
         
         report_sandbox_process(pid, ppid, comm, exe_path, cmdline);
