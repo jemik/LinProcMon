@@ -52,6 +52,8 @@ char** sandbox_args = NULL;  // Arguments for sandbox binary
 int sandbox_args_count = 0;  // Number of arguments
 int sandbox_timeout = 0;  // Sandbox timeout in seconds (0 = wait for process exit)
 time_t sandbox_start_time = 0;  // When sandbox started
+int max_dumps = 0;  // Maximum number of processes to dump (0 = unlimited)
+int dumps_performed = 0;  // Counter for dumps performed
 char sandbox_termination_status[32] = "running";  // Termination status: running, completed, timeout, crashed
 int sandbox_exit_code = -1;  // Exit code or signal number
 int sandbox_tool_crashed = 0;  // Set to 1 if tool crashes due to sample
@@ -80,6 +82,19 @@ typedef struct {
 
 sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
+
+// Check if a PID is part of the sandbox process tree
+int is_sandbox_process(pid_t pid) {
+    if (!sandbox_mode) return 0;
+    if (pid == sandbox_root_pid) return 1;
+    
+    for (int i = 0; i < sandbox_process_count; i++) {
+        if (sandbox_processes[i].active && sandbox_processes[i].pid == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // File operations and network activity tracking for JSON report
@@ -736,10 +751,10 @@ void finalize_sandbox_report() {
         }
     }
     
-    // Write complete JSON from scratch
-    fprintf(sandbox_json_report, "{\n");
-    fprintf(sandbox_json_report, "  \"analysis\": {\n");
-    fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time);
+    // Write complete JSON from scratch with error checking
+    if (fprintf(sandbox_json_report, "{\n") < 0) goto write_error;
+    if (fprintf(sandbox_json_report, "  \"analysis\": {\n") < 0) goto write_error;
+    if (fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time) < 0) goto write_error;
     
     // Read full analysis from initial report or reconstruct
     char initial_report[600];
@@ -854,7 +869,9 @@ void finalize_sandbox_report() {
     if (tf) {
         char line[MAX_LINE];
         int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
+        int line_count = 0;
+        int max_alert_lines = 10000;  // Limit to 10k alerts to prevent crashes
+        while (fgets(line, sizeof(line), tf) && line_count < max_alert_lines) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
             // Strip newline if present
@@ -863,9 +880,13 @@ void finalize_sandbox_report() {
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
+            line_count++;
         }
         fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
+        if (!first) fprintf(sandbox_json_report, "\n");
+        if (line_count >= max_alert_lines) {
+            fprintf(stderr, "[!] WARN: Alert limit reached (%d), truncating...\n", max_alert_lines);
+        }
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -894,6 +915,15 @@ void finalize_sandbox_report() {
     
     printf("[+] Sandbox report finalized: %s/report.json\n", sandbox_report_dir);
     
+    pthread_mutex_unlock(&report_mutex);
+    return;
+
+write_error:
+    fprintf(stderr, "[!] ERROR: Failed to write to report.json: %s\n", strerror(errno));
+    if (sandbox_json_report) {
+        fclose(sandbox_json_report);
+        sandbox_json_report = NULL;
+    }
     pthread_mutex_unlock(&report_mutex);
 }
 
@@ -1032,16 +1062,22 @@ void finalize_sandbox_report_signal_safe() {
     if (tf) {
         char line[MAX_LINE];
         int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
+        int line_count = 0;
+        int max_alert_lines = 10000;  // Limit alerts in signal handler too
+        while (fgets(line, sizeof(line), tf) && line_count < max_alert_lines) {
             line[sizeof(line) - 1] = '\0';
             size_t len = strlen(line);
             if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
+            line_count++;
         }
         fclose(tf);
         if (!first) fprintf(sandbox_json_report, "\n");
+        if (line_count >= max_alert_lines) {
+            write(STDERR_FILENO, "[!] WARN: Alert limit reached in signal handler\n", 49);
+        }
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -2300,7 +2336,22 @@ void scan_maps_and_dump(pid_t pid) {
     fclose(maps);
     
     // If full_dump is enabled, queue for async memory dumping (non-blocking)
+    // In sandbox mode: only dump processes in the sandbox tree
     if (full_dump && suspicious_count > 0) {
+        // Skip if not a sandbox process when in sandbox mode
+        if (sandbox_mode && !is_sandbox_process(pid)) {
+            // Not part of sandbox tree, skip dumping
+            return;
+        }
+        
+        // Check dump limit
+        if (max_dumps > 0 && dumps_performed >= max_dumps) {
+            if (!quiet_mode) {
+                printf("[INFO] Maximum dump limit (%d) reached, skipping PID %d\n", max_dumps, pid);
+            }
+            return;
+        }
+        
         // Check if already dumped to prevent duplicates
         if (is_already_dumped(pid)) {
             // Already dumped, skip
@@ -2308,8 +2359,17 @@ void scan_maps_and_dump(pid_t pid) {
             if (!quiet_mode) {
                 printf("[WARN] Dump queue full, skipping full dump for PID %d\n", pid);
             }
-        } else if (!quiet_mode) {
-            printf("[INFO] Queued PID %d for full memory dump (background)\n", pid);
+        } else {
+            dumps_performed++;
+            if (!quiet_mode) {
+                if (max_dumps > 0) {
+                    printf("[INFO] Queued PID %d for full memory dump (%d/%d)\n", 
+                           pid, dumps_performed, max_dumps);
+                } else {
+                    printf("[INFO] Queued PID %d for full memory dump (%d/unlimited)\n", 
+                           pid, dumps_performed);
+                }
+            }
         }
     }
     
@@ -2551,6 +2611,12 @@ int main(int argc, char **argv) {
             printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
         } else if (strcmp(argv[i], "--sandbox-timeout") == 0 && i + 1 < argc) {
             sandbox_timeout = atoi(argv[++i]) * 60;  // Convert minutes to seconds
+        } else if (strcmp(argv[i], "--max-dumps") == 0 && i + 1 < argc) {
+            max_dumps = atoi(argv[++i]);
+            if (max_dumps < 0) {
+                fprintf(stderr, "Error: --max-dumps must be >= 0\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--sandbox") == 0 && i + 1 < argc) {
             sandbox_mode = 1;
             sandbox_binary = argv[++i];
@@ -2582,6 +2648,8 @@ int main(int argc, char **argv) {
             printf("  --mem_dump        Enable memory dumping to disk (default: off)\n");
             printf("  --full_dump       Dump entire process memory (implies --mem_dump)\n");
             printf("                    Creates memdump_PID/ directory with all regions\n");
+            printf("  --max-dumps <N>   Maximum number of processes to dump (0=unlimited, default: 0)\n");
+            printf("                    In sandbox mode, only counts sandbox processes\n");
             printf("  --sandbox <bin>   Sandbox mode: execute and monitor specific binary\n");
             printf("                    All remaining arguments are passed to the binary\n");
             printf("  --help, -h        Show this help message\n\n");
