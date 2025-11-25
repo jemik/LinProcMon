@@ -195,12 +195,8 @@ int is_duplicate_alert(pid_t pid, unsigned long start, unsigned long end, const 
     if (!reason) return 1;  // Safety check
     if (pid <= 0) return 1;  // Invalid PID
     
-    // Try lock with timeout to prevent deadlock
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 1;  // 1 second timeout
-    
-    if (pthread_mutex_timedlock(&alert_cache_mutex, &timeout) != 0) {
+    // Try lock - if busy, allow alert through (better than crash)
+    if (pthread_mutex_trylock(&alert_cache_mutex) != 0) {
         return 0;  // Couldn't get lock, allow alert to proceed
     }
     
@@ -863,13 +859,9 @@ void finalize_sandbox_report() {
         return;
     }
     
-    // Use timedlock to prevent permanent hangs
-    struct timespec timeout;
-    clock_gettime(CLOCK_REALTIME, &timeout);
-    timeout.tv_sec += 5;  // 5 second timeout
-    
-    if (pthread_mutex_timedlock(&report_mutex, &timeout) != 0) {
-        fprintf(stderr, "[!] ERROR: Timeout acquiring report_mutex\n");
+    // Use trylock to avoid deadlocks
+    if (pthread_mutex_trylock(&report_mutex) != 0) {
+        fprintf(stderr, "[!] WARN: Could not acquire report_mutex, skipping update\n");
         __sync_lock_release(&report_writer_busy);
         return;
     }
@@ -2686,6 +2678,31 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
         total_events++;
         pthread_mutex_unlock(&stats_mutex);
         
+        // Register child in sandbox tracking if parent is sandbox process
+        if (sandbox_mode && is_sandbox_process(parent_pid)) {
+            pthread_mutex_lock(&sandbox_proc_mutex);
+            if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
+                int found = 0;
+                // Check if already registered
+                for (int i = 0; i < sandbox_process_count; i++) {
+                    if (sandbox_processes[i].pid == child_pid) {
+                        found = 1;
+                        sandbox_processes[i].active = 1;  // Reactivate if needed
+                        break;
+                    }
+                }
+                if (!found) {
+                    sandbox_processes[sandbox_process_count].pid = child_pid;
+                    sandbox_processes[sandbox_process_count].ppid = parent_pid;
+                    sandbox_processes[sandbox_process_count].active = 1;
+                    sandbox_processes[sandbox_process_count].start_time = time(NULL);
+                    snprintf(sandbox_processes[sandbox_process_count].name, sizeof(sandbox_processes[0].name), "child_%d", child_pid);
+                    __sync_fetch_and_add(&sandbox_process_count, 1);
+                }
+            }
+            pthread_mutex_unlock(&sandbox_proc_mutex);
+        }
+        
         // Queue child for scanning (may have inherited suspicious mappings from parent)
         if (queue_push(&event_queue, child_pid, parent_pid) < 0) {
             if (!quiet_mode) {
@@ -3059,6 +3076,18 @@ int main(int argc, char **argv) {
         // Parent process - store sandbox root PID
         sandbox_root_pid = child_pid;
         sandbox_start_time = time(NULL);
+        
+        // Register root PID in tracking array immediately
+        pthread_mutex_lock(&sandbox_proc_mutex);
+        sandbox_processes[0].pid = sandbox_root_pid;
+        sandbox_processes[0].ppid = getpid();
+        sandbox_processes[0].active = 1;
+        sandbox_processes[0].start_time = sandbox_start_time;
+        snprintf(sandbox_processes[0].name, sizeof(sandbox_processes[0].name), "sandbox_root");
+        snprintf(sandbox_processes[0].path, sizeof(sandbox_processes[0].path), "%s", sandbox_binary);
+        sandbox_process_count = 1;
+        pthread_mutex_unlock(&sandbox_proc_mutex);
+        
         printf("[+] Sandbox process started with PID %d\n", sandbox_root_pid);
         printf("[+] Sandbox binary: %s\n", sandbox_binary);
         if (sandbox_timeout > 0) {
