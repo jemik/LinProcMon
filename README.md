@@ -1,6 +1,6 @@
 # LinProcMon
 
-Real-time Linux process monitoring tool designed to detect malware, memory injection, fileless execution, and in-memory payload unpacking techniques. **Now with multi-threaded architecture for high-load container environments!**
+Real-time Linux process monitoring tool designed to detect malware, memory injection, fileless execution, and in-memory payload unpacking techniques. **Production-ready with crash-resistant architecture for high-activity malware analysis!**
 
 ## Overview
 
@@ -17,11 +17,15 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 
 ## Features
 
+- ✅ **Crash-resistant architecture** - Handles high-activity malware with 30+ spawned processes without segfaults
 - ✅ **Multi-threaded architecture** - Producer-consumer pattern prevents buffer overflow in high-load environments
 - ✅ **Sandbox mode** - Execute and monitor specific binaries, Python scripts, or bash scripts with full process tree tracking
 - ✅ **Enhanced file monitoring** - Tracks file operations in 15+ high-risk locations with risk scoring and categorization
 - ✅ **Hidden file detection** - Identifies concealment attempts (files starting with '.')
 - ✅ **Comprehensive JSON reporting** - Full sandbox analysis with SHA-1/SHA-256 hashes, file types, and dropped file collection
+- ✅ **Bulletproof data capture** - Immediate-write temp files + periodic aggregation prevents data loss on crashes
+- ✅ **JSON integrity** - Automatic escaping of special characters prevents corruption from malicious file paths
+- ✅ **Process deduplication** - Hash-based tracking eliminates duplicate entries in reports
 - ✅ **Sandbox timeout** - Configure analysis duration for malware that kills parent processes
 - ✅ **Full memory dump** - Single contiguous dump for easy reverse engineering (unpacking analysis)
 - ✅ Real-time process monitoring via netlink connector (16MB kernel buffer)
@@ -35,6 +39,30 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 - ✅ Low overhead, suitable for production environments
 - ✅ Detailed alerting with reason codes
 - ✅ Self-contained static binary support (no dependencies)
+
+## Recent Improvements (November 2025)
+
+### Crash Resistance & Stability
+- **Stack overflow prevention**: Heap allocation for large buffers, reduced thread-local storage
+- **Safe memory operations**: 1MB buffer chunks for memory dumps (down from 16MB)
+- **Process existence validation**: Multiple checks throughout analysis to handle short-lived processes
+- **Iteration limits**: Max 1024 file descriptors, 512 network sockets, 500 memory regions
+- **Graceful error handling**: Safe errno handling for EIO/EFAULT during memory reads
+
+### Data Integrity
+- **JSON string escaping**: Prevents corruption from special characters in file paths, command lines
+- **Buffer reuse fix**: Separate string copies avoid static buffer conflicts in fprintf calls
+- **Hash-based deduplication**: O(1) PID lookup with atomic operations prevents duplicate process entries
+- **Immediate-write architecture**: Data written to temp files before processing, survives crashes
+- **Cmdline fallback**: Uses process name when cmdline is unavailable (short-lived processes)
+
+### Performance & Reliability
+- **Reduced memory footprint**: Thread-local buffers down to 2KB from 8KB
+- **Safer bounds checking**: Explicit length validation for readlink, fread, sscanf operations
+- **Process monitoring limits**: Periodic existence checks prevent chasing dead processes
+- **Network data accuracy**: Fixed IP address reporting with proper variable handling
+
+These improvements make LinProcMon production-ready for analyzing complex, high-activity malware samples that spawn dozens of child processes and perform intensive file/network operations.
 
 ## Installation
 
