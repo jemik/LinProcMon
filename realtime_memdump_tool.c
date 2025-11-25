@@ -68,6 +68,21 @@ FILE *sandbox_json_report = NULL;  // JSON report file
 pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;
 int json_first_item = 1;  // Track if we need comma before next JSON item
 int report_writer_busy = 0;  // Flag to prevent re-entrant report writing
+int alerts_written = 0;  // Counter for alerts written to file
+#define MAX_ALERTS_TO_FILE 1000  // Maximum alerts to write to temp file
+
+// Alert deduplication to prevent processing same region multiple times
+#define ALERT_CACHE_SIZE 2048
+typedef struct {
+    pid_t pid;
+    unsigned long start;
+    unsigned long end;
+    char reason[64];
+} alert_key_t;
+
+static alert_key_t alert_cache[ALERT_CACHE_SIZE];
+static int alert_cache_count = 0;
+pthread_mutex_t alert_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Process tracking for sandbox
 #define MAX_SANDBOX_PROCESSES 256
@@ -172,6 +187,34 @@ cache_and_return_true:
     sandbox_cache_index = (sandbox_cache_index + 1) % SANDBOX_CACHE_SIZE;
     pthread_mutex_unlock(&sandbox_cache_mutex);
     return 1;
+}
+
+// Check if alert already exists (deduplication)
+int is_duplicate_alert(pid_t pid, unsigned long start, unsigned long end, const char *reason) {
+    pthread_mutex_lock(&alert_cache_mutex);
+    
+    for (int i = 0; i < alert_cache_count; i++) {
+        if (alert_cache[i].pid == pid &&
+            alert_cache[i].start == start &&
+            alert_cache[i].end == end &&
+            strcmp(alert_cache[i].reason, reason) == 0) {
+            pthread_mutex_unlock(&alert_cache_mutex);
+            return 1;  // Duplicate found
+        }
+    }
+    
+    // Not a duplicate - add to cache
+    if (alert_cache_count < ALERT_CACHE_SIZE) {
+        alert_cache[alert_cache_count].pid = pid;
+        alert_cache[alert_cache_count].start = start;
+        alert_cache[alert_cache_count].end = end;
+        strncpy(alert_cache[alert_cache_count].reason, reason, sizeof(alert_cache[0].reason) - 1);
+        alert_cache[alert_cache_count].reason[sizeof(alert_cache[0].reason) - 1] = '\0';
+        alert_cache_count++;
+    }
+    
+    pthread_mutex_unlock(&alert_cache_mutex);
+    return 0;  // Not a duplicate
 }
 
 // File operations and network activity tracking for JSON report
@@ -864,22 +907,32 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
     FILE *tf = fopen(temp_file, "r");
     if (tf) {
-        char line[MAX_LINE];  // Use MAX_LINE instead of 4096 for consistency
-        int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
-            // Ensure null termination
-            line[sizeof(line) - 1] = '\0';
-            // Strip newline if present - safe bounds check
-            size_t len = strnlen(line, sizeof(line));
-            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                line[len-1] = '\0';
+        // Check file size first
+        fseek(tf, 0, SEEK_END);
+        long file_size = ftell(tf);
+        fseek(tf, 0, SEEK_SET);
+        
+        if (file_size < 0 || file_size > 10*1024*1024) {  // Max 10MB
+            fprintf(stderr, "[!] WARN: Processes file size invalid or too large (%ld bytes), skipping\n", file_size);
+            fclose(tf);
+        } else {
+            char line[MAX_LINE];  // Use MAX_LINE instead of 4096 for consistency
+            int first = 1;
+            while (fgets(line, sizeof(line), tf)) {
+                // Ensure null termination
+                line[sizeof(line) - 1] = '\0';
+                // Strip newline if present - safe bounds check
+                size_t len = strnlen(line, sizeof(line));
+                if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                    line[len-1] = '\0';
+                }
+                if (!first) fprintf(sandbox_json_report, ",\n");
+                fprintf(sandbox_json_report, "    %s", line);
+                first = 0;
             }
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
+            fclose(tf);
+            if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
         }
-        fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -963,8 +1016,8 @@ void finalize_sandbox_report() {
         char line[MAX_LINE];
         int first = 1;
         int line_count = 0;
-        int max_alert_lines = 10000;  // Limit to 10k alerts to prevent crashes
-        while (fgets(line, sizeof(line), tf) && line_count < max_alert_lines) {
+        int max_alert_lines = 1000;  // Limit to 1k alerts to prevent crashes
+        while (line_count < max_alert_lines && fgets(line, sizeof(line), tf)) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
             // Strip newline if present - safe bounds check
@@ -976,6 +1029,10 @@ void finalize_sandbox_report() {
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
             line_count++;
+        }
+        if (ferror(tf)) {
+            fprintf(stderr, "[!] ERROR: I/O error reading alerts file\n");
+            clearerr(tf);
         }
         fclose(tf);
         if (!first) fprintf(sandbox_json_report, "\n");
@@ -1160,15 +1217,19 @@ void finalize_sandbox_report_signal_safe() {
         char line[MAX_LINE];
         int first = 1;
         int line_count = 0;
-        int max_alert_lines = 10000;  // Limit alerts in signal handler too
-        while (fgets(line, sizeof(line), tf) && line_count < max_alert_lines) {
+        int max_alert_lines = 1000;  // Limit alerts in signal handler too
+        while (line_count < max_alert_lines && fgets(line, sizeof(line), tf)) {
             line[sizeof(line) - 1] = '\0';
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
             line_count++;
+        }
+        if (ferror(tf)) {
+            write(STDERR_FILENO, "[!] ERROR: I/O error reading alerts in signal handler\n", 56);
+            clearerr(tf);
         }
         fclose(tf);
         if (!first) fprintf(sandbox_json_report, "\n");
@@ -2365,6 +2426,11 @@ void scan_maps_and_dump(pid_t pid) {
         */
 
         if (suspicious) {
+            // Check for duplicate before processing
+            if (is_duplicate_alert(pid, start, end, reason)) {
+                continue;  // Skip duplicate alert
+            }
+            
             suspicious_count++;
             pthread_mutex_lock(&stats_mutex);
             suspicious_found++;
@@ -2380,7 +2446,7 @@ void scan_maps_and_dump(pid_t pid) {
             }
             
             // Report to sandbox JSON if in sandbox mode
-            if (sandbox_mode && strlen(sandbox_report_dir) > 0) {
+            if (sandbox_mode && strlen(sandbox_report_dir) > 0 && alerts_written < MAX_ALERTS_TO_FILE) {
                 char alert_tmp[600];
                 snprintf(alert_tmp, sizeof(alert_tmp), "%s/.alerts.tmp", sandbox_report_dir);
                 FILE *af = fopen(alert_tmp, "a");
@@ -2389,6 +2455,11 @@ void scan_maps_and_dump(pid_t pid) {
                             pid, reason, start, end, perms, path, time(NULL));
                     fflush(af);
                     fclose(af);
+                    __sync_fetch_and_add(&alerts_written, 1);
+                    
+                    if (alerts_written == MAX_ALERTS_TO_FILE) {
+                        fprintf(stderr, "[!] WARN: Alert limit (%d) reached, no more alerts will be written to file\n", MAX_ALERTS_TO_FILE);
+                    }
                 }
             }
             
@@ -3015,7 +3086,7 @@ int main(int argc, char **argv) {
     time_t last_sandbox_scan = time(NULL);
 
     while (running) {
-        char buf[65536];  // 64KB buffer to handle many events at once
+        char buf[32768];  // 32KB buffer to handle many events (reduced from 64KB)
         ssize_t len = recv(nl_sock, buf, sizeof(buf), 0);
         
         if (len == -1) {
