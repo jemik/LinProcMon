@@ -82,49 +82,96 @@ typedef struct {
 
 sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
+pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Cache for sandbox process checks (reduces /proc filesystem load)
+#define SANDBOX_CACHE_SIZE 1024
+static struct {
+    pid_t pid;
+    int is_sandbox;
+    time_t timestamp;
+} sandbox_cache[SANDBOX_CACHE_SIZE];
+static int sandbox_cache_index = 0;
+pthread_mutex_t sandbox_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Check if a PID is part of the sandbox process tree
 int is_sandbox_process(pid_t pid) {
     if (!sandbox_mode) return 0;
     if (pid == sandbox_root_pid) return 1;
+    if (pid <= 1) return 0;
     
-    // Check if already tracked
-    for (int i = 0; i < sandbox_process_count; i++) {
-        if (sandbox_processes[i].active && sandbox_processes[i].pid == pid) {
-            return 1;
+    // Check cache first
+    time_t now = time(NULL);
+    pthread_mutex_lock(&sandbox_cache_mutex);
+    for (int i = 0; i < SANDBOX_CACHE_SIZE; i++) {
+        if (sandbox_cache[i].pid == pid && (now - sandbox_cache[i].timestamp) < 5) {
+            int result = sandbox_cache[i].is_sandbox;
+            pthread_mutex_unlock(&sandbox_cache_mutex);
+            return result;
         }
     }
+    pthread_mutex_unlock(&sandbox_cache_mutex);
+    
+    // Check if already tracked
+    pthread_mutex_lock(&sandbox_proc_mutex);
+    for (int i = 0; i < sandbox_process_count; i++) {
+        if (sandbox_processes[i].active && sandbox_processes[i].pid == pid) {
+            pthread_mutex_unlock(&sandbox_proc_mutex);
+            goto cache_and_return_true;
+        }
+    }
+    pthread_mutex_unlock(&sandbox_proc_mutex);
     
     // Check parent chain - walk up the process tree
     pid_t current = pid;
-    for (int depth = 0; depth < 20; depth++) {  // Limit depth to prevent infinite loop
+    for (int depth = 0; depth < 20; depth++) {
         char stat_path[64];
         snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
         
         FILE *f = fopen(stat_path, "r");
-        if (!f) return 0;  // Process doesn't exist
+        if (!f) {
+            goto cache_and_return_false;  // Process doesn't exist
+        }
         
-        char stat_line[2048];
+        char stat_line[512];  // Reduced from 2048 to save stack space
         pid_t ppid = 0;
         if (fgets(stat_line, sizeof(stat_line), f)) {
             // Format: pid (comm) state ppid ...
             char *p = strrchr(stat_line, ')');
-            if (p) {
-                sscanf(p + 1, " %*c %d", &ppid);
+            if (p && sscanf(p + 1, " %*c %d", &ppid) == 1) {
+                fclose(f);
+                if (ppid == sandbox_root_pid) {
+                    goto cache_and_return_true;  // Parent is sandbox root
+                }
+                if (ppid <= 1) {
+                    goto cache_and_return_false;  // Reached init
+                }
+                current = ppid;
+                continue;
             }
         }
         fclose(f);
-        
-        if (ppid == 0) return 0;
-        if (ppid == sandbox_root_pid) return 1;  // Parent is sandbox root
-        if (ppid <= 1) return 0;  // Reached init
-        
-        current = ppid;
+        goto cache_and_return_false;
     }
     
+cache_and_return_false:
+    pthread_mutex_lock(&sandbox_cache_mutex);
+    sandbox_cache[sandbox_cache_index].pid = pid;
+    sandbox_cache[sandbox_cache_index].is_sandbox = 0;
+    sandbox_cache[sandbox_cache_index].timestamp = time(NULL);
+    sandbox_cache_index = (sandbox_cache_index + 1) % SANDBOX_CACHE_SIZE;
+    pthread_mutex_unlock(&sandbox_cache_mutex);
     return 0;
+    
+cache_and_return_true:
+    pthread_mutex_lock(&sandbox_cache_mutex);
+    sandbox_cache[sandbox_cache_index].pid = pid;
+    sandbox_cache[sandbox_cache_index].is_sandbox = 1;
+    sandbox_cache[sandbox_cache_index].timestamp = time(NULL);
+    sandbox_cache_index = (sandbox_cache_index + 1) % SANDBOX_CACHE_SIZE;
+    pthread_mutex_unlock(&sandbox_cache_mutex);
+    return 1;
 }
-pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // File operations and network activity tracking for JSON report
 #define MAX_SANDBOX_FILE_OPS 512
