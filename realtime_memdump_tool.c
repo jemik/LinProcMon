@@ -743,43 +743,57 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     }
     
     // Check if this PID already exists (prevent duplicates from periodic rescans)
+    int already_exists = 0;
     for (int i = 0; i < sandbox_process_count && i < MAX_SANDBOX_PROCESSES; i++) {
         if (sandbox_processes[i].pid == pid) {
-            // Process already tracked, skip
+            // Update the existing entry with better info
+            already_exists = 1;
+            strncpy(sandbox_processes[i].name, name, sizeof(sandbox_processes[i].name) - 1);
+            sandbox_processes[i].name[sizeof(sandbox_processes[i].name) - 1] = '\0';
+            strncpy(sandbox_processes[i].path, path, sizeof(sandbox_processes[i].path) - 1);
+            sandbox_processes[i].path[sizeof(sandbox_processes[i].path) - 1] = '\0';
+            strncpy(sandbox_processes[i].cmdline, cmdline, sizeof(sandbox_processes[i].cmdline) - 1);
+            sandbox_processes[i].cmdline[sizeof(sandbox_processes[i].cmdline) - 1] = '\0';
+            break;
+        }
+    }
+    
+    if (!already_exists) {
+        // Add new process
+        if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
+            int idx = sandbox_process_count;
+            sandbox_processes[idx].pid = pid;
+            sandbox_processes[idx].ppid = ppid;
+            strncpy(sandbox_processes[idx].name, name, sizeof(sandbox_processes[idx].name) - 1);
+            sandbox_processes[idx].name[sizeof(sandbox_processes[idx].name) - 1] = '\0';
+            strncpy(sandbox_processes[idx].path, path, sizeof(sandbox_processes[idx].path) - 1);
+            sandbox_processes[idx].path[sizeof(sandbox_processes[idx].path) - 1] = '\0';
+            strncpy(sandbox_processes[idx].cmdline, cmdline, sizeof(sandbox_processes[idx].cmdline) - 1);
+            sandbox_processes[idx].cmdline[sizeof(sandbox_processes[idx].cmdline) - 1] = '\0';
+            sandbox_processes[idx].start_time = time(NULL);
+            sandbox_processes[idx].active = 1;
+            sandbox_process_count++;
+        } else {
+            fprintf(stderr, "[!] WARN: Process tracking array full (%d processes)\n", MAX_SANDBOX_PROCESSES);
             pthread_mutex_unlock(&sandbox_proc_mutex);
             return;
         }
     }
     
-    // Add new process
-    if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
-        int idx = sandbox_process_count;
-        sandbox_processes[idx].pid = pid;
-        sandbox_processes[idx].ppid = ppid;
-        strncpy(sandbox_processes[idx].name, name, sizeof(sandbox_processes[idx].name) - 1);
-        sandbox_processes[idx].name[sizeof(sandbox_processes[idx].name) - 1] = '\0';
-        strncpy(sandbox_processes[idx].path, path, sizeof(sandbox_processes[idx].path) - 1);
-        sandbox_processes[idx].path[sizeof(sandbox_processes[idx].path) - 1] = '\0';
-        strncpy(sandbox_processes[idx].cmdline, cmdline, sizeof(sandbox_processes[idx].cmdline) - 1);
-        sandbox_processes[idx].cmdline[sizeof(sandbox_processes[idx].cmdline) - 1] = '\0';
-        sandbox_processes[idx].start_time = time(NULL);
-        sandbox_processes[idx].active = 1;
-        sandbox_process_count++;
-        
-        // BULLETPROOF: Write immediately to temp file
-        char temp_file[600];
-        int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
-        if (n > 0 && n < sizeof(temp_file)) {
-            FILE *tf = fopen(temp_file, "a");
-            if (tf) {
-                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        pid, ppid, name, path, cmdline, time(NULL));
-                fflush(tf);
-                fclose(tf);
-            }
+    // Always write to temp file (even for updates, as this creates the permanent record)
+    char temp_file[600];
+    int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
+    if (n > 0 && n < sizeof(temp_file)) {
+        FILE *tf = fopen(temp_file, "a");
+        if (tf) {
+            fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
+                    pid, ppid, name, path, cmdline, time(NULL));
+            fflush(tf);
+            fclose(tf);
+            printf("[DEBUG] Wrote process PID %d to report\n", pid);
+        } else {
+            fprintf(stderr, "[!] ERROR: Could not open %s for writing\n", temp_file);
         }
-    } else {
-        fprintf(stderr, "[!] WARN: Process tracking array full (%d processes)\n", MAX_SANDBOX_PROCESSES);
     }
     pthread_mutex_unlock(&sandbox_proc_mutex);
 }
@@ -3112,6 +3126,19 @@ int main(int argc, char **argv) {
         snprintf(sandbox_processes[0].name, sizeof(sandbox_processes[0].name), "sandbox_root");
         snprintf(sandbox_processes[0].path, sizeof(sandbox_processes[0].path), "%s", sandbox_binary);
         sandbox_process_count = 1;
+        
+        // Write root process to temp file immediately
+        char temp_file[600];
+        int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
+        if (n > 0 && n < sizeof(temp_file)) {
+            FILE *tf = fopen(temp_file, "a");
+            if (tf) {
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"sandbox_root\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
+                        sandbox_root_pid, getpid(), sandbox_binary, sandbox_binary, sandbox_start_time);
+                fflush(tf);
+                fclose(tf);
+            }
+        }
         pthread_mutex_unlock(&sandbox_proc_mutex);
         
         printf("[+] Sandbox process started with PID %d\n", sandbox_root_pid);
