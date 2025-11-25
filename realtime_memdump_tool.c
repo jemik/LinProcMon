@@ -764,11 +764,14 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
     FILE *tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];  // Use MAX_LINE instead of 4096 for consistency
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            // Strip newline
-            line[strcspn(line, "\n")] = 0;
+            // Ensure null termination
+            line[sizeof(line) - 1] = '\0';
+            // Strip newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -783,11 +786,14 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.fileops.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            // Strip newline
-            line[strcspn(line, "\n")] = 0;
+            // Ensure null termination
+            line[sizeof(line) - 1] = '\0';
+            // Strip newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -802,11 +808,14 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.network.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            // Strip newline
-            line[strcspn(line, "\n")] = 0;
+            // Ensure null termination
+            line[sizeof(line) - 1] = '\0';
+            // Strip newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -821,11 +830,14 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            // Strip newline
-            line[strcspn(line, "\n")] = 0;
+            // Ensure null termination
+            line[sizeof(line) - 1] = '\0';
+            // Strip newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -840,11 +852,14 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.alerts.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            // Strip newline
-            line[strcspn(line, "\n")] = 0;
+            // Ensure null termination
+            line[sizeof(line) - 1] = '\0';
+            // Strip newline if present
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -939,10 +954,12 @@ void finalize_sandbox_report_signal_safe() {
     snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
     FILE *tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            line[strcspn(line, "\n")] = 0;
+            line[sizeof(line) - 1] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -956,10 +973,12 @@ void finalize_sandbox_report_signal_safe() {
     snprintf(temp_file, sizeof(temp_file), "%s/.fileops.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            line[strcspn(line, "\n")] = 0;
+            line[sizeof(line) - 1] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -973,10 +992,12 @@ void finalize_sandbox_report_signal_safe() {
     snprintf(temp_file, sizeof(temp_file), "%s/.network.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            line[strcspn(line, "\n")] = 0;
+            line[sizeof(line) - 1] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -990,10 +1011,12 @@ void finalize_sandbox_report_signal_safe() {
     snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            line[strcspn(line, "\n")] = 0;
+            line[sizeof(line) - 1] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -1007,10 +1030,12 @@ void finalize_sandbox_report_signal_safe() {
     snprintf(temp_file, sizeof(temp_file), "%s/.alerts.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[4096];
+        char line[MAX_LINE];
         int first = 1;
         while (fgets(line, sizeof(line), tf)) {
-            line[strcspn(line, "\n")] = 0;
+            line[sizeof(line) - 1] = '\0';
+            size_t len = strlen(line);
+            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
