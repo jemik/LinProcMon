@@ -88,11 +88,40 @@ int is_sandbox_process(pid_t pid) {
     if (!sandbox_mode) return 0;
     if (pid == sandbox_root_pid) return 1;
     
+    // Check if already tracked
     for (int i = 0; i < sandbox_process_count; i++) {
         if (sandbox_processes[i].active && sandbox_processes[i].pid == pid) {
             return 1;
         }
     }
+    
+    // Check parent chain - walk up the process tree
+    pid_t current = pid;
+    for (int depth = 0; depth < 20; depth++) {  // Limit depth to prevent infinite loop
+        char stat_path[64];
+        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
+        
+        FILE *f = fopen(stat_path, "r");
+        if (!f) return 0;  // Process doesn't exist
+        
+        char stat_line[2048];
+        pid_t ppid = 0;
+        if (fgets(stat_line, sizeof(stat_line), f)) {
+            // Format: pid (comm) state ppid ...
+            char *p = strrchr(stat_line, ')');
+            if (p) {
+                sscanf(p + 1, " %*c %d", &ppid);
+            }
+        }
+        fclose(f);
+        
+        if (ppid == 0) return 0;
+        if (ppid == sandbox_root_pid) return 1;  // Parent is sandbox root
+        if (ppid <= 1) return 0;  // Reached init
+        
+        current = ppid;
+    }
+    
     return 0;
 }
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
