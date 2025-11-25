@@ -828,8 +828,21 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
         if (n > 0 && n < sizeof(temp_file)) {
             FILE *tf = fopen(temp_file, "a");
             if (tf) {
+                // Escape strings separately to avoid buffer reuse
+                const char *esc_name = json_escape(name);
+                char name_copy[512];
+                strncpy(name_copy, esc_name, sizeof(name_copy) - 1);
+                name_copy[sizeof(name_copy) - 1] = '\0';
+                
+                const char *esc_path = json_escape(path);
+                char path_copy[1024];
+                strncpy(path_copy, esc_path, sizeof(path_copy) - 1);
+                path_copy[sizeof(path_copy) - 1] = '\0';
+                
+                const char *esc_cmdline = json_escape(cmdline);
+                
                 fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        pid, ppid, json_escape(name), json_escape(path), json_escape(cmdline), time(NULL));
+                        pid, ppid, name_copy, path_copy, esc_cmdline, time(NULL));
                 fflush(tf);
                 fclose(tf);
                 
@@ -870,8 +883,21 @@ void report_file_operation(pid_t pid, const char *operation, const char *filepat
         snprintf(temp_file, sizeof(temp_file), "%s/.fileops.tmp", sandbox_report_dir);
         FILE *tf = fopen(temp_file, "a");
         if (tf) {
+            // Escape strings separately to avoid buffer reuse
+            const char *esc_op = json_escape(operation);
+            char op_copy[128];
+            strncpy(op_copy, esc_op, sizeof(op_copy) - 1);
+            op_copy[sizeof(op_copy) - 1] = '\0';
+            
+            const char *esc_path = json_escape(filepath);
+            char path_copy[1024];
+            strncpy(path_copy, esc_path, sizeof(path_copy) - 1);
+            path_copy[sizeof(path_copy) - 1] = '\0';
+            
+            const char *esc_cat = json_escape(category);
+            
             fprintf(tf, "{\"pid\":%d,\"operation\":\"%s\",\"filepath\":\"%s\",\"risk_score\":%d,\"category\":\"%s\",\"timestamp\":%ld}\n",
-                    pid, json_escape(operation), json_escape(filepath), risk_score, json_escape(category), time(NULL));
+                    pid, op_copy, path_copy, risk_score, esc_cat, time(NULL));
             fflush(tf);
             fclose(tf);
         }
@@ -920,8 +946,21 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
         snprintf(temp_file, sizeof(temp_file), "%s/.network.tmp", sandbox_report_dir);
         FILE *tf = fopen(temp_file, "a");
         if (tf) {
+            // Escape strings separately to avoid buffer reuse issue
+            const char *esc_proto = json_escape(protocol);
+            char proto_copy[256];
+            strncpy(proto_copy, esc_proto, sizeof(proto_copy) - 1);
+            proto_copy[sizeof(proto_copy) - 1] = '\0';
+            
+            const char *esc_local = json_escape(local_addr);
+            char local_copy[256];
+            strncpy(local_copy, esc_local, sizeof(local_copy) - 1);
+            local_copy[sizeof(local_copy) - 1] = '\0';
+            
+            const char *esc_remote = json_escape(remote_addr);
+            
             fprintf(tf, "{\"pid\":%d,\"protocol\":\"%s\",\"local_address\":\"%s\",\"remote_address\":\"%s\",\"timestamp\":%ld}\n",
-                    pid, json_escape(protocol), json_escape(local_addr), json_escape(remote_addr), time(NULL));
+                    pid, proto_copy, local_copy, esc_remote, time(NULL));
             fflush(tf);
             fclose(tf);
         }
@@ -2516,10 +2555,20 @@ void scan_maps_and_dump(pid_t pid) {
                 for (size_t i = 0; i < len - 1 && i < sizeof(cmdline) - 1; i++) {
                     if (cmdline[i] == '\0') cmdline[i] = ' ';
                 }
+                // Trim trailing spaces
+                while (len > 0 && cmdline[len-1] == ' ') {
+                    cmdline[--len] = '\0';
+                }
             } else {
-                cmdline[0] = '\0';
+                // Fallback: use comm if cmdline is empty
+                strncpy(cmdline, comm, sizeof(cmdline) - 1);
+                cmdline[sizeof(cmdline) - 1] = '\0';
             }
             fclose(cmdline_file);
+        } else {
+            // Fallback: use comm if cmdline file can't be opened
+            strncpy(cmdline, comm, sizeof(cmdline) - 1);
+            cmdline[sizeof(cmdline) - 1] = '\0';
         }
         
         // Check again before readlink
@@ -2684,8 +2733,16 @@ void scan_maps_and_dump(pid_t pid) {
                 snprintf(alert_tmp, sizeof(alert_tmp), "%s/.alerts.tmp", sandbox_report_dir);
                 FILE *af = fopen(alert_tmp, "a");
                 if (af) {
+                    // Escape strings separately to avoid buffer reuse
+                    const char *esc_reason = json_escape(reason);
+                    char reason_copy[256];
+                    strncpy(reason_copy, esc_reason, sizeof(reason_copy) - 1);
+                    reason_copy[sizeof(reason_copy) - 1] = '\0';
+                    
+                    const char *esc_path = json_escape(path);
+                    
                     fprintf(af, "{\"pid\":%d,\"type\":\"%s\",\"region\":\"%lx-%lx\",\"perms\":\"%s\",\"path\":\"%s\",\"timestamp\":%ld}\n",
-                            pid, json_escape(reason), start, end, perms, json_escape(path), time(NULL));
+                            pid, reason_copy, start, end, perms, esc_path, time(NULL));
                     fflush(af);
                     fclose(af);
                     __sync_fetch_and_add(&alerts_written, 1);
@@ -3300,8 +3357,16 @@ int main(int argc, char **argv) {
         if (n > 0 && n < sizeof(temp_file)) {
             FILE *tf = fopen(temp_file, "a");
             if (tf) {
+                // Escape separately to avoid buffer reuse
+                const char *esc_path = json_escape(sandbox_binary);
+                char path_copy[1024];
+                strncpy(path_copy, esc_path, sizeof(path_copy) - 1);
+                path_copy[sizeof(path_copy) - 1] = '\0';
+                
+                const char *esc_cmdline = json_escape(sandbox_binary);
+                
                 fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"sandbox_root\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        sandbox_root_pid, getpid(), json_escape(sandbox_binary), json_escape(sandbox_binary), sandbox_start_time);
+                        sandbox_root_pid, getpid(), path_copy, esc_cmdline, sandbox_start_time);
                 fflush(tf);
                 fclose(tf);
             }
