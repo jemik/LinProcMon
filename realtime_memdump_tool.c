@@ -1830,36 +1830,6 @@ static int is_legitimate_path(const char *path) {
     return 0;
 }
 
-// Check if PID belongs to sandbox process tree
-static int is_sandbox_process(pid_t pid) {
-    if (!sandbox_mode) return 0;
-    if (pid == sandbox_root_pid) return 1;
-    
-    // Check if this process is a descendant of sandbox root
-    pid_t current = pid;
-    for (int depth = 0; depth < 100; depth++) {  // Max depth to prevent infinite loop
-        char stat_path[64];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
-        
-        FILE *f = fopen(stat_path, "r");
-        if (!f) return 0;  // Process doesn't exist
-        
-        pid_t ppid;
-        // Parse: pid (comm) state ppid
-        if (fscanf(f, "%*d %*s %*c %d", &ppid) != 1) {
-            fclose(f);
-            return 0;
-        }
-        fclose(f);
-        
-        if (ppid == sandbox_root_pid) return 1;  // Parent is sandbox root
-        if (ppid <= 1) return 0;  // Reached init/kernel
-        
-        current = ppid;
-    }
-    return 0;
-}
-
 // Check if path matches high-risk malware locations
 static int is_suspicious_file_location(const char *path, int *risk_score, char *category) {
     *risk_score = 0;
