@@ -1790,10 +1790,13 @@ void dump_full_process_memory(pid_t pid) {
     int region_count = 0;
     size_t total_dumped = 0;
     size_t current_offset = 0;
-    char *buffer = malloc(16 * 1024 * 1024);  // 16MB reusable buffer
+    
+    // Use smaller buffer (1MB) to reduce memory pressure and stack overflow risk
+    size_t buffer_size = 1024 * 1024;  // 1MB buffer
+    char *buffer = malloc(buffer_size);
     
     if (!buffer) {
-        perror("[-] malloc buffer");
+        fprintf(stderr, "[-] malloc buffer failed for PID %d\n", pid);
         close(mem_fd);
         close(dump_fd);
         fclose(maps);
@@ -1827,13 +1830,13 @@ void dump_full_process_memory(pid_t pid) {
             continue;
         }
 
-        // Read and write region in chunks
+        // Read and write region in chunks (use smaller chunks to prevent issues)
         size_t bytes_dumped = 0;
         size_t remaining = size;
         int read_failed = 0;
         
         while (remaining > 0 && !read_failed) {
-            size_t chunk_size = (remaining > 16*1024*1024) ? 16*1024*1024 : remaining;
+            size_t chunk_size = (remaining > buffer_size) ? buffer_size : remaining;
             ssize_t bytes = read(mem_fd, buffer, chunk_size);
             
             if (bytes <= 0) {
@@ -2216,64 +2219,76 @@ static void check_file_operations(pid_t pid) {
     if (!fd_dir) return;
     
     struct dirent *entry;
-    while ((entry = readdir(fd_dir)) != NULL) {
+    int fd_count = 0;
+    int max_fds = 1024;  // Limit to prevent excessive iteration
+    while ((entry = readdir(fd_dir)) != NULL && fd_count < max_fds) {
         if (entry->d_name[0] == '.') continue;
+        fd_count++;
+        
+        // Re-check process existence periodically
+        if (fd_count % 100 == 0) {
+            if (access(proc_check, F_OK) != 0) {
+                closedir(fd_dir);
+                return;  // Process died during iteration
+            }
+        }
         
         char link_path[128];
         char target[PATH_MAX];
         snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
         
         ssize_t len = readlink(link_path, target, sizeof(target) - 1);
-        if (len > 0) {
-            target[len] = '\0';
+        if (len <= 0 || len >= (ssize_t)sizeof(target)) {
+            continue;  // readlink failed or buffer overflow
+        }
+        target[len] = '\0';
+        
+        // Skip non-file descriptors
+        if (strstr(target, "socket:") || strstr(target, "pipe:") || 
+            strstr(target, "anon_inode:") || target[0] != '/') {
+            continue;
+        }
+        
+        // Check if this is a suspicious location
+        int risk_score;
+        char category[64];
+        if (is_suspicious_file_location(target, &risk_score, category)) {
+            // Check file access mode to determine operation type
+            char fdinfo_path[128];
+            snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/%s", pid, entry->d_name);
             
-            // Skip non-file descriptors
-            if (strstr(target, "socket:") || strstr(target, "pipe:") || 
-                strstr(target, "anon_inode:") || target[0] != '/') {
-                continue;
-            }
-            
-            // Check if this is a suspicious location
-            int risk_score;
-            char category[64];
-            if (is_suspicious_file_location(target, &risk_score, category)) {
-                // Check file access mode to determine operation type
-                char fdinfo_path[128];
-                snprintf(fdinfo_path, sizeof(fdinfo_path), "/proc/%d/fdinfo/%s", pid, entry->d_name);
-                
-                FILE *fdinfo = fopen(fdinfo_path, "r");
-                const char *op_type = "accessed";
-                if (fdinfo) {
-                    char line[256];
-                    while (fgets(line, sizeof(line), fdinfo)) {
-                        if (strstr(line, "flags:")) {
-                            // O_WRONLY=01, O_RDWR=02, O_CREAT=0100
-                            unsigned int flags;
-                            if (sscanf(line, "flags: %o", &flags) == 1) {
-                                if (flags & 0100) {  // O_CREAT
-                                    op_type = "created";
-                                } else if (flags & 03) {  // O_WRONLY | O_RDWR
-                                    op_type = "written";
-                                }
+            FILE *fdinfo = fopen(fdinfo_path, "r");
+            const char *op_type = "accessed";
+            if (fdinfo) {
+                char line[256];
+                while (fgets(line, sizeof(line), fdinfo)) {
+                    if (strstr(line, "flags:")) {
+                        // O_WRONLY=01, O_RDWR=02, O_CREAT=0100
+                        unsigned int flags;
+                        if (sscanf(line, "flags: %o", &flags) == 1) {
+                            if (flags & 0100) {  // O_CREAT
+                                op_type = "created";
+                            } else if (flags & 03) {  // O_WRONLY | O_RDWR
+                                op_type = "written";
                             }
-                            break;
                         }
+                        break;
                     }
-                    fclose(fdinfo);
                 }
-                
-                printf("[SANDBOX] File %s: %s (PID=%d, Risk=%d, Category=%s)\n", 
-                       op_type, target, pid, risk_score, category);
-                       
-                report_file_operation(pid, op_type, target, risk_score, category);
-                
-                pthread_mutex_lock(&stats_mutex);
-                files_created++;
-                if (risk_score >= 80) {
-                    suspicious_found++;  // High-risk file operation
-                }
-                pthread_mutex_unlock(&stats_mutex);
+                fclose(fdinfo);
             }
+            
+            printf("[SANDBOX] File %s: %s (PID=%d, Risk=%d, Category=%s)\n", 
+                   op_type, target, pid, risk_score, category);
+                   
+            report_file_operation(pid, op_type, target, risk_score, category);
+            
+            pthread_mutex_lock(&stats_mutex);
+            files_created++;
+            if (risk_score >= 80) {
+                suspicious_found++;  // High-risk file operation
+            }
+            pthread_mutex_unlock(&stats_mutex);
         }
     }
     closedir(fd_dir);
@@ -2326,8 +2341,18 @@ static void check_network_connections(pid_t pid) {
                 }
                 
                 struct dirent *entry;
-                while ((entry = readdir(fd_dir)) != NULL) {
+                int fd_count = 0;
+                int max_fds = 512;  // Limit FD iteration in network check
+                while ((entry = readdir(fd_dir)) != NULL && fd_count < max_fds) {
                     if (entry->d_name[0] == '.') continue;
+                    fd_count++;
+                    
+                    // Check process existence every 50 iterations
+                    if (fd_count % 50 == 0 && access(proc_check, F_OK) != 0) {
+                        closedir(fd_dir);
+                        fclose(f);
+                        return;
+                    }
                     
                     char link_path[128], target[256];
                     snprintf(link_path, sizeof(link_path), "%s/%s", fd_path, entry->d_name);
@@ -2468,8 +2493,16 @@ void scan_maps_and_dump(pid_t pid) {
         
         report_sandbox_process(pid, ppid, comm, exe_path, cmdline);
         
-        check_file_operations(pid);
-        check_network_connections(pid);
+        // Wrap these in process existence checks to prevent crashes
+        char proc_check2[64];
+        snprintf(proc_check2, sizeof(proc_check2), "/proc/%d", pid);
+        if (access(proc_check2, F_OK) == 0) {
+            check_file_operations(pid);
+        }
+        
+        if (access(proc_check2, F_OK) == 0) {
+            check_network_connections(pid);
+        }
     }
 
     // First read process info and check for obvious red flags
