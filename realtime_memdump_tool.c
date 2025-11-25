@@ -103,12 +103,22 @@ pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 // JSON string escape helper - prevents buffer overflow from special characters
 // Returns escaped string in a static buffer (not thread-safe but used with mutex protection)
 static const char* json_escape(const char *str) {
-    static __thread char escaped[MAX_LINE * 2];  // Thread-local buffer
+    static __thread char escaped[2048];  // Reduced from 8KB to 2KB per thread
     if (!str) return "";
     
     int j = 0;
-    for (int i = 0; str[i] && j < (int)sizeof(escaped) - 10; i++) {
+    int max_len = sizeof(escaped) - 10;
+    for (int i = 0; str[i] && j < max_len; i++) {
         unsigned char c = str[i];
+        
+        // Truncate if getting close to buffer limit
+        if (j >= max_len - 6) {
+            escaped[j++] = '.';
+            escaped[j++] = '.';
+            escaped[j++] = '.';
+            break;
+        }
+        
         // Escape special JSON characters
         if (c == '"' || c == '\\') {
             escaped[j++] = '\\';
@@ -1005,22 +1015,29 @@ void finalize_sandbox_report() {
             fprintf(stderr, "[!] WARN: Processes file size invalid or too large (%ld bytes), skipping\n", file_size);
             fclose(tf);
         } else {
-            char line[MAX_LINE];  // Use MAX_LINE instead of 4096 for consistency
-            int first = 1;
-            while (fgets(line, sizeof(line), tf)) {
-                // Ensure null termination
-                line[sizeof(line) - 1] = '\0';
-                // Strip newline if present - safe bounds check
-                size_t len = strnlen(line, sizeof(line));
-                if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                    line[len-1] = '\0';
+            // Use heap instead of stack for large buffer to prevent stack overflow
+            char *line = malloc(MAX_LINE);
+            if (!line) {
+                fprintf(stderr, "[!] ERROR: Cannot allocate memory for line buffer\n");
+                fclose(tf);
+            } else {
+                int first = 1;
+                while (fgets(line, MAX_LINE, tf)) {
+                    // Ensure null termination
+                    line[MAX_LINE - 1] = '\0';
+                    // Strip newline if present - safe bounds check
+                    size_t len = strnlen(line, MAX_LINE);
+                    if (len > 0 && len < MAX_LINE && line[len-1] == '\n') {
+                        line[len-1] = '\0';
+                    }
+                    if (!first) fprintf(sandbox_json_report, ",\n");
+                    fprintf(sandbox_json_report, "    %s", line);
+                    first = 0;
                 }
-                if (!first) fprintf(sandbox_json_report, ",\n");
-                fprintf(sandbox_json_report, "    %s", line);
-                first = 0;
+                free(line);
+                fclose(tf);
+                if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
             }
-            fclose(tf);
-            if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
         }
     }
     fprintf(sandbox_json_report, "  ],\n");
@@ -1030,22 +1047,23 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.fileops.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[MAX_LINE];
-        int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
-            // Ensure null termination
-            line[sizeof(line) - 1] = '\0';
-            // Strip newline if present - safe bounds check
-            size_t len = strnlen(line, sizeof(line));
-            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                line[len-1] = '\0';
+        char *line = malloc(MAX_LINE);
+        if (line) {
+            int first = 1;
+            while (fgets(line, MAX_LINE, tf)) {
+                line[MAX_LINE - 1] = '\0';
+                size_t len = strnlen(line, MAX_LINE);
+                if (len > 0 && len < MAX_LINE && line[len-1] == '\n') {
+                    line[len-1] = '\0';
+                }
+                if (!first) fprintf(sandbox_json_report, ",\n");
+                fprintf(sandbox_json_report, "    %s", line);
+                first = 0;
             }
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
+            free(line);
+            if (!first) fprintf(sandbox_json_report, "\n");
         }
         fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -1054,22 +1072,23 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.network.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[MAX_LINE];
-        int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
-            // Ensure null termination
-            line[sizeof(line) - 1] = '\0';
-            // Strip newline if present - safe bounds check
-            size_t len = strnlen(line, sizeof(line));
-            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                line[len-1] = '\0';
+        char *line = malloc(MAX_LINE);
+        if (line) {
+            int first = 1;
+            while (fgets(line, MAX_LINE, tf)) {
+                line[MAX_LINE - 1] = '\0';
+                size_t len = strnlen(line, MAX_LINE);
+                if (len > 0 && len < MAX_LINE && line[len-1] == '\n') {
+                    line[len-1] = '\0';
+                }
+                if (!first) fprintf(sandbox_json_report, ",\n");
+                fprintf(sandbox_json_report, "    %s", line);
+                first = 0;
             }
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
+            free(line);
+            if (!first) fprintf(sandbox_json_report, "\n");
         }
         fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -1078,22 +1097,23 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[MAX_LINE];
-        int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
-            // Ensure null termination
-            line[sizeof(line) - 1] = '\0';
-            // Strip newline if present - safe bounds check
-            size_t len = strnlen(line, sizeof(line));
-            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                line[len-1] = '\0';
+        char *line = malloc(MAX_LINE);
+        if (line) {
+            int first = 1;
+            while (fgets(line, MAX_LINE, tf)) {
+                line[MAX_LINE - 1] = '\0';
+                size_t len = strnlen(line, MAX_LINE);
+                if (len > 0 && len < MAX_LINE && line[len-1] == '\n') {
+                    line[len-1] = '\0';
+                }
+                if (!first) fprintf(sandbox_json_report, ",\n");
+                fprintf(sandbox_json_report, "    %s", line);
+                first = 0;
             }
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
+            free(line);
+            if (!first) fprintf(sandbox_json_report, "\n");
         }
         fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");  // Add final newline if data was written
     }
     fprintf(sandbox_json_report, "  ],\n");
     
@@ -1102,32 +1122,35 @@ void finalize_sandbox_report() {
     snprintf(temp_file, sizeof(temp_file), "%s/.alerts.tmp", sandbox_report_dir);
     tf = fopen(temp_file, "r");
     if (tf) {
-        char line[MAX_LINE];
-        int first = 1;
-        int line_count = 0;
-        int max_alert_lines = 1000;  // Limit to 1k alerts to prevent crashes
-        while (line_count < max_alert_lines && fgets(line, sizeof(line), tf)) {
-            // Ensure null termination
-            line[sizeof(line) - 1] = '\0';
-            // Strip newline if present - safe bounds check
-            size_t len = strnlen(line, sizeof(line));
-            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
-                line[len-1] = '\0';
+        char *line = malloc(MAX_LINE);
+        if (line) {
+            int first = 1;
+            int line_count = 0;
+            int max_alert_lines = 1000;  // Limit to 1k alerts to prevent crashes
+            while (line_count < max_alert_lines && fgets(line, MAX_LINE, tf)) {
+                // Ensure null termination
+                line[MAX_LINE - 1] = '\0';
+                // Strip newline if present - safe bounds check
+                size_t len = strnlen(line, MAX_LINE);
+                if (len > 0 && len < MAX_LINE && line[len-1] == '\n') {
+                    line[len-1] = '\0';
+                }
+                if (!first) fprintf(sandbox_json_report, ",\n");
+                fprintf(sandbox_json_report, "    %s", line);
+                first = 0;
+                line_count++;
             }
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
-            line_count++;
+            free(line);
+            if (!first) fprintf(sandbox_json_report, "\n");
+            if (line_count >= max_alert_lines) {
+                fprintf(stderr, "[!] WARN: Alert limit reached (%d), truncating...\n", max_alert_lines);
+            }
         }
         if (ferror(tf)) {
             fprintf(stderr, "[!] ERROR: I/O error reading alerts file\n");
             clearerr(tf);
         }
         fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");
-        if (line_count >= max_alert_lines) {
-            fprintf(stderr, "[!] WARN: Alert limit reached (%d), truncating...\n", max_alert_lines);
-        }
     }
     fprintf(sandbox_json_report, "  ],\n");
     
