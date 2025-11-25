@@ -512,27 +512,6 @@ const char* get_file_type(const char *filename) {
     return "binary";
 }
 
-// JSON escape string
-void json_escape(const char *src, char *dst, size_t dst_size) {
-    size_t j = 0;
-    for (size_t i = 0; src[i] && j < dst_size - 2; i++) {
-        switch (src[i]) {
-            case '"':  dst[j++] = '\\'; dst[j++] = '"'; break;
-            case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
-            case '\n': dst[j++] = '\\'; dst[j++] = 'n'; break;
-            case '\r': dst[j++] = '\\'; dst[j++] = 'r'; break;
-            case '\t': dst[j++] = '\\'; dst[j++] = 't'; break;
-            default:
-                if (src[i] < 32) {
-                    j += snprintf(dst + j, dst_size - j, "\\u%04x", (unsigned char)src[i]);
-                } else {
-                    dst[j++] = src[i];
-                }
-        }
-    }
-    dst[j] = '\0';
-}
-
 // File operation queue functions (non-blocking)
 void file_op_queue_init(file_op_queue_t *q) {
     memset(q, 0, sizeof(file_op_queue_t));
