@@ -67,6 +67,7 @@ char sample_sha1[41] = "";  // SHA-1 of sample being analyzed
 FILE *sandbox_json_report = NULL;  // JSON report file
 pthread_mutex_t report_mutex = PTHREAD_MUTEX_INITIALIZER;
 int json_first_item = 1;  // Track if we need comma before next JSON item
+int report_writer_busy = 0;  // Flag to prevent re-entrant report writing
 
 // Process tracking for sandbox
 #define MAX_SANDBOX_PROCESSES 256
@@ -800,12 +801,19 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
 
 // Finalize sandbox report
 void finalize_sandbox_report() {
+    // Prevent re-entrant calls
+    if (__sync_lock_test_and_set(&report_writer_busy, 1)) {
+        fprintf(stderr, "[DEBUG] Report writer already busy, skipping...\n");
+        return;
+    }
+    
     pthread_mutex_lock(&report_mutex);
     
     // Check if sandbox directory is valid
     if (strlen(sandbox_report_dir) == 0) {
         fprintf(stderr, "[!] ERROR: sandbox_report_dir is empty!\n");
         pthread_mutex_unlock(&report_mutex);
+        __sync_lock_release(&report_writer_busy);
         return;
     }
     
@@ -817,6 +825,7 @@ void finalize_sandbox_report() {
         if (!sandbox_json_report) {
             fprintf(stderr, "[!] ERROR: Cannot open report.json for finalization: %s\n", strerror(errno));
             pthread_mutex_unlock(&report_mutex);
+            __sync_lock_release(&report_writer_busy);
             return;
         }
     } else {
@@ -860,9 +869,11 @@ void finalize_sandbox_report() {
         while (fgets(line, sizeof(line), tf)) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
-            // Strip newline if present
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            // Strip newline if present - safe bounds check
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -882,9 +893,11 @@ void finalize_sandbox_report() {
         while (fgets(line, sizeof(line), tf)) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
-            // Strip newline if present
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            // Strip newline if present - safe bounds check
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -904,9 +917,11 @@ void finalize_sandbox_report() {
         while (fgets(line, sizeof(line), tf)) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
-            // Strip newline if present
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            // Strip newline if present - safe bounds check
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -926,9 +941,11 @@ void finalize_sandbox_report() {
         while (fgets(line, sizeof(line), tf)) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
-            // Strip newline if present
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            // Strip newline if present - safe bounds check
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -950,9 +967,11 @@ void finalize_sandbox_report() {
         while (fgets(line, sizeof(line), tf) && line_count < max_alert_lines) {
             // Ensure null termination
             line[sizeof(line) - 1] = '\0';
-            // Strip newline if present
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
+            // Strip newline if present - safe bounds check
+            size_t len = strnlen(line, sizeof(line));
+            if (len > 0 && len < sizeof(line) && line[len-1] == '\n') {
+                line[len-1] = '\0';
+            }
             if (!first) fprintf(sandbox_json_report, ",\n");
             fprintf(sandbox_json_report, "    %s", line);
             first = 0;
@@ -992,6 +1011,7 @@ void finalize_sandbox_report() {
     printf("[+] Sandbox report finalized: %s/report.json\n", sandbox_report_dir);
     
     pthread_mutex_unlock(&report_mutex);
+    __sync_lock_release(&report_writer_busy);
     return;
 
 write_error:
@@ -1001,6 +1021,7 @@ write_error:
         sandbox_json_report = NULL;
     }
     pthread_mutex_unlock(&report_mutex);
+    __sync_lock_release(&report_writer_busy);
 }
 
 // Signal-safe finalization: no mutexes, best-effort write
@@ -2597,13 +2618,15 @@ void *periodic_report_writer(void *arg) {
     if (strlen(sandbox_report_dir) > 0) {
         sleep(1);  // Brief delay to let initial events get written
         fprintf(stderr, "[DEBUG] Periodic writer: initial update...\n");
-        finalize_sandbox_report();
+        if (!report_writer_busy) {
+            finalize_sandbox_report();
+        }
     }
     
     while (running && sandbox_mode) {
         sleep(2);  // Update every 2 seconds
         
-        if (strlen(sandbox_report_dir) > 0) {
+        if (strlen(sandbox_report_dir) > 0 && !report_writer_busy) {
             fprintf(stderr, "[DEBUG] Periodic writer: updating report...\n");
             // Rewrite the complete report from temp files
             finalize_sandbox_report();
