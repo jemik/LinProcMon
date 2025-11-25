@@ -100,6 +100,10 @@ sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Fast PID deduplication using hash set (lock-free reads)
+#define WRITTEN_PID_HASH_SIZE 512  // Power of 2 for fast modulo
+static volatile int written_pid_hash[WRITTEN_PID_HASH_SIZE] = {0};  // 0 = empty, >0 = PID stored
+
 // Cache for sandbox process checks (reduces /proc filesystem load)
 #define SANDBOX_CACHE_SIZE 1024
 static struct {
@@ -780,19 +784,43 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
         }
     }
     
-    // Always write to temp file (even for updates, as this creates the permanent record)
-    char temp_file[600];
-    int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
-    if (n > 0 && n < sizeof(temp_file)) {
-        FILE *tf = fopen(temp_file, "a");
-        if (tf) {
-            fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                    pid, ppid, name, path, cmdline, time(NULL));
-            fflush(tf);
-            fclose(tf);
-            printf("[DEBUG] Wrote process PID %d to report\n", pid);
-        } else {
-            fprintf(stderr, "[!] ERROR: Could not open %s for writing\n", temp_file);
+    // Fast duplicate check using hash (lock-free, no iteration)
+    int hash_idx = pid % WRITTEN_PID_HASH_SIZE;
+    int already_written = 0;
+    
+    // Try up to 8 hash slots (linear probing for collisions)
+    for (int probe = 0; probe < 8; probe++) {
+        int idx = (hash_idx + probe) % WRITTEN_PID_HASH_SIZE;
+        int stored_pid = written_pid_hash[idx];
+        if (stored_pid == pid) {
+            already_written = 1;
+            break;
+        }
+        if (stored_pid == 0) break;  // Empty slot, PID not found
+    }
+    
+    // Write to file only if new PID
+    if (!already_written) {
+        char temp_file[600];
+        int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
+        if (n > 0 && n < sizeof(temp_file)) {
+            FILE *tf = fopen(temp_file, "a");
+            if (tf) {
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
+                        pid, ppid, name, path, cmdline, time(NULL));
+                fflush(tf);
+                fclose(tf);
+                
+                // Mark as written using atomic store
+                for (int probe = 0; probe < 8; probe++) {
+                    int idx = (hash_idx + probe) % WRITTEN_PID_HASH_SIZE;
+                    int expected = 0;
+                    if (__sync_bool_compare_and_swap(&written_pid_hash[idx], 0, pid)) {
+                        break;  // Successfully stored
+                    }
+                    // Slot occupied, try next
+                }
+            }
         }
     }
     pthread_mutex_unlock(&sandbox_proc_mutex);
