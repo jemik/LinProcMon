@@ -100,6 +100,39 @@ sandbox_process_t sandbox_processes[MAX_SANDBOX_PROCESSES];
 int sandbox_process_count = 0;
 pthread_mutex_t sandbox_proc_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// JSON string escape helper - prevents buffer overflow from special characters
+// Returns escaped string in a static buffer (not thread-safe but used with mutex protection)
+static const char* json_escape(const char *str) {
+    static __thread char escaped[MAX_LINE * 2];  // Thread-local buffer
+    if (!str) return "";
+    
+    int j = 0;
+    for (int i = 0; str[i] && j < (int)sizeof(escaped) - 10; i++) {
+        unsigned char c = str[i];
+        // Escape special JSON characters
+        if (c == '"' || c == '\\') {
+            escaped[j++] = '\\';
+            escaped[j++] = c;
+        } else if (c == '\n') {
+            escaped[j++] = '\\';
+            escaped[j++] = 'n';
+        } else if (c == '\r') {
+            escaped[j++] = '\\';
+            escaped[j++] = 'r';
+        } else if (c == '\t') {
+            escaped[j++] = '\\';
+            escaped[j++] = 't';
+        } else if (c < 32 || c == 127) {
+            // Control characters - skip them
+            continue;
+        } else {
+            escaped[j++] = c;
+        }
+    }
+    escaped[j] = '\0';
+    return escaped;
+}
+
 // Fast PID deduplication using hash set (lock-free reads)
 #define WRITTEN_PID_HASH_SIZE 512  // Power of 2 for fast modulo
 static volatile int written_pid_hash[WRITTEN_PID_HASH_SIZE] = {0};  // 0 = empty, >0 = PID stored
@@ -807,7 +840,7 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
             FILE *tf = fopen(temp_file, "a");
             if (tf) {
                 fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        pid, ppid, name, path, cmdline, time(NULL));
+                        pid, ppid, json_escape(name), json_escape(path), json_escape(cmdline), time(NULL));
                 fflush(tf);
                 fclose(tf);
                 
@@ -849,7 +882,7 @@ void report_file_operation(pid_t pid, const char *operation, const char *filepat
         FILE *tf = fopen(temp_file, "a");
         if (tf) {
             fprintf(tf, "{\"pid\":%d,\"operation\":\"%s\",\"filepath\":\"%s\",\"risk_score\":%d,\"category\":\"%s\",\"timestamp\":%ld}\n",
-                    pid, operation, filepath, risk_score, category, time(NULL));
+                    pid, json_escape(operation), json_escape(filepath), risk_score, json_escape(category), time(NULL));
             fflush(tf);
             fclose(tf);
         }
@@ -899,7 +932,7 @@ void report_network_activity(pid_t pid, const char *protocol, const char *local_
         FILE *tf = fopen(temp_file, "a");
         if (tf) {
             fprintf(tf, "{\"pid\":%d,\"protocol\":\"%s\",\"local_address\":\"%s\",\"remote_address\":\"%s\",\"timestamp\":%ld}\n",
-                    pid, protocol, local_addr, remote_addr, time(NULL));
+                    pid, json_escape(protocol), json_escape(local_addr), json_escape(remote_addr), time(NULL));
             fflush(tf);
             fclose(tf);
         }
@@ -1890,7 +1923,7 @@ void dump_full_process_memory(pid_t pid) {
                 FILE *tf = fopen(temp_file, "a");
                 if (tf) {
                     fprintf(tf, "{\"pid\":%d,\"filename\":\"%s\",\"size\":%zu,\"sha1\":\"%s\",\"timestamp\":%ld}\n",
-                            pid, filename, total_dumped, sha1, time(NULL));
+                            pid, json_escape(filename), total_dumped, sha1, time(NULL));
                     fflush(tf);
                     fclose(tf);
                     fprintf(stderr, "[DEBUG] Wrote memory dump to temp file: %s\n", temp_file);
@@ -2546,7 +2579,7 @@ void scan_maps_and_dump(pid_t pid) {
                 FILE *af = fopen(alert_tmp, "a");
                 if (af) {
                     fprintf(af, "{\"pid\":%d,\"type\":\"%s\",\"region\":\"%lx-%lx\",\"perms\":\"%s\",\"path\":\"%s\",\"timestamp\":%ld}\n",
-                            pid, reason, start, end, perms, path, time(NULL));
+                            pid, json_escape(reason), start, end, perms, json_escape(path), time(NULL));
                     fflush(af);
                     fclose(af);
                     __sync_fetch_and_add(&alerts_written, 1);
@@ -3162,7 +3195,7 @@ int main(int argc, char **argv) {
             FILE *tf = fopen(temp_file, "a");
             if (tf) {
                 fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"sandbox_root\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        sandbox_root_pid, getpid(), sandbox_binary, sandbox_binary, sandbox_start_time);
+                        sandbox_root_pid, getpid(), json_escape(sandbox_binary), json_escape(sandbox_binary), sandbox_start_time);
                 fflush(tf);
                 fclose(tf);
             }
