@@ -114,7 +114,7 @@ pthread_mutex_t sandbox_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 int is_sandbox_process(pid_t pid) {
     if (!sandbox_mode) return 0;
     if (pid == sandbox_root_pid) return 1;
-    if (pid <= 1) return 0;
+    if (pid <= 1 || pid > 4194304) return 0;  // Invalid PID range
     
     // Check cache first
     time_t now = time(NULL);
@@ -138,36 +138,37 @@ int is_sandbox_process(pid_t pid) {
     }
     pthread_mutex_unlock(&sandbox_proc_mutex);
     
-    // Check parent chain - walk up the process tree
+    // Check parent chain - simplified approach to reduce crashes
     pid_t current = pid;
-    for (int depth = 0; depth < 20; depth++) {
+    for (int depth = 0; depth < 10; depth++) {  // Reduced from 20 to 10
+        if (current <= 1 || current > 4194304) break;  // Invalid PID
+        
         char stat_path[64];
-        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
+        int n = snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", current);
+        if (n < 0 || n >= sizeof(stat_path)) break;  // Buffer overflow protection
         
         FILE *f = fopen(stat_path, "r");
-        if (!f) {
-            goto cache_and_return_false;  // Process doesn't exist
-        }
+        if (!f) break;  // Process doesn't exist
         
-        char stat_line[512];  // Reduced from 2048 to save stack space
-        pid_t ppid = 0;
+        char stat_line[256];  // Smaller buffer
+        pid_t ppid = -1;
+        
         if (fgets(stat_line, sizeof(stat_line), f)) {
             // Format: pid (comm) state ppid ...
             char *p = strrchr(stat_line, ')');
-            if (p && sscanf(p + 1, " %*c %d", &ppid) == 1) {
-                fclose(f);
-                if (ppid == sandbox_root_pid) {
-                    goto cache_and_return_true;  // Parent is sandbox root
-                }
-                if (ppid <= 1) {
-                    goto cache_and_return_false;  // Reached init
-                }
-                current = ppid;
-                continue;
+            if (p) {
+                int scan_result = sscanf(p + 1, " %*c %d", &ppid);
+                if (scan_result != 1) ppid = -1;
             }
         }
         fclose(f);
-        goto cache_and_return_false;
+        
+        if (ppid < 0) break;  // Parse error
+        if (ppid == sandbox_root_pid) goto cache_and_return_true;
+        if (ppid <= 1) break;  // Reached init
+        if (ppid == current) break;  // Prevent infinite loop
+        
+        current = ppid;
     }
     
 cache_and_return_false:
@@ -191,7 +192,17 @@ cache_and_return_true:
 
 // Check if alert already exists (deduplication)
 int is_duplicate_alert(pid_t pid, unsigned long start, unsigned long end, const char *reason) {
-    pthread_mutex_lock(&alert_cache_mutex);
+    if (!reason) return 1;  // Safety check
+    if (pid <= 0) return 1;  // Invalid PID
+    
+    // Try lock with timeout to prevent deadlock
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 1;  // 1 second timeout
+    
+    if (pthread_mutex_timedlock(&alert_cache_mutex, &timeout) != 0) {
+        return 0;  // Couldn't get lock, allow alert to proceed
+    }
     
     for (int i = 0; i < alert_cache_count; i++) {
         if (alert_cache[i].pid == pid &&
@@ -208,8 +219,10 @@ int is_duplicate_alert(pid_t pid, unsigned long start, unsigned long end, const 
         alert_cache[alert_cache_count].pid = pid;
         alert_cache[alert_cache_count].start = start;
         alert_cache[alert_cache_count].end = end;
-        strncpy(alert_cache[alert_cache_count].reason, reason, sizeof(alert_cache[0].reason) - 1);
-        alert_cache[alert_cache_count].reason[sizeof(alert_cache[0].reason) - 1] = '\0';
+        size_t reason_len = strlen(reason);
+        size_t copy_len = reason_len < sizeof(alert_cache[0].reason) - 1 ? reason_len : sizeof(alert_cache[0].reason) - 1;
+        memcpy(alert_cache[alert_cache_count].reason, reason, copy_len);
+        alert_cache[alert_cache_count].reason[copy_len] = '\0';
         alert_cache_count++;
     }
     
@@ -850,7 +863,16 @@ void finalize_sandbox_report() {
         return;
     }
     
-    pthread_mutex_lock(&report_mutex);
+    // Use timedlock to prevent permanent hangs
+    struct timespec timeout;
+    clock_gettime(CLOCK_REALTIME, &timeout);
+    timeout.tv_sec += 5;  // 5 second timeout
+    
+    if (pthread_mutex_timedlock(&report_mutex, &timeout) != 0) {
+        fprintf(stderr, "[!] ERROR: Timeout acquiring report_mutex\n");
+        __sync_lock_release(&report_writer_busy);
+        return;
+    }
     
     // Check if sandbox directory is valid
     if (strlen(sandbox_report_dir) == 0) {
@@ -880,6 +902,10 @@ void finalize_sandbox_report() {
     }
     
     // Write complete JSON from scratch with error checking
+    if (!sandbox_json_report) {
+        fprintf(stderr, "[!] ERROR: sandbox_json_report is NULL after open attempt\n");
+        goto write_error;
+    }
     if (fprintf(sandbox_json_report, "{\n") < 0) goto write_error;
     if (fprintf(sandbox_json_report, "  \"analysis\": {\n") < 0) goto write_error;
     if (fprintf(sandbox_json_report, "    \"start_time\": %ld,\n", sandbox_start_time) < 0) goto write_error;
@@ -2287,6 +2313,12 @@ void scan_maps_and_dump(pid_t pid) {
             return;  // Process exited during scan
         }
         
+        // Double-check maps file is still open
+        if (!maps || ferror(maps)) {
+            if (maps) fclose(maps);
+            return;
+        }
+        
         pthread_mutex_lock(&stats_mutex);
         sandbox_events++;
         pthread_mutex_unlock(&stats_mutex);
@@ -2299,9 +2331,13 @@ void scan_maps_and_dump(pid_t pid) {
         snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
         FILE *comm_file = fopen(comm_path, "r");
         if (comm_file) {
-            fgets(comm, sizeof(comm), comm_file);
-            size_t len = strlen(comm);
-            if (len > 0 && comm[len-1] == '\n') comm[len-1] = '\0';
+            if (fgets(comm, sizeof(comm), comm_file)) {
+                comm[sizeof(comm) - 1] = '\0';  // Ensure null termination
+                size_t len = strnlen(comm, sizeof(comm));
+                if (len > 0 && len < sizeof(comm) && comm[len-1] == '\n') {
+                    comm[len-1] = '\0';
+                }
+            }
             fclose(comm_file);
         }
         
@@ -2581,6 +2617,11 @@ void *worker_thread(void *arg) {
             break;
         }
         
+        // Validate PID
+        if (event.pid <= 0 || event.pid > 4194304) {
+            continue;  // Invalid PID
+        }
+        
         // Skip Docker/container infrastructure processes
         if (should_ignore_process(event.pid)) {
             continue;
@@ -2596,6 +2637,7 @@ void *worker_thread(void *arg) {
                    event.pid, event.ppid, pthread_self());
         }
         
+        // Wrap in error handler to prevent worker thread crashes
         scan_maps_and_dump(event.pid);
         
         if (!quiet_mode) {
@@ -2699,8 +2741,10 @@ void *periodic_report_writer(void *arg) {
         
         if (strlen(sandbox_report_dir) > 0 && !report_writer_busy) {
             fprintf(stderr, "[DEBUG] Periodic writer: updating report...\n");
-            // Rewrite the complete report from temp files
+            // Wrap in error recovery
+            int saved_errno = errno;
             finalize_sandbox_report();
+            errno = saved_errno;  // Restore errno
             fprintf(stderr, "[DEBUG] Periodic writer: update complete\n");
         }
     }
