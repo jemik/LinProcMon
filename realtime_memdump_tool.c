@@ -1455,7 +1455,7 @@ void dump_full_process_memory(pid_t pid) {
         return;
     }
 
-    char line[512];
+    char line[MAX_LINE];  // Use MAX_LINE (4096) instead of 512 for long paths
     int region_count = 0;
     size_t total_dumped = 0;
     size_t current_offset = 0;
@@ -1472,9 +1472,9 @@ void dump_full_process_memory(pid_t pid) {
 
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
-        char perms[5], path[256] = "";
+        char perms[5], path[MAX_LINE] = "";
         
-        int items = sscanf(line, "%lx-%lx %4s %*x %*s %*d %255[^\n]", &start, &end, perms, path);
+        int items = sscanf(line, "%lx-%lx %4s %*x %*s %*d %4095[^\n]", &start, &end, perms, path);
         if (items < 3) continue;
 
         // Skip regions without read permission
@@ -1996,7 +1996,7 @@ static void check_network_connections(pid_t pid) {
         FILE *f = fopen(net_files[i], "r");
         if (!f) continue;
         
-        char line[512];
+        char line[MAX_LINE];  // Use MAX_LINE for potential IPv6 addresses and long paths
         // Skip header
         if (fgets(line, sizeof(line), f) == NULL) {
             fclose(f);
