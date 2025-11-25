@@ -729,12 +729,21 @@ int init_sandbox_reporting(const char *sample_path) {
 void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char *path, const char *cmdline) {
     // Always write to temp file in sandbox mode
     if (!sandbox_mode) return;
+    if (pid <= 0 || pid > 4194304) return;
     
-    // Only need one mutex - just tracking in memory, no I/O
-    pthread_mutex_lock(&sandbox_proc_mutex);
+    // Safety: ensure strings are not NULL
+    if (!name) name = "unknown";
+    if (!path) path = "unknown";
+    if (!cmdline) cmdline = "unknown";
+    
+    // Use trylock to avoid deadlocks
+    if (pthread_mutex_trylock(&sandbox_proc_mutex) != 0) {
+        fprintf(stderr, "[!] WARN: Could not acquire lock for PID %d, skipping report\n", pid);
+        return;
+    }
     
     // Check if this PID already exists (prevent duplicates from periodic rescans)
-    for (int i = 0; i < sandbox_process_count; i++) {
+    for (int i = 0; i < sandbox_process_count && i < MAX_SANDBOX_PROCESSES; i++) {
         if (sandbox_processes[i].pid == pid) {
             // Process already tracked, skip
             pthread_mutex_unlock(&sandbox_proc_mutex);
@@ -744,25 +753,33 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     
     // Add new process
     if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
-        sandbox_processes[sandbox_process_count].pid = pid;
-        sandbox_processes[sandbox_process_count].ppid = ppid;
-        strncpy(sandbox_processes[sandbox_process_count].name, name, sizeof(sandbox_processes[0].name) - 1);
-        strncpy(sandbox_processes[sandbox_process_count].path, path, sizeof(sandbox_processes[0].path) - 1);
-        strncpy(sandbox_processes[sandbox_process_count].cmdline, cmdline, sizeof(sandbox_processes[0].cmdline) - 1);
-        sandbox_processes[sandbox_process_count].start_time = time(NULL);
-        sandbox_processes[sandbox_process_count].active = 1;
+        int idx = sandbox_process_count;
+        sandbox_processes[idx].pid = pid;
+        sandbox_processes[idx].ppid = ppid;
+        strncpy(sandbox_processes[idx].name, name, sizeof(sandbox_processes[idx].name) - 1);
+        sandbox_processes[idx].name[sizeof(sandbox_processes[idx].name) - 1] = '\0';
+        strncpy(sandbox_processes[idx].path, path, sizeof(sandbox_processes[idx].path) - 1);
+        sandbox_processes[idx].path[sizeof(sandbox_processes[idx].path) - 1] = '\0';
+        strncpy(sandbox_processes[idx].cmdline, cmdline, sizeof(sandbox_processes[idx].cmdline) - 1);
+        sandbox_processes[idx].cmdline[sizeof(sandbox_processes[idx].cmdline) - 1] = '\0';
+        sandbox_processes[idx].start_time = time(NULL);
+        sandbox_processes[idx].active = 1;
         sandbox_process_count++;
         
         // BULLETPROOF: Write immediately to temp file
         char temp_file[600];
-        snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
-        FILE *tf = fopen(temp_file, "a");
-        if (tf) {
-            fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                    pid, ppid, name, path, cmdline, time(NULL));
-            fflush(tf);
-            fclose(tf);
+        int n = snprintf(temp_file, sizeof(temp_file), "%s/.processes.tmp", sandbox_report_dir);
+        if (n > 0 && n < sizeof(temp_file)) {
+            FILE *tf = fopen(temp_file, "a");
+            if (tf) {
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
+                        pid, ppid, name, path, cmdline, time(NULL));
+                fflush(tf);
+                fclose(tf);
+            }
         }
+    } else {
+        fprintf(stderr, "[!] WARN: Process tracking array full (%d processes)\n", MAX_SANDBOX_PROCESSES);
     }
     pthread_mutex_unlock(&sandbox_proc_mutex);
 }
@@ -2283,8 +2300,15 @@ static void check_network_connections(pid_t pid) {
 }
 
 void scan_maps_and_dump(pid_t pid) {
+    if (pid <= 0 || pid > 4194304) {
+        return;  // Invalid PID
+    }
+    
     char maps_path[64];
-    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    int n = snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+    if (n < 0 || n >= sizeof(maps_path)) {
+        return;  // Buffer error
+    }
 
     FILE *maps = fopen(maps_path, "r");
     if (!maps) {
@@ -2680,27 +2704,29 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
         
         // Register child in sandbox tracking if parent is sandbox process
         if (sandbox_mode && is_sandbox_process(parent_pid)) {
-            pthread_mutex_lock(&sandbox_proc_mutex);
-            if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
-                int found = 0;
-                // Check if already registered
-                for (int i = 0; i < sandbox_process_count; i++) {
-                    if (sandbox_processes[i].pid == child_pid) {
-                        found = 1;
-                        sandbox_processes[i].active = 1;  // Reactivate if needed
-                        break;
+            if (pthread_mutex_trylock(&sandbox_proc_mutex) == 0) {
+                if (sandbox_process_count < MAX_SANDBOX_PROCESSES) {
+                    int found = 0;
+                    // Check if already registered
+                    for (int i = 0; i < sandbox_process_count; i++) {
+                        if (sandbox_processes[i].pid == child_pid) {
+                            found = 1;
+                            sandbox_processes[i].active = 1;  // Reactivate if needed
+                            break;
+                        }
+                    }
+                    if (!found) {
+                        int idx = sandbox_process_count;
+                        sandbox_processes[idx].pid = child_pid;
+                        sandbox_processes[idx].ppid = parent_pid;
+                        sandbox_processes[idx].active = 1;
+                        sandbox_processes[idx].start_time = time(NULL);
+                        snprintf(sandbox_processes[idx].name, sizeof(sandbox_processes[idx].name), "child_%d", child_pid);
+                        sandbox_process_count++;
                     }
                 }
-                if (!found) {
-                    sandbox_processes[sandbox_process_count].pid = child_pid;
-                    sandbox_processes[sandbox_process_count].ppid = parent_pid;
-                    sandbox_processes[sandbox_process_count].active = 1;
-                    sandbox_processes[sandbox_process_count].start_time = time(NULL);
-                    snprintf(sandbox_processes[sandbox_process_count].name, sizeof(sandbox_processes[0].name), "child_%d", child_pid);
-                    __sync_fetch_and_add(&sandbox_process_count, 1);
-                }
+                pthread_mutex_unlock(&sandbox_proc_mutex);
             }
-            pthread_mutex_unlock(&sandbox_proc_mutex);
         }
         
         // Queue child for scanning (may have inherited suspicious mappings from parent)
@@ -3098,10 +3124,12 @@ int main(int argc, char **argv) {
         // Give the process a moment to start and then scan it
         usleep(100000); // 100ms
         
-        // Read what the child actually executed and add to process tree
-        char exe_path[256];
-        snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", sandbox_root_pid);
-        char exe_link[256] = {0};
+        // Verify process is still running before gathering info
+        if (kill(sandbox_root_pid, 0) == 0) {
+            // Read what the child actually executed and add to process tree
+            char exe_path[256];
+            snprintf(exe_path, sizeof(exe_path), "/proc/%d/exe", sandbox_root_pid);
+            char exe_link[256] = {0};
         ssize_t len = readlink(exe_path, exe_link, sizeof(exe_link) - 1);
         if (len > 0) {
             exe_link[len] = '\0';
@@ -3150,6 +3178,10 @@ int main(int argc, char **argv) {
             
             // Add parent/root process to report
             report_sandbox_process(sandbox_root_pid, parent_ppid, comm, exe_link, cmdline_buf);
+        } else {
+            fprintf(stderr, "[!] WARN: Sandbox root process exited before info could be gathered\n");
+            // Still report with minimal info
+            report_sandbox_process(sandbox_root_pid, getpid(), "exited", sandbox_binary, sandbox_binary);
         }
         
         queue_push(&event_queue, sandbox_root_pid, 0);
