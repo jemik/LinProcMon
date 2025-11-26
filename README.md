@@ -7,7 +7,7 @@ Real-time Linux process monitoring tool designed to detect malware, memory injec
 LinProcMon is a powerful security monitoring tool that uses the Linux kernel's netlink connector to receive real-time notifications about process execution events. It analyzes process memory mappings to detect suspicious behavior patterns commonly used by malware, including:
 
 - **Memory Injection Detection**: Identifies code execution from memfd_create, /dev/shm, and anonymous memory regions
-- **Process Hollowing**: Detects reflective DLL loading and process replacement techniques
+- **Process Replacement**: Detects binary replacement and ELF manipulation techniques
 - **RWX Memory Regions**: Flags writable+executable memory (JIT spray, self-modifying code, unpacking)
 - **Fileless Execution**: Catches execution from deleted files, memfd, and temporary locations
 - **Heap/Stack Execution**: Identifies shellcode execution in non-standard memory regions
