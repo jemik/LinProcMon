@@ -3050,12 +3050,20 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if this PID previously called memfd_create
-                int had_memfd = check_and_clear_memfd_pid(pid);
+                // Check if this PID previously called memfd_create (but don't clear the flag yet)
+                int had_memfd = 0;
+                pthread_mutex_lock(&memfd_pids_mutex);
+                for (int i = 0; i < memfd_pids_count; i++) {
+                    if (memfd_pids[i] == pid) {
+                        had_memfd = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&memfd_pids_mutex);
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s) - DUMPING NOW\n", pid, comm);
+                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s)\n", pid, comm);
                     } else {
                         printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
                                pid, comm, (unsigned long)addr, (unsigned long)len);
@@ -3064,17 +3072,6 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
-                
-                // Dump immediately after mmap following memfd_create (shellcode is loaded)
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after memfd+mmap (before execve)...\n", pid);
-                    
-                    // Brief yield to let mmap complete
-                    for (int i = 0; i < 5; i++) sched_yield();
-                    
-                    dump_full_process_memory(pid);
-                }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3087,20 +3084,8 @@ void *ebpf_pipe_reader(void *arg) {
                            pid, comm, (unsigned long)addr, (unsigned long)len);
                 }
                 
-                // Queue immediate scan
+                // Queue immediate scan (will trigger alerts)
                 queue_push(&event_queue, pid, 0);
-                
-                // For UPX/packers: dump after mprotect makes code executable
-                // Only dump if length is significant (not just PLT/GOT)
-                if (full_dump && len > 10000 && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after mprotect(PROT_EXEC) len=%lu (likely unpacked code)...\n", pid, (unsigned long)len);
-                    
-                    // Brief yield to let unpacking complete
-                    for (int i = 0; i < 5; i++) sched_yield();
-                    
-                    dump_full_process_memory(pid);
-                }
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3125,15 +3110,26 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Clear memfd flag if set (we should have dumped already on mmap)
-                check_and_clear_memfd_pid(pid);
+                // Check if memfd flag is set - means memfd was created then mmap'd, now about to exec
+                int had_memfd = check_and_clear_memfd_pid(pid);
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
+                    if (had_memfd) {
+                        printf("[eBPF] execve() AFTER memfd+mmap in PID %u (%s) - DUMPING NOW\n", pid, comm);
+                    } else {
+                        printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
+                    }
                 }
                 
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
+                
+                // Dump RIGHT NOW before execve completes (shellcode is written, process not replaced yet)
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping PID %u at execve (after shellcode written, before binary replacement)...\n", pid);
+                    dump_full_process_memory(pid);
+                }
             }
         }
     }
