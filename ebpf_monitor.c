@@ -10,14 +10,23 @@
  * Compile: clang -O2 -target bpf -c ebpf_monitor.c -o ebpf_monitor.o
  */
 
+// Type definitions (needed by libbpf headers)
+typedef unsigned char __u8;
+typedef unsigned short __u16;
+typedef unsigned int __u32;
+typedef unsigned long long __u64;
+typedef signed char __s8;
+typedef signed short __s16;
+typedef signed int __s32;
+typedef signed long long __s64;
+
+typedef __u8 u8;
+typedef __u16 u16;
+typedef __u32 u32;
+typedef __u64 u64;
+
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
-
-// Type definitions (avoid kernel headers)
-typedef unsigned char u8;
-typedef unsigned short u16;
-typedef unsigned int u32;
-typedef unsigned long long u64;
 
 // Event types
 #define EVENT_MMAP_EXEC 1
