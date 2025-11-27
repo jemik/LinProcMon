@@ -3050,13 +3050,31 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
+                // Check if this PID previously called memfd_create
+                int had_memfd = check_and_clear_memfd_pid(pid);
+                
                 if (!quiet_mode) {
-                    printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
-                           pid, comm, (unsigned long)addr, (unsigned long)len);
+                    if (had_memfd) {
+                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s) - DUMPING NOW\n", pid, comm);
+                    } else {
+                        printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
+                               pid, comm, (unsigned long)addr, (unsigned long)len);
+                    }
                 }
                 
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
+                
+                // Dump immediately after mmap following memfd_create (shellcode is loaded)
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping PID %u after memfd+mmap (before execve)...\n", pid);
+                    
+                    // Brief yield to let mmap complete
+                    for (int i = 0; i < 5; i++) sched_yield();
+                    
+                    dump_full_process_memory(pid);
+                }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3065,11 +3083,24 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] mprotect(PROT_EXEC) detected in PID %u (%s)\n", pid, comm);
+                    printf("[eBPF] mprotect(PROT_EXEC) detected in PID %u (%s) addr=0x%lx len=%lu\n", 
+                           pid, comm, (unsigned long)addr, (unsigned long)len);
                 }
                 
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
+                
+                // For UPX/packers: dump after mprotect makes code executable
+                // Only dump if length is significant (not just PLT/GOT)
+                if (full_dump && len > 10000 && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping PID %u after mprotect(PROT_EXEC) len=%lu (likely unpacked code)...\n", pid, (unsigned long)len);
+                    
+                    // Brief yield to let unpacking complete
+                    for (int i = 0; i < 5; i++) sched_yield();
+                    
+                    dump_full_process_memory(pid);
+                }
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3094,64 +3125,15 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if this PID previously called memfd_create
-                int had_memfd = check_and_clear_memfd_pid(pid);
+                // Clear memfd flag if set (we should have dumped already on mmap)
+                check_and_clear_memfd_pid(pid);
                 
                 if (!quiet_mode) {
-                    if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - waiting for memory load\n", pid, comm);
-                    } else {
-                        printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
-                    }
+                    printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                 }
                 
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
-                
-                // For memfd exec, wait for kernel to load binary then dump
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    
-                    // Poll /proc/PID/maps until executable regions appear (max 1000 attempts = ~100ms)
-                    char maps_path[64];
-                    snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
-                    int attempts = 0;
-                    int has_exec = 0;
-                    
-                    while (attempts < 1000 && !has_exec) {
-                        FILE *maps = fopen(maps_path, "r");
-                        if (maps) {
-                            char line[512];
-                            while (fgets(line, sizeof(line), maps)) {
-                                char perms[5];
-                                if (sscanf(line, "%*x-%*x %4s", perms) == 1) {
-                                    if (strchr(perms, 'x')) {
-                                        has_exec = 1;
-                                        break;
-                                    }
-                                }
-                            }
-                            fclose(maps);
-                        }
-                        
-                        if (!has_exec) {
-                            // Yield CPU briefly (sched_yield is more precise than usleep)
-                            sched_yield();
-                            attempts++;
-                        }
-                    }
-                    
-                    if (has_exec) {
-                        printf("[+] Dumping PID %u after memfd execve (found executable mappings after %d checks)...\n", pid, attempts);
-                        
-                        // Small additional yield to ensure kernel finishes loading
-                        for (int i = 0; i < 10; i++) sched_yield();
-                        
-                        dump_full_process_memory(pid);
-                    } else {
-                        printf("[WARN] PID %u - no executable mappings found after execve\n", pid);
-                    }
-                }
             }
         }
     }
