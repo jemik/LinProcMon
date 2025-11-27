@@ -20,10 +20,19 @@ typedef signed short __s16;
 typedef signed int __s32;
 typedef signed long long __s64;
 
+// Network byte order types
+typedef __u16 __be16;
+typedef __u32 __be32;
+typedef __u64 __be64;
+typedef __u32 __wsum;
+
 typedef __u8 u8;
 typedef __u16 u16;
 typedef __u32 u32;
 typedef __u64 u64;
+
+// BPF map types
+#define BPF_MAP_TYPE_RINGBUF 27
 
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
