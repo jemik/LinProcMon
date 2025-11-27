@@ -10,15 +10,14 @@
  * Compile: clang -O2 -target bpf -c ebpf_monitor.c -o ebpf_monitor.o
  */
 
-#include <linux/types.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
 
-// Minimal type definitions needed
-typedef __u8 u8;
-typedef __u16 u16;
-typedef __u32 u32;
-typedef __u64 u64;
+// Type definitions (avoid kernel headers)
+typedef unsigned char u8;
+typedef unsigned short u16;
+typedef unsigned int u32;
+typedef unsigned long long u64;
 
 // Event types
 #define EVENT_MMAP_EXEC 1
