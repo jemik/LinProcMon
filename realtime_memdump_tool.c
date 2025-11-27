@@ -58,6 +58,8 @@ int max_dumps = 0;  // Maximum number of processes to dump (0 = unlimited)
 int dumps_performed = 0;  // Counter for dumps performed
 char sandbox_termination_status[32] = "running";  // Termination status: running, completed, timeout, crashed
 int sandbox_exit_code = -1;  // Exit code or signal number
+char* ebpf_pipe_path = NULL;  // Path to named pipe for eBPF events
+pthread_t ebpf_pipe_thread;
 int sandbox_tool_crashed = 0;  // Set to 1 if tool crashes due to sample
 char sandbox_crash_reason[128] = "";  // Reason for tool crash
 
@@ -2886,6 +2888,65 @@ int queue_pop(event_queue_t *q, event_data_t *event) {
     return 0;
 }
 
+// eBPF event pipe reader thread
+void *ebpf_pipe_reader(void *arg) {
+    const char *pipe_path = (const char *)arg;
+    
+    printf("[+] eBPF pipe reader starting, opening: %s\n", pipe_path);
+    
+    FILE *pipe = fopen(pipe_path, "r");
+    if (!pipe) {
+        fprintf(stderr, "[!] Failed to open eBPF pipe %s: %s\n", pipe_path, strerror(errno));
+        return NULL;
+    }
+    
+    printf("[+] eBPF pipe opened successfully, waiting for events...\n");
+    
+    char line[512];
+    while (fgets(line, sizeof(line), pipe)) {
+        // Parse CSV: pid,tid,addr,len,prot,flags,event_type,comm
+        uint32_t pid, tid, prot, flags, event_type;
+        uint64_t addr, len;
+        char comm[32];
+        
+        if (sscanf(line, "%u,%u,%lx,%lu,%u,%u,%u,%31s", 
+                   &pid, &tid, &addr, &len, &prot, &flags, &event_type, comm) == 8) {
+            
+            // Event types: 1=MMAP_EXEC, 2=MPROTECT_EXEC, 3=MEMFD_CREATE, 4=EXECVE
+            if (event_type == 1 || event_type == 2) {  // MMAP_EXEC or MPROTECT_EXEC
+                if (!quiet_mode) {
+                    printf("[eBPF] %s detected in PID %u (%s) - triggering immediate scan\n",
+                           event_type == 1 ? "mmap(PROT_EXEC)" : "mprotect(PROT_EXEC)",
+                           pid, comm);
+                }
+                
+                // Queue immediate scan
+                queue_push(&event_queue, pid, 0);
+                
+                // If full dump enabled, also queue for dump
+                if (full_dump) {
+                    dump_queue_push(&dump_queue, pid);
+                }
+            } else if (event_type == 3) {  // MEMFD_CREATE
+                if (!quiet_mode) {
+                    printf("[eBPF] memfd_create() detected in PID %u (%s) - fileless execution risk\n",
+                           pid, comm);
+                }
+                queue_push(&event_queue, pid, 0);
+            } else if (event_type == 4) {  // EXECVE
+                if (!quiet_mode) {
+                    printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
+                }
+                queue_push(&event_queue, pid, 0);
+            }
+        }
+    }
+    
+    fclose(pipe);
+    printf("[*] eBPF pipe reader exiting\n");
+    return NULL;
+}
+
 // Worker thread function
 void *worker_thread(void *arg) {
     (void)arg;  // Unused
@@ -3114,6 +3175,9 @@ int main(int argc, char **argv) {
                 fprintf(stderr, "Error: --max-dumps must be >= 0\n");
                 return 1;
             }
+        } else if (strcmp(argv[i], "--ebpf-pipe") == 0 && i + 1 < argc) {
+            ebpf_pipe_path = argv[++i];
+            printf("[+] eBPF event pipe enabled: %s\n", ebpf_pipe_path);
         } else if (strcmp(argv[i], "--sandbox") == 0 && i + 1 < argc) {
             sandbox_mode = 1;
             sandbox_binary = argv[++i];
@@ -3147,6 +3211,7 @@ int main(int argc, char **argv) {
             printf("                    Creates memdump_PID/ directory with all regions\n");
             printf("  --max-dumps <N>   Maximum number of processes to dump (0=unlimited, default: 0)\n");
             printf("                    In sandbox mode, only counts sandbox processes\n");
+            printf("  --ebpf-pipe <path>  Read eBPF syscall events from named pipe for event-driven scanning\n");
             printf("  --sandbox <bin>   Sandbox mode: execute and monitor specific binary\n");
             printf("                    All remaining arguments are passed to the binary\n");
             printf("  --sandbox-timeout <min>  Sandbox analysis timeout in minutes (default: wait for exit)\n");
@@ -3200,6 +3265,15 @@ int main(int argc, char **argv) {
         }
     }
     printf("[+] Started %d worker threads for async processing\n", num_threads);
+
+    // Start eBPF pipe reader thread if enabled
+    if (ebpf_pipe_path) {
+        if (pthread_create(&ebpf_pipe_thread, NULL, ebpf_pipe_reader, (void*)ebpf_pipe_path) != 0) {
+            perror("pthread_create ebpf_pipe_reader");
+            return 1;
+        }
+        printf("[+] Started eBPF event pipe reader thread\n");
+    }
 
     // Perform initial scan of all running processes to catch existing threats
     // Skip this in sandbox mode - we only care about the sandbox process tree

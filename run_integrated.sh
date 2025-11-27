@@ -23,6 +23,7 @@ EXTRA_ARGS="$@"
 # Create unique session ID
 SESSION_ID="ebpf_$$"
 EBPF_LOG="/tmp/${SESSION_ID}_ebpf.log"
+PIPE_PATH="/tmp/${SESSION_ID}_pipe"
 
 echo "======================================"
 echo " Integrated eBPF + Memory Monitoring"
@@ -30,11 +31,17 @@ echo "======================================"
 echo ""
 echo "Target: $BINARY"
 echo "eBPF Log: $EBPF_LOG"
+echo "IPC Pipe: $PIPE_PATH"
 echo ""
+
+# Create named pipe for IPC
+echo "[0/3] Creating IPC pipe..."
+mkfifo "$PIPE_PATH"
+echo "      [✓] Named pipe created: $PIPE_PATH"
 
 # Start eBPF monitor in background
 echo "[1/3] Starting eBPF syscall monitor..."
-./ebpf_standalone > "$EBPF_LOG" 2>&1 &
+./ebpf_standalone --pipe "$PIPE_PATH" > "$EBPF_LOG" 2>&1 &
 EBPF_PID=$!
 sleep 1
 
@@ -48,7 +55,7 @@ echo "      [✓] eBPF monitor running (PID $EBPF_PID)"
 
 # Start memory dumper with sandbox mode
 echo "[2/3] Starting memory dumper in sandbox mode..."
-./realtime_memdump_tool --full_dump --sandbox-rescan 1 $EXTRA_ARGS --sandbox "$BINARY" &
+./realtime_memdump_tool --ebpf-pipe "$PIPE_PATH" --full_dump --sandbox-rescan 1 --sandbox-timeout 1  $EXTRA_ARGS --sandbox "$BINARY" &
 DUMPER_PID=$!
 
 echo "      [✓] Memory dumper running (PID $DUMPER_PID)"
@@ -64,6 +71,9 @@ cleanup() {
     kill $DUMPER_PID 2>/dev/null || true
     wait $EBPF_PID 2>/dev/null || true
     wait $DUMPER_PID 2>/dev/null || true
+    
+    # Clean up pipe
+    rm -f "$PIPE_PATH"
     
     echo ""
     echo "======================================"

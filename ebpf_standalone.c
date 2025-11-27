@@ -40,6 +40,7 @@ struct exec_event {
 
 static volatile int running = 1;
 static int filter_pid = 0;  // 0 = monitor all PIDs
+static FILE *pipe_output = NULL;  // Output pipe for IPC
 
 static void sig_handler(int sig) {
     running = 0;
@@ -117,6 +118,14 @@ static int handle_event(void *ctx, void *data, size_t data_sz) {
     }
     
     fflush(stdout);
+    
+    // Write to pipe if available (for IPC with memory dumper)
+    if (pipe_output) {
+        fprintf(pipe_output, "%u,%u,%lx,%lu,%u,%u,%u,%s\n",
+                e->pid, e->tid, e->addr, e->len, e->prot, e->flags, e->event_type, e->comm);
+        fflush(pipe_output);
+    }
+    
     return 0;
 }
 
@@ -127,21 +136,36 @@ int main(int argc, char **argv) {
     int err;
     
     // Parse arguments
+    const char *pipe_path = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--pid") == 0 && i + 1 < argc) {
             filter_pid = atoi(argv[i + 1]);
             i++;
+        } else if (strcmp(argv[i], "--pipe") == 0 && i + 1 < argc) {
+            pipe_path = argv[i + 1];
+            i++;
         } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--pid PID]\n", argv[0]);
+            printf("Usage: %s [--pid PID] [--pipe PATH]\n", argv[0]);
             printf("\nMonitor dangerous syscalls using eBPF:\n");
             printf("  mmap(PROT_EXEC)      - Allocate executable memory\n");
             printf("  mprotect(PROT_EXEC)  - Make memory executable\n");
             printf("  memfd_create()       - Create anonymous file (fileless execution)\n");
             printf("  execve()             - Execute program\n");
             printf("\nOptions:\n");
-            printf("  --pid PID   Only monitor specific PID\n");
+            printf("  --pid PID     Only monitor specific PID\n");
+            printf("  --pipe PATH   Write events to named pipe for IPC\n");
             return 0;
         }
+    }
+    
+    // Open pipe if specified
+    if (pipe_path) {
+        pipe_output = fopen(pipe_path, "w");
+        if (!pipe_output) {
+            fprintf(stderr, "[!] Failed to open pipe %s: %s\n", pipe_path, strerror(errno));
+            return 1;
+        }
+        printf("[+] Writing events to pipe: %s\n", pipe_path);
     }
     
     // Check root
@@ -235,6 +259,9 @@ int main(int argc, char **argv) {
     err = 0;
     
 cleanup:
+    if (pipe_output) {
+        fclose(pipe_output);
+    }
     if (rb) {
         ring_buffer__free(rb);
     }
