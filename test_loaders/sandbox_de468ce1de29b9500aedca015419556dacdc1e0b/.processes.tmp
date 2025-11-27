@@ -1,2 +1,0 @@
-{"pid":18898,"ppid":18887,"name":"sandbox_root","path":"/workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader","cmdline":"/workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader","start_time":1764168637}
-{"pid":18898,"ppid":18887,"name":"2_rwx_injection","path":"/workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader","cmdline":"/workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader -o test_2_report.json","start_time":1764168637}

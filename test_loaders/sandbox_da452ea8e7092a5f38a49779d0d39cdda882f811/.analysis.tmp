@@ -1,6 +1,0 @@
-"sample_path": "/workspaces/LinProcMon/test_loaders/test_output/3_deleted_binary_loader",
-"sample_sha1": "da452ea8e7092a5f38a49779d0d39cdda882f811",
-"sample_sha256": "9a838ff6dadd3bc143a5be64e6f5c606663f90849f1b006bef12b893c56bf1e5",
-"sample_type": "ELF",
-"sample_size": 17144,
-"timeout": 60

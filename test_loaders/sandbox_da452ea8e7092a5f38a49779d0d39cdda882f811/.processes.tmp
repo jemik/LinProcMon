@@ -1,3 +1,0 @@
-{"pid":19319,"ppid":19308,"name":"sandbox_root","path":"/workspaces/LinProcMon/test_loaders/test_output/3_deleted_binary_loader","cmdline":"/workspaces/LinProcMon/test_loaders/test_output/3_deleted_binary_loader","start_time":1764168669}
-{"pid":19319,"ppid":19308,"name":"3_deleted_binar","path":"/workspaces/LinProcMon/test_loaders/test_output/3_deleted_binary_loader","cmdline":"/workspaces/LinProcMon/test_loaders/test_output/3_deleted_binary_loader -o test_3_report.json","start_time":1764168669}
-{"pid":19320,"ppid":19319,"name":"legitimate_upda","path":"/tmp/legitimate_update_ju351p (deleted)","cmdline":"/tmp/legitimate_update_ju351p --child","start_time":1764168670}

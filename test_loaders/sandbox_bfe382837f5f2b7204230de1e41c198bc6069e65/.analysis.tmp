@@ -1,6 +1,0 @@
-"sample_path": "/workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader",
-"sample_sha1": "bfe382837f5f2b7204230de1e41c198bc6069e65",
-"sample_sha256": "ec341ff6668bf6dbcca5cdabac669dc4e49b314d2280e767e66a3eed212099e3",
-"sample_type": "ELF",
-"sample_size": 16760,
-"timeout": 60

@@ -1,6 +1,0 @@
-"sample_path": "/workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader",
-"sample_sha1": "de468ce1de29b9500aedca015419556dacdc1e0b",
-"sample_sha256": "e166634fdd87e2dbb1f754691ccd719b3d6102795477063a5d57d41254a3efdb",
-"sample_type": "ELF",
-"sample_size": 16552,
-"timeout": 60
