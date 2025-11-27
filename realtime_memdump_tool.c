@@ -2919,7 +2919,8 @@ void *ebpf_pipe_reader(void *arg) {
             
             // Event types: 1=MMAP_EXEC, 2=MPROTECT_EXEC, 3=MEMFD_CREATE, 4=EXECVE
             if (event_type == 1 || event_type == 2) {  // MMAP_EXEC or MPROTECT_EXEC
-                // In sandbox mode, only process sandbox PIDs
+                // In sandbox mode, check if this PID is in sandbox tree
+                // For child processes (like memfd exec), is_sandbox_process() walks parent chain
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
@@ -2930,15 +2931,16 @@ void *ebpf_pipe_reader(void *arg) {
                            pid, comm);
                 }
                 
-                // Queue immediate scan
+                // Queue immediate scan - HIGH PRIORITY
                 queue_push(&event_queue, pid, 0);
                 
-                // If full dump enabled, also queue for dump
+                // If full dump enabled, queue for dump immediately
+                // This is critical for catching decrypted payloads
                 if (full_dump) {
                     dump_queue_push(&dump_queue, pid);
                 }
             } else if (event_type == 3) {  // MEMFD_CREATE
-                // In sandbox mode, only process sandbox PIDs
+                // In sandbox mode, check if this PID is in sandbox tree
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
@@ -2947,17 +2949,36 @@ void *ebpf_pipe_reader(void *arg) {
                     printf("[eBPF] memfd_create() detected in PID %u (%s) - fileless execution risk\n",
                            pid, comm);
                 }
+                
+                // Queue scan
                 queue_push(&event_queue, pid, 0);
+                
+                // CRITICAL: memfd_create often means shellcode is about to be written
+                // Queue for dump immediately, then again after short delay to catch writes
+                if (full_dump) {
+                    dump_queue_push(&dump_queue, pid);
+                }
             } else if (event_type == 4) {  // EXECVE
-                // In sandbox mode, only process sandbox PIDs
+                // For execve events, the process has just replaced its binary
+                // This is HIGH PRIORITY - could be memfd exec with Meterpreter
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
+                    printf("[eBPF] execve() detected in PID %u (%s) - NEW BINARY LOADED\n", pid, comm);
                 }
+                
+                // CRITICAL: Queue scan immediately - the process just exec'd
                 queue_push(&event_queue, pid, 0);
+                
+                // CRITICAL: Queue for dump - this might be memfd exec with shellcode
+                // Dump AFTER exec to get the new binary's memory
+                if (full_dump) {
+                    // Add small delay to let exec complete and memory get mapped
+                    usleep(50000);  // 50ms delay
+                    dump_queue_push(&dump_queue, pid);
+                }
             }
         }
     }
