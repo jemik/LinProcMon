@@ -2210,6 +2210,11 @@ static int is_suspicious_file_location(const char *path, int *risk_score, char *
     *risk_score = 0;
     category[0] = '\0';
     
+    // Whitelist eBPF IPC pipe (our own monitoring infrastructure)
+    if (strstr(path, "/tmp/ebpf_") && strstr(path, "_pipe")) {
+        return 0;  // Not suspicious - it's our pipe
+    }
+    
     // Extract filename to check for hidden files
     const char *filename = strrchr(path, '/');
     filename = filename ? filename + 1 : path;
