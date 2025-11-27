@@ -25,7 +25,6 @@
 #include <sys/inotify.h>
 #include <ctype.h>
 #include <sched.h>  // For sched_yield()
-#include <sys/ptrace.h>  // For ptrace attach/detach
 
 #include <stddef.h> // For NULL
 
@@ -1939,28 +1938,6 @@ void dump_full_process_memory(pid_t pid) {
         fprintf(mapfile, "Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]\n\n");
     }
 
-    // Attach with ptrace to allow reading /proc/PID/mem
-    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
-        fprintf(stderr, "[-] ptrace attach failed for PID %d: %s\n", pid, strerror(errno));
-        fclose(maps);
-        close(dump_fd);
-        if (mapfile) fclose(mapfile);
-        return;
-    }
-    
-    // Wait for process to stop
-    int status;
-    if (waitpid(pid, &status, 0) == -1) {
-        fprintf(stderr, "[-] waitpid failed for PID %d: %s\n", pid, strerror(errno));
-        ptrace(PTRACE_DETACH, pid, NULL, NULL);
-        fclose(maps);
-        close(dump_fd);
-        if (mapfile) fclose(mapfile);
-        return;
-    }
-    
-    printf("[DEBUG] Successfully attached to PID %d with ptrace\n", pid);
-
     int mem_fd = -1;
     char mem_path[64];
     snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
@@ -2051,11 +2028,21 @@ void dump_full_process_memory(pid_t pid) {
                 // EIO = I/O error (common when process is modifying memory)
                 // EFAULT = Bad address (process unmapped region)
                 if (errno == EIO || errno == EFAULT) {
-                    // Silent failure - this is expected for active processes
+                    // Log for first region to help debug
+                    if (region_count == 0) {
+                        printf("[DEBUG] First region read failed: %s (errno=%d)\n", strerror(errno), errno);
+                    }
                     read_failed = 1;
                 } else if (errno != 0) {
                     // Other error - log it
+                    printf("[DEBUG] Read error at region %d: %s (errno=%d)\n", region_count, strerror(errno), errno);
                     if (mapfile) fprintf(mapfile, " [READ ERROR: %s]", strerror(errno));
+                    read_failed = 1;
+                } else {
+                    // bytes == 0 with no error means EOF
+                    if (region_count == 0) {
+                        printf("[DEBUG] First region returned 0 bytes (EOF)\n");
+                    }
                     read_failed = 1;
                 }
                 break;
@@ -2089,9 +2076,6 @@ void dump_full_process_memory(pid_t pid) {
     close(mem_fd);
     close(dump_fd);
     fclose(maps);
-    
-    // Detach and continue process
-    ptrace(PTRACE_DETACH, pid, NULL, NULL);
     
     printf("[DEBUG] Dump complete: %d total regions, %d readable, %zu bytes dumped\n", 
            region_count, readable_regions, total_dumped);
@@ -3159,6 +3143,10 @@ void *ebpf_pipe_reader(void *arg) {
                     
                     if (has_exec) {
                         printf("[+] Dumping PID %u after memfd execve (found executable mappings after %d checks)...\n", pid, attempts);
+                        
+                        // Small additional yield to ensure kernel finishes loading
+                        for (int i = 0; i < 10; i++) sched_yield();
+                        
                         dump_full_process_memory(pid);
                     } else {
                         printf("[WARN] PID %u - no executable mappings found after execve\n", pid);
