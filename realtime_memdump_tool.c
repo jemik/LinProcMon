@@ -440,6 +440,22 @@ void mark_as_dumped(pid_t pid) {
     pthread_mutex_unlock(&dumped_pids_mutex);
 }
 
+// Clear dumped flag for PID (e.g., after execve to allow re-dump)
+void clear_dumped_flag(pid_t pid) {
+    pthread_mutex_lock(&dumped_pids_mutex);
+    for (int i = 0; i < dumped_pids_count; i++) {
+        if (dumped_pids[i] == pid) {
+            // Shift array left to remove this entry
+            for (int j = i; j < dumped_pids_count - 1; j++) {
+                dumped_pids[j] = dumped_pids[j + 1];
+            }
+            dumped_pids_count--;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&dumped_pids_mutex);
+}
+
 // Check if PID has already been processed
 int is_already_processed(pid_t pid) {
     pthread_mutex_lock(&processed_pids_mutex);
@@ -2941,20 +2957,25 @@ void *ebpf_pipe_reader(void *arg) {
             // Event types: 1=MMAP_EXEC, 2=MPROTECT_EXEC, 3=MEMFD_CREATE, 4=EXECVE
             if (event_type == 1 || event_type == 2) {  // MMAP_EXEC or MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
-                // For child processes (like memfd exec), is_sandbox_process() walks parent chain
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] %s detected in PID %u (%s) - triggering immediate scan\n",
+                    printf("[eBPF] %s detected in PID %u (%s) - triggering immediate scan and dump\n",
                            event_type == 1 ? "mmap(PROT_EXEC)" : "mprotect(PROT_EXEC)",
                            pid, comm);
                 }
                 
-                // Queue immediate scan - HIGH PRIORITY
-                // The scan will determine if dump is needed based on what it finds
+                // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
+                
+                // CRITICAL: mmap/mprotect(PROT_EXEC) means code is being loaded/decrypted
+                // Queue for dump immediately - this catches XOR decryption and unpacking
+                if (full_dump && !is_already_dumped(pid)) {
+                    dump_queue_push(&dump_queue, pid);
+                    mark_as_dumped(pid);
+                }
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -2963,16 +2984,21 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] memfd_create() detected in PID %u (%s) - fileless execution risk\n",
+                    printf("[eBPF] memfd_create() detected in PID %u (%s) - HIGH RISK\n",
                            pid, comm);
                 }
                 
-                // Queue scan - memfd is HIGH RISK, scan will trigger dump if suspicious
+                // Queue scan
                 queue_push(&event_queue, pid, 0);
+                
+                // CRITICAL: memfd_create is HIGH RISK - queue for dump
+                if (full_dump && !is_already_dumped(pid)) {
+                    dump_queue_push(&dump_queue, pid);
+                    mark_as_dumped(pid);
+                }
                 
             } else if (event_type == 4) {  // EXECVE
                 // For execve events, the process has just replaced its binary
-                // This is HIGH PRIORITY - could be memfd exec with Meterpreter
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
@@ -2981,9 +3007,18 @@ void *ebpf_pipe_reader(void *arg) {
                     printf("[eBPF] execve() detected in PID %u (%s) - NEW BINARY LOADED\n", pid, comm);
                 }
                 
-                // CRITICAL: Queue scan immediately - the process just exec'd
-                // If it's memfd exec, the scan will detect it and trigger dump
+                // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
+                
+                // CRITICAL: execve might be memfd exec - clear "already dumped" flag
+                // so we can dump the NEW binary's memory
+                clear_dumped_flag(pid);
+                
+                // Queue for dump to catch the new binary (might be Meterpreter)
+                if (full_dump) {
+                    dump_queue_push(&dump_queue, pid);
+                    mark_as_dumped(pid);
+                }
             }
         }
     }
