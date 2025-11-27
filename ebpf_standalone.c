@@ -173,12 +173,30 @@ int main(int argc, char **argv) {
         goto cleanup;
     }
     
-    // Attach programs
-    err = bpf_object__attach_skeleton(obj);
-    if (err) {
-        fprintf(stderr, "[!] Failed to attach BPF programs: %d\n", err);
+    // Manually attach each tracepoint program
+    struct bpf_program *prog;
+    struct bpf_link *link;
+    int attached_count = 0;
+    
+    bpf_object__for_each_program(prog, obj) {
+        link = bpf_program__attach(prog);
+        if (!link) {
+            err = -errno;
+            fprintf(stderr, "[!] Failed to attach program %s: %s\n", 
+                    bpf_program__name(prog), strerror(-err));
+            // Continue trying to attach other programs
+        } else {
+            attached_count++;
+        }
+    }
+    
+    if (attached_count == 0) {
+        fprintf(stderr, "[!] Failed to attach any BPF programs\n");
+        err = -1;
         goto cleanup;
     }
+    
+    printf("[+] Attached %d BPF programs successfully\n", attached_count);
     
     // Get ringbuffer map
     events_map = bpf_object__find_map_by_name(obj, "events");
