@@ -3027,27 +3027,13 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if this follows memfd_create + execve
-                int had_memfd_exec = check_and_clear_memfd_exec_pid(pid);
-                
                 if (!quiet_mode) {
-                    if (had_memfd_exec) {
-                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd+execve in PID %u (%s) - DUMPING NOW\n", pid, comm);
-                    } else {
-                        printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
-                               pid, comm, (unsigned long)addr, (unsigned long)len);
-                    }
+                    printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
+                           pid, comm, (unsigned long)addr, (unsigned long)len);
                 }
                 
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
-                
-                // Dump if this is the first mmap after memfd+exec (shellcode now loaded)
-                if (had_memfd_exec && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping memfd-exec process PID %u after mmap...\n", pid);
-                    dump_full_process_memory(pid);
-                }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3090,7 +3076,7 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - marking for dump on next mmap\n", pid, comm);
+                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - DUMPING IMMEDIATELY\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
@@ -3099,9 +3085,19 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Mark for dump on NEXT mmap (when new binary's code is loaded)
-                if (had_memfd) {
-                    mark_memfd_exec_pid(pid);
+                // For memfd exec, dump RIGHT NOW (this PID is now Meterpreter)
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    
+                    // Verify process exists
+                    char proc_check[64];
+                    snprintf(proc_check, sizeof(proc_check), "/proc/%u", pid);
+                    if (access(proc_check, F_OK) == 0) {
+                        printf("[+] Dumping PID %u immediately after memfd execve...\n", pid);
+                        dump_full_process_memory(pid);
+                    } else {
+                        printf("[WARN] PID %u exited before dump after execve\n", pid);
+                    }
                 }
             }
         }
