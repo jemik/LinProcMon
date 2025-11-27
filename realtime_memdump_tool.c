@@ -3073,6 +3073,64 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
+                // If this is after memfd_create, the loader will write shellcode then execve
+                // We need to dump AFTER shellcode is written but BEFORE execve
+                // Solution: Poll the memfd size until it grows beyond the stub size
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Waiting for shellcode to be written after memfd+mmap in PID %u...\n", pid);
+                    
+                    // The mmap is just 74 bytes (stub), wait for the memfd to be populated
+                    // Check /proc/PID/fd/* for memfd and poll its size
+                    char fd_dir[64];
+                    snprintf(fd_dir, sizeof(fd_dir), "/proc/%u/fd", pid);
+                    
+                    int payload_written = 0;
+                    for (int attempt = 0; attempt < 100 && !payload_written; attempt++) {
+                        DIR *dir = opendir(fd_dir);
+                        if (dir) {
+                            struct dirent *entry;
+                            while ((entry = readdir(dir)) != NULL) {
+                                if (entry->d_name[0] == '.') continue;
+                                
+                                char fd_path[128], fd_target[256];
+                                snprintf(fd_path, sizeof(fd_path), "%s/%s", fd_dir, entry->d_name);
+                                ssize_t len = readlink(fd_path, fd_target, sizeof(fd_target) - 1);
+                                if (len > 0) {
+                                    fd_target[len] = '\0';
+                                    if (strstr(fd_target, "memfd:")) {
+                                        // Found memfd, check its size
+                                        struct stat st;
+                                        if (fstat(atoi(entry->d_name), &st) == 0 || stat(fd_path, &st) == 0) {
+                                            if (st.st_size > 10000) {  // Shellcode written (>10KB)
+                                                payload_written = 1;
+                                                printf("[+] Memfd populated with %ld bytes, dumping now...\n", st.st_size);
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            closedir(dir);
+                        }
+                        
+                        if (!payload_written) {
+                            // Check if process still exists
+                            char proc_check[64];
+                            snprintf(proc_check, sizeof(proc_check), "/proc/%u", pid);
+                            if (access(proc_check, F_OK) != 0) break;
+                            
+                            sched_yield();
+                        }
+                    }
+                    
+                    if (payload_written) {
+                        dump_full_process_memory(pid);
+                    } else {
+                        printf("[WARN] PID %u - memfd not populated or process exited\n", pid);
+                    }
+                }
+                
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
                 if (sandbox_mode && !is_sandbox_process(pid)) {
@@ -3110,26 +3168,15 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if memfd flag is set - means memfd was created then mmap'd, now about to exec
-                int had_memfd = check_and_clear_memfd_pid(pid);
+                // Clear memfd flag (we should have dumped on mmap)
+                check_and_clear_memfd_pid(pid);
                 
                 if (!quiet_mode) {
-                    if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd+mmap in PID %u (%s) - DUMPING NOW\n", pid, comm);
-                    } else {
-                        printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
-                    }
+                    printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                 }
                 
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
-                
-                // Dump RIGHT NOW before execve completes (shellcode is written, process not replaced yet)
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u at execve (after shellcode written, before binary replacement)...\n", pid);
-                    dump_full_process_memory(pid);
-                }
             }
         }
     }
