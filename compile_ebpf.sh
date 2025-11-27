@@ -59,8 +59,11 @@ clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 \
     -I/usr/include \
     -I${KERNEL_HEADERS}/include \
     -I${KERNEL_HEADERS}/include/uapi \
+    -I${KERNEL_HEADERS}/include/generated/uapi \
     -I${KERNEL_HEADERS}/arch/x86/include \
     -I${KERNEL_HEADERS}/arch/x86/include/uapi \
+    -I${KERNEL_HEADERS}/arch/x86/include/generated \
+    -I${KERNEL_HEADERS}/arch/x86/include/generated/uapi \
     -c ebpf_monitor.c -o ebpf_monitor.o
 
 if [ $? -eq 0 ]; then
