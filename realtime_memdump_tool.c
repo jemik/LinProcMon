@@ -2914,6 +2914,11 @@ void *ebpf_pipe_reader(void *arg) {
             
             // Event types: 1=MMAP_EXEC, 2=MPROTECT_EXEC, 3=MEMFD_CREATE, 4=EXECVE
             if (event_type == 1 || event_type == 2) {  // MMAP_EXEC or MPROTECT_EXEC
+                // In sandbox mode, only process sandbox PIDs
+                if (sandbox_mode && !is_sandbox_process(pid)) {
+                    continue;
+                }
+                
                 if (!quiet_mode) {
                     printf("[eBPF] %s detected in PID %u (%s) - triggering immediate scan\n",
                            event_type == 1 ? "mmap(PROT_EXEC)" : "mprotect(PROT_EXEC)",
@@ -2928,12 +2933,22 @@ void *ebpf_pipe_reader(void *arg) {
                     dump_queue_push(&dump_queue, pid);
                 }
             } else if (event_type == 3) {  // MEMFD_CREATE
+                // In sandbox mode, only process sandbox PIDs
+                if (sandbox_mode && !is_sandbox_process(pid)) {
+                    continue;
+                }
+                
                 if (!quiet_mode) {
                     printf("[eBPF] memfd_create() detected in PID %u (%s) - fileless execution risk\n",
                            pid, comm);
                 }
                 queue_push(&event_queue, pid, 0);
             } else if (event_type == 4) {  // EXECVE
+                // In sandbox mode, only process sandbox PIDs
+                if (sandbox_mode && !is_sandbox_process(pid)) {
+                    continue;
+                }
+                
                 if (!quiet_mode) {
                     printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                 }
@@ -3072,6 +3087,28 @@ void* dump_worker(void *arg) {
         if (dump_queue_pop(&dump_queue, &pid) < 0) {
             // Shutdown signal received
             break;
+        }
+        
+        // In sandbox mode, only dump sandbox processes
+        if (sandbox_mode && !is_sandbox_process(pid)) {
+            if (!quiet_mode) {
+                printf("[SKIP] PID %d not in sandbox process tree\n", pid);
+            }
+            continue;
+        }
+        
+        // Check max_dumps limit (0 = unlimited)
+        if (max_dumps > 0) {
+            pthread_mutex_lock(&stats_mutex);
+            int current_dumps = dumps_performed;
+            pthread_mutex_unlock(&stats_mutex);
+            
+            if (current_dumps >= max_dumps) {
+                if (!quiet_mode) {
+                    printf("[SKIP] PID %d - max dump limit reached (%d/%d)\n", pid, current_dumps, max_dumps);
+                }
+                continue;
+            }
         }
         
         // Check if process still exists before dumping
