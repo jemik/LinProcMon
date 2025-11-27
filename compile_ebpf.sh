@@ -19,7 +19,7 @@ if ! command -v llvm-objdump &> /dev/null; then
     MISSING="$MISSING llvm"
 fi
 
-if ! pkg-config --exists libbpf 2>/dev/null; then
+if ! pkg-config --exists libbpf 2>/dev/null && [ ! -f /usr/include/bpf/libbpf.h ] && [ ! -f /usr/include/bpf/bpf.h ]; then
     MISSING="$MISSING libbpf-dev"
 fi
 
