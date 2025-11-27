@@ -36,7 +36,12 @@ sudo pacman -S clang llvm libbpf linux-headers
 ### 2. Compile eBPF Program
 
 ```bash
-clang -O2 -target bpf -D__TARGET_ARCH_x86_64 -c ebpf_monitor.c -o ebpf_monitor.o
+clang -O2 -target bpf -D__TARGET_ARCH_x86_64 \
+    -I/lib/modules/$(uname -r)/build/include \
+    -I/lib/modules/$(uname -r)/build/include/uapi \
+    -I/lib/modules/$(uname -r)/build/arch/x86/include \
+    -I/lib/modules/$(uname -r)/build/arch/x86/include/uapi \
+    -c ebpf_monitor.c -o ebpf_monitor.o
 ```
 
 ### 3. Compile Standalone Monitor

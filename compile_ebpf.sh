@@ -46,8 +46,21 @@ fi
 # Compile eBPF program
 echo ""
 echo "[2] Compiling eBPF kernel module..."
+
+# Find kernel headers
+KERNEL_HEADERS=""
+if [ -d "/lib/modules/$(uname -r)/build" ]; then
+    KERNEL_HEADERS="/lib/modules/$(uname -r)/build"
+elif [ -d "/usr/src/linux-headers-$(uname -r)" ]; then
+    KERNEL_HEADERS="/usr/src/linux-headers-$(uname -r)"
+fi
+
 clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 \
     -I/usr/include \
+    -I${KERNEL_HEADERS}/include \
+    -I${KERNEL_HEADERS}/include/uapi \
+    -I${KERNEL_HEADERS}/arch/x86/include \
+    -I${KERNEL_HEADERS}/arch/x86/include/uapi \
     -c ebpf_monitor.c -o ebpf_monitor.o
 
 if [ $? -eq 0 ]; then

@@ -145,18 +145,25 @@ RUN ./compile_ebpf.sh
 If `compile_ebpf.sh` fails, you can compile manually:
 
 ```bash
-# 1. Compile eBPF kernel module
+# 1. Set kernel headers path
+KHEADERS="/lib/modules/$(uname -r)/build"
+
+# 2. Compile eBPF kernel module
 clang -O2 -g -target bpf -D__TARGET_ARCH_x86_64 \
     -I/usr/include \
+    -I${KHEADERS}/include \
+    -I${KHEADERS}/include/uapi \
+    -I${KHEADERS}/arch/x86/include \
+    -I${KHEADERS}/arch/x86/include/uapi \
     -c ebpf_monitor.c -o ebpf_monitor.o
 
-# 2. Verify eBPF object
+# 3. Verify eBPF object
 llvm-objdump -h ebpf_monitor.o | grep tracepoint
 
-# 3. Compile userspace monitor
+# 4. Compile userspace monitor
 gcc -o ebpf_standalone ebpf_standalone.c -lbpf -lelf -lz
 
-# 4. Test
+# 5. Test
 sudo ./ebpf_standalone
 ```
 
