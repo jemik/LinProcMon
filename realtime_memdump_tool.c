@@ -2994,26 +2994,13 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if this PID previously called memfd_create
-                int had_memfd = check_and_clear_memfd_pid(pid);
-                
                 if (!quiet_mode) {
-                    if (had_memfd) {
-                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s) - DUMPING SHELLCODE\n", pid, comm);
-                    } else {
-                        printf("[eBPF] mmap(PROT_EXEC) detected in PID %u (%s)\n", pid, comm);
-                    }
+                    printf("[eBPF] mmap(PROT_EXEC) detected in PID %u (%s) addr=0x%lx len=%lu\n", 
+                           pid, comm, (unsigned long)addr, (unsigned long)len);
                 }
                 
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
-                
-                // Dump if this follows memfd_create (shellcode loaded to memfd)
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    if (dump_queue_push(&dump_queue, pid) == 0) {
-                        mark_as_dumped(pid);
-                    }
-                }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3051,21 +3038,25 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                if (!quiet_mode) {
-                    printf("[eBPF] execve() detected in PID %u (%s) - NEW BINARY LOADED\n", pid, comm);
-                }
+                // Check if this PID previously called memfd_create
+                int had_memfd = check_and_clear_memfd_pid(pid);
                 
-                // Clear "already dumped" flag so the new binary can be dumped
-                clear_dumped_flag(pid);
+                if (!quiet_mode) {
+                    if (had_memfd) {
+                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - DUMPING IMMEDIATELY\n", pid, comm);
+                    } else {
+                        printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
+                    }
+                }
                 
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump to catch the new binary (e.g., Meterpreter after UPX unpacking)
-                if (full_dump) {
-                    if (dump_queue_push(&dump_queue, pid) == 0) {
-                        mark_as_dumped(pid);
-                    }
+                // For memfd exec, dump IMMEDIATELY (process may exit quickly)
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping memfd-exec process PID %u immediately...\n", pid);
+                    dump_full_process_memory(pid);  // Direct call, not queued
                 }
             }
         }
