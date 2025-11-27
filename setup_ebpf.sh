@@ -34,8 +34,10 @@ if [ "$DISTRO" = "ubuntu" ] || [ "$DISTRO" = "debian" ]; then
         libbpf-dev \
         linux-headers-$(uname -r) \
         linux-tools-$(uname -r) \
-        linux-tools-common \
-        bpftool
+        linux-tools-common
+    
+    # bpftool is optional - try to install but don't fail if not available
+    apt-get install -y linux-tools-generic 2>/dev/null || true
         
 elif [ "$DISTRO" = "fedora" ] || [ "$DISTRO" = "rhel" ] || [ "$DISTRO" = "centos" ]; then
     dnf install -y \

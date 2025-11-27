@@ -32,9 +32,9 @@ if [ -n "$MISSING" ]; then
     echo ""
     echo "Install with:"
     if [ -f /etc/debian_version ]; then
-        echo "    sudo apt-get install clang llvm libbpf-dev linux-headers-\$(uname -r) bpftool"
+        echo "    sudo apt-get install clang llvm libbpf-dev linux-headers-\$(uname -r)"
     elif [ -f /etc/redhat-release ]; then
-        echo "    sudo dnf install clang llvm libbpf-devel kernel-devel bpftool"
+        echo "    sudo dnf install clang llvm libbpf-devel kernel-devel"
     else
         echo "    (See EBPF_README.md for your distribution)"
     fi

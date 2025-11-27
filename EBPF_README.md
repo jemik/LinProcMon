@@ -24,13 +24,13 @@ The original tool uses **netlink process events** which only catches process cre
 
 ```bash
 # Ubuntu/Debian
-sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r) bpftool
+sudo apt-get install clang llvm libbpf-dev linux-headers-$(uname -r)
 
 # Fedora/RHEL
-sudo dnf install clang llvm libbpf-devel kernel-devel bpftool
+sudo dnf install clang llvm libbpf-devel kernel-devel
 
 # Arch Linux
-sudo pacman -S clang llvm libbpf linux-headers bpf
+sudo pacman -S clang llvm libbpf linux-headers
 ```
 
 ### 2. Compile eBPF Program
