@@ -414,6 +414,12 @@ pid_t processed_pids[MAX_PROCESSED_PIDS];
 int processed_pids_count = 0;
 pthread_mutex_t processed_pids_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Track PIDs that called memfd_create (dump on next mmap(PROT_EXEC))
+#define MAX_MEMFD_PIDS 128
+pid_t memfd_pids[MAX_MEMFD_PIDS];
+int memfd_pids_count = 0;
+pthread_mutex_t memfd_pids_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // ============================================================================
 // SANDBOX REPORTING FUNCTIONS
 // ============================================================================
@@ -454,6 +460,33 @@ void clear_dumped_flag(pid_t pid) {
         }
     }
     pthread_mutex_unlock(&dumped_pids_mutex);
+}
+
+// Mark PID as having called memfd_create
+void mark_memfd_pid(pid_t pid) {
+    pthread_mutex_lock(&memfd_pids_mutex);
+    if (memfd_pids_count < MAX_MEMFD_PIDS) {
+        memfd_pids[memfd_pids_count++] = pid;
+    }
+    pthread_mutex_unlock(&memfd_pids_mutex);
+}
+
+// Check and clear memfd flag for PID (returns 1 if was flagged, 0 otherwise)
+int check_and_clear_memfd_pid(pid_t pid) {
+    pthread_mutex_lock(&memfd_pids_mutex);
+    for (int i = 0; i < memfd_pids_count; i++) {
+        if (memfd_pids[i] == pid) {
+            // Remove from array by shifting
+            for (int j = i; j < memfd_pids_count - 1; j++) {
+                memfd_pids[j] = memfd_pids[j + 1];
+            }
+            memfd_pids_count--;
+            pthread_mutex_unlock(&memfd_pids_mutex);
+            return 1;
+        }
+    }
+    pthread_mutex_unlock(&memfd_pids_mutex);
+    return 0;
 }
 
 // Check if PID has already been processed
@@ -2955,19 +2988,44 @@ void *ebpf_pipe_reader(void *arg) {
                    &pid, &tid, &addr, &len, &prot, &flags, &event_type, comm) == 8) {
             
             // Event types: 1=MMAP_EXEC, 2=MPROTECT_EXEC, 3=MEMFD_CREATE, 4=EXECVE
-            if (event_type == 1 || event_type == 2) {  // MMAP_EXEC or MPROTECT_EXEC
+            if (event_type == 1) {  // MMAP_EXEC
+                // In sandbox mode, check if this PID is in sandbox tree
+                if (sandbox_mode && !is_sandbox_process(pid)) {
+                    continue;
+                }
+                
+                // Check if this PID previously called memfd_create
+                int had_memfd = check_and_clear_memfd_pid(pid);
+                
+                if (!quiet_mode) {
+                    if (had_memfd) {
+                        printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s) - DUMPING SHELLCODE\n", pid, comm);
+                    } else {
+                        printf("[eBPF] mmap(PROT_EXEC) detected in PID %u (%s)\n", pid, comm);
+                    }
+                }
+                
+                // Queue immediate scan
+                queue_push(&event_queue, pid, 0);
+                
+                // Dump if this follows memfd_create (shellcode loaded to memfd)
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    if (dump_queue_push(&dump_queue, pid) == 0) {
+                        mark_as_dumped(pid);
+                    }
+                }
+                
+            } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
                 if (sandbox_mode && !is_sandbox_process(pid)) {
                     continue;
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] %s detected in PID %u (%s) - triggering immediate scan\n",
-                           event_type == 1 ? "mmap(PROT_EXEC)" : "mprotect(PROT_EXEC)",
-                           pid, comm);
+                    printf("[eBPF] mprotect(PROT_EXEC) detected in PID %u (%s)\n", pid, comm);
                 }
                 
-                // Queue immediate scan - scan will detect suspicious regions and trigger dump
+                // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
@@ -2977,11 +3035,14 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] memfd_create() detected in PID %u (%s) - HIGH RISK\n",
+                    printf("[eBPF] memfd_create() detected in PID %u (%s) - marking for dump on next mmap\n",
                            pid, comm);
                 }
                 
-                // Queue scan - scan will detect memfd execution and trigger dump
+                // Mark this PID - we'll dump on the NEXT mmap(PROT_EXEC)
+                mark_memfd_pid(pid);
+                
+                // Queue scan
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
@@ -2997,8 +3058,15 @@ void *ebpf_pipe_reader(void *arg) {
                 // Clear "already dumped" flag so the new binary can be dumped
                 clear_dumped_flag(pid);
                 
-                // Queue scan immediately - scan will detect suspicious regions in new binary
+                // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
+                
+                // Dump to catch the new binary (e.g., Meterpreter after UPX unpacking)
+                if (full_dump) {
+                    if (dump_queue_push(&dump_queue, pid) == 0) {
+                        mark_as_dumped(pid);
+                    }
+                }
             }
         }
     }
