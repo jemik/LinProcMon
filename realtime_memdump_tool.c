@@ -24,6 +24,7 @@
 #include <openssl/sha.h>
 #include <sys/inotify.h>
 #include <ctype.h>
+#include <sched.h>  // For sched_yield()
 
 #include <stddef.h> // For NULL
 
@@ -3076,7 +3077,7 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - DUMPING IMMEDIATELY\n", pid, comm);
+                        printf("[eBPF] execve() AFTER memfd_create in PID %u (%s) - waiting for memory load\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
@@ -3085,18 +3086,44 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // For memfd exec, dump RIGHT NOW (this PID is now Meterpreter)
+                // For memfd exec, wait for kernel to load binary then dump
                 if (had_memfd && full_dump && !is_already_dumped(pid)) {
                     mark_as_dumped(pid);
                     
-                    // Verify process exists
-                    char proc_check[64];
-                    snprintf(proc_check, sizeof(proc_check), "/proc/%u", pid);
-                    if (access(proc_check, F_OK) == 0) {
-                        printf("[+] Dumping PID %u immediately after memfd execve...\n", pid);
+                    // Poll /proc/PID/maps until executable regions appear (max 1000 attempts = ~100ms)
+                    char maps_path[64];
+                    snprintf(maps_path, sizeof(maps_path), "/proc/%u/maps", pid);
+                    int attempts = 0;
+                    int has_exec = 0;
+                    
+                    while (attempts < 1000 && !has_exec) {
+                        FILE *maps = fopen(maps_path, "r");
+                        if (maps) {
+                            char line[512];
+                            while (fgets(line, sizeof(line), maps)) {
+                                char perms[5];
+                                if (sscanf(line, "%*x-%*x %4s", perms) == 1) {
+                                    if (strchr(perms, 'x')) {
+                                        has_exec = 1;
+                                        break;
+                                    }
+                                }
+                            }
+                            fclose(maps);
+                        }
+                        
+                        if (!has_exec) {
+                            // Yield CPU briefly (sched_yield is more precise than usleep)
+                            sched_yield();
+                            attempts++;
+                        }
+                    }
+                    
+                    if (has_exec) {
+                        printf("[+] Dumping PID %u after memfd execve (found executable mappings after %d checks)...\n", pid, attempts);
                         dump_full_process_memory(pid);
                     } else {
-                        printf("[WARN] PID %u exited before dump after execve\n", pid);
+                        printf("[WARN] PID %u - no executable mappings found after execve\n", pid);
                     }
                 }
             }
