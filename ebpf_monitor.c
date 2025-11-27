@@ -61,10 +61,13 @@ struct {
     __uint(max_entries, 256 * 1024); // 256KB buffer
 } events SEC(".maps");
 
-// Tracepoint format for syscall entry (simplified)
-struct trace_event_raw_sys_enter {
-    u64 __unused;
-    long id;
+// Tracepoint context structure
+struct syscall_trace_enter {
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    long syscall_nr;
     unsigned long args[6];
 };
 
@@ -73,9 +76,9 @@ static __always_inline void get_task_comm(char *buf, int size) {
     bpf_get_current_comm(buf, size);
 }
 
-// Hook: sys_mmap / do_mmap
+// Hook: sys_mmap
 SEC("tracepoint/syscalls/sys_enter_mmap")
-int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
+int trace_mmap(struct syscall_trace_enter *ctx) {
     u64 addr = ctx->args[0];
     u64 len = ctx->args[1];
     u32 prot = (u32)ctx->args[2];
@@ -108,7 +111,7 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
 
 // Hook: sys_mprotect
 SEC("tracepoint/syscalls/sys_enter_mprotect")
-int trace_mprotect(struct trace_event_raw_sys_enter *ctx) {
+int trace_mprotect(struct syscall_trace_enter *ctx) {
     u64 addr = ctx->args[0];
     u64 len = ctx->args[1];
     u32 prot = (u32)ctx->args[2];
@@ -139,7 +142,7 @@ int trace_mprotect(struct trace_event_raw_sys_enter *ctx) {
 
 // Hook: sys_memfd_create
 SEC("tracepoint/syscalls/sys_enter_memfd_create")
-int trace_memfd_create(struct trace_event_raw_sys_enter *ctx) {
+int trace_memfd_create(struct syscall_trace_enter *ctx) {
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         return 0;
@@ -161,7 +164,7 @@ int trace_memfd_create(struct trace_event_raw_sys_enter *ctx) {
 
 // Hook: sys_execve
 SEC("tracepoint/syscalls/sys_enter_execve")
-int trace_execve(struct trace_event_raw_sys_enter *ctx) {
+int trace_execve(struct syscall_trace_enter *ctx) {
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
     if (!e) {
         return 0;
