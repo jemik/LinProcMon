@@ -25,6 +25,7 @@
 #include <sys/inotify.h>
 #include <ctype.h>
 #include <sched.h>  // For sched_yield()
+#include <sys/ptrace.h>  // For ptrace attach/detach
 
 #include <stddef.h> // For NULL
 
@@ -1938,20 +1939,45 @@ void dump_full_process_memory(pid_t pid) {
         fprintf(mapfile, "Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]\n\n");
     }
 
-    int mem_fd = -1;
-    char mem_path[64];
-    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
-    mem_fd = open(mem_path, O_RDONLY);
-    if (mem_fd < 0) {
-        perror("[-] open /proc/PID/mem");
+    // Attach with ptrace to allow reading /proc/PID/mem
+    if (ptrace(PTRACE_ATTACH, pid, NULL, NULL) == -1) {
+        fprintf(stderr, "[-] ptrace attach failed for PID %d: %s\n", pid, strerror(errno));
         fclose(maps);
         close(dump_fd);
         if (mapfile) fclose(mapfile);
         return;
     }
+    
+    // Wait for process to stop
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        fprintf(stderr, "[-] waitpid failed for PID %d: %s\n", pid, strerror(errno));
+        ptrace(PTRACE_DETACH, pid, NULL, NULL);
+        fclose(maps);
+        close(dump_fd);
+        if (mapfile) fclose(mapfile);
+        return;
+    }
+    
+    printf("[DEBUG] Successfully attached to PID %d with ptrace\n", pid);
+
+    int mem_fd = -1;
+    char mem_path[64];
+    snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+    mem_fd = open(mem_path, O_RDONLY);
+    if (mem_fd < 0) {
+        fprintf(stderr, "[-] open /proc/PID/mem failed for PID %d: %s\n", pid, strerror(errno));
+        fclose(maps);
+        close(dump_fd);
+        if (mapfile) fclose(mapfile);
+        return;
+    }
+    
+    printf("[DEBUG] Successfully opened /proc/%d/mem (fd=%d)\n", pid, mem_fd);
 
     char line[MAX_LINE];  // Use MAX_LINE (4096) instead of 512 for long paths
     int region_count = 0;
+    int readable_regions = 0;
     int max_regions = 500;  // Limit number of regions to dump to prevent excessive processing
     size_t total_dumped = 0;
     size_t current_offset = 0;
@@ -1986,9 +2012,15 @@ void dump_full_process_memory(pid_t pid) {
 
         // Skip regions without read permission
         if (perms[0] != 'r') continue;
+        
+        readable_regions++;
 
         size_t size = end - start;
         if (size == 0 || size > 1024*1024*1024) continue;  // Skip invalid/huge regions
+        
+        if (region_count == 0) {
+            printf("[DEBUG] First readable region: %lx-%lx %s size=%zu path=%s\n", start, end, perms, size, path);
+        }
 
         // Write to map file with current offset in dump
         if (mapfile) {
@@ -2057,6 +2089,12 @@ void dump_full_process_memory(pid_t pid) {
     close(mem_fd);
     close(dump_fd);
     fclose(maps);
+    
+    // Detach and continue process
+    ptrace(PTRACE_DETACH, pid, NULL, NULL);
+    
+    printf("[DEBUG] Dump complete: %d total regions, %d readable, %zu bytes dumped\n", 
+           region_count, readable_regions, total_dumped);
     
     if (mapfile) {
         fprintf(mapfile, "\n========================================\n");
