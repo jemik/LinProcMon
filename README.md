@@ -9,6 +9,7 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 - **Memory Injection Detection**: Identifies code execution from memfd_create, /dev/shm, and anonymous memory regions
 - **Process Replacement**: Detects binary replacement and ELF manipulation techniques
 - **RWX Memory Regions**: Flags writable+executable memory (JIT spray, self-modifying code, unpacking)
+- **Runtime Unpacking Detection**: Periodic memory rescanning catches XOR decryption, UPX unpacking, and custom packers
 - **Fileless Execution**: Catches execution from deleted files, memfd, and temporary locations
 - **Heap/Stack Execution**: Identifies shellcode execution in non-standard memory regions
 - **Environment Variable Inspection**: Detects LD_PRELOAD and LD_LIBRARY_PATH hijacking
@@ -48,6 +49,14 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 - **Process existence validation**: Multiple checks throughout analysis to handle short-lived processes
 - **Iteration limits**: Max 1024 file descriptors, 512 network sockets, 500 memory regions
 - **Graceful error handling**: Safe errno handling for EIO/EFAULT during memory reads
+
+### Runtime Unpacking & Decryption Detection
+- **Periodic memory rescanning**: Alert cache cleared every 2 seconds in sandbox mode
+- **Detects XOR/RC4 decryption**: Catches payload decryption at runtime
+- **Detects UPX unpacking**: Identifies when packers decompress code into memory
+- **Detects custom packers**: Generic approach catches any runtime code modification
+- **Configurable rescan interval**: `--sandbox-rescan <seconds>` for fine-tuning
+- **Low overhead**: Smart caching prevents duplicate alerts while still catching changes
 
 ### Data Integrity
 - **JSON string escaping**: Prevents corruption from special characters in file paths, command lines
@@ -706,6 +715,42 @@ Contributions are welcome! Areas for improvement:
 - Worker threads process events in parallel
 - Queue absorbs burst traffic
 - Graceful degradation (drops tracked but doesn't crash)
+
+## Testing & Verification
+
+### Meterpreter Detection Test Suite
+
+A comprehensive test suite is included to verify all 5 detection capabilities work correctly and that memory dumps contain identifiable malware signatures.
+
+**Location**: `test_loaders/`
+
+**Quick Start**:
+```bash
+cd test_loaders
+chmod +x *.sh
+./compile_all.sh                    # Compile all test loaders
+sudo ./run_automated_tests.sh       # Run full automated test suite
+./scan_dumps.sh                     # Scan dumps with YARA
+```
+
+**Test Cases**:
+1. **memfd Fileless Execution** - Verifies memfd_create() detection
+2. **RWX Memory Injection** - Tests RWX region detection + YARA scanning
+3. **Deleted Binary Replacement** - Validates (deleted) file detection
+4. **Heap Execution** - Confirms executable heap detection
+5. **LD_PRELOAD Hijacking** - Tests environment variable inspection
+
+Each test embeds meterpreter-like signatures (metsrv.dll, ReflectiveLoader, LHOST/LPORT configs) to verify:
+- ✅ Detection alerts trigger correctly
+- ✅ Memory dumps capture payloads
+- ✅ YARA rules identify malware signatures
+
+**Documentation**:
+- `test_loaders/QUICK_START.md` - Quick testing guide
+- `test_loaders/README.md` - Complete test suite documentation
+- `test_loaders/TEST_SUITE_SUMMARY.md` - Expected results & verification matrix
+
+**Safety**: All shellcode execution is commented out. Loaders only keep payloads in memory for 30 seconds without executing them.
 
 ## License
 

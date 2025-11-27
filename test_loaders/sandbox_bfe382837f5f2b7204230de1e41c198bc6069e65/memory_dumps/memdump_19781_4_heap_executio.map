@@ -1,0 +1,38 @@
+Memory dump for PID 19781 (4_heap_executio)
+Dump file: sandbox_bfe382837f5f2b7204230de1e41c198bc6069e65/memory_dumps/memdump_19781_4_heap_executio.bin
+========================================
+
+Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]
+
+[0x0000000000000000] -> 0x000063e915ebe000-0x000063e915ebf000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader [DUMPED 4096 bytes]
+[0x0000000000001000] -> 0x000063e915ebf000-0x000063e915ec0000 r-xp       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader [DUMPED 4096 bytes]
+[0x0000000000002000] -> 0x000063e915ec0000-0x000063e915ec1000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader [DUMPED 4096 bytes]
+[0x0000000000003000] -> 0x000063e915ec1000-0x000063e915ec2000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader [DUMPED 4096 bytes]
+[0x0000000000004000] -> 0x000063e915ec2000-0x000063e915ec3000 rw-p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/4_heap_execution_loader [DUMPED 4096 bytes]
+[0x0000000000005000] -> 0x000063e93f519000-0x000063e93f51c000 rwxp      12288 bytes [heap] [DUMPED 12288 bytes]
+[0x0000000000008000] -> 0x000063e93f51c000-0x000063e93f53a000 rw-p     122880 bytes [heap] [DUMPED 122880 bytes]
+[0x0000000000026000] -> 0x0000703507760000-0x0000703507763000 rw-p      12288 bytes  [DUMPED 12288 bytes]
+[0x0000000000029000] -> 0x0000703507763000-0x000070350778b000 r--p     163840 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 163840 bytes]
+[0x0000000000051000] -> 0x000070350778b000-0x0000703507913000 r-xp    1605632 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 1605632 bytes]
+[0x00000000001d9000] -> 0x0000703507913000-0x0000703507962000 r--p     323584 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 323584 bytes]
+[0x0000000000228000] -> 0x0000703507962000-0x0000703507966000 r--p      16384 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 16384 bytes]
+[0x000000000022c000] -> 0x0000703507966000-0x0000703507968000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 8192 bytes]
+[0x000000000022e000] -> 0x0000703507968000-0x0000703507975000 rw-p      53248 bytes  [DUMPED 53248 bytes]
+[0x000000000023b000] -> 0x000070350797c000-0x000070350797e000 rw-p       8192 bytes  [DUMPED 8192 bytes]
+[0x000000000023d000] -> 0x000070350797e000-0x000070350797f000 r--p       4096 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 4096 bytes]
+[0x000000000023e000] -> 0x000070350797f000-0x00007035079aa000 r-xp     176128 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 176128 bytes]
+[0x0000000000269000] -> 0x00007035079aa000-0x00007035079b4000 r--p      40960 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 40960 bytes]
+[0x0000000000273000] -> 0x00007035079b4000-0x00007035079b6000 r--p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000275000] -> 0x00007035079b6000-0x00007035079b8000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000277000] -> 0x00007fff128d6000-0x00007fff128f8000 rw-p     139264 bytes [stack] [DUMPED 139264 bytes]
+[0x0000000000299000] -> 0x00007fff129a2000-0x00007fff129a6000 r--p      16384 bytes [vvar] [READ FAILED]
+[0x0000000000299000] -> 0x00007fff129a6000-0x00007fff129a8000 r-xp       8192 bytes [vdso] [DUMPED 8192 bytes]
+
+========================================
+Total regions: 23
+Total dumped: 2.61 MB
+
+Usage:
+  - Load sandbox_bfe382837f5f2b7204230de1e41c198bc6069e65/memory_dumps/memdump_19781_4_heap_executio.bin into your reverse engineering tool
+  - Use this map file to locate specific memory regions
+  - Virtual address 0xADDR is at file offset shown in brackets

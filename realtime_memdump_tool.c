@@ -52,6 +52,8 @@ char** sandbox_args = NULL;  // Arguments for sandbox binary
 int sandbox_args_count = 0;  // Number of arguments
 int sandbox_timeout = 0;  // Sandbox timeout in seconds (0 = wait for process exit)
 time_t sandbox_start_time = 0;  // When sandbox started
+int sandbox_rescan_interval = 2;  // Rescan sandbox processes every N seconds (for unpacking detection)
+time_t last_sandbox_rescan = 0;  // Last time we rescanned sandbox processes
 int max_dumps = 0;  // Maximum number of processes to dump (0 = unlimited)
 int dumps_performed = 0;  // Counter for dumps performed
 char sandbox_termination_status[32] = "running";  // Termination status: running, completed, timeout, crashed
@@ -268,9 +270,33 @@ int is_duplicate_alert(pid_t pid, unsigned long start, unsigned long end, const 
         alert_cache[alert_cache_count].reason[copy_len] = '\0';
         alert_cache_count++;
     }
-    
     pthread_mutex_unlock(&alert_cache_mutex);
     return 0;  // Not a duplicate
+}
+
+// Clear alert cache for specific PID to allow re-detection after unpacking
+void clear_alert_cache_for_pid(pid_t pid) {
+    pthread_mutex_lock(&alert_cache_mutex);
+    
+    int write_idx = 0;
+    for (int read_idx = 0; read_idx < alert_cache_count; read_idx++) {
+        if (alert_cache[read_idx].pid != pid) {
+            if (write_idx != read_idx) {
+                alert_cache[write_idx] = alert_cache[read_idx];
+            }
+            write_idx++;
+        }
+    }
+    alert_cache_count = write_idx;
+    
+    pthread_mutex_unlock(&alert_cache_mutex);
+}
+
+// Clear entire alert cache (for sandbox mode periodic rescans)
+void clear_alert_cache() {
+    pthread_mutex_lock(&alert_cache_mutex);
+    alert_cache_count = 0;
+    pthread_mutex_unlock(&alert_cache_mutex);
 }
 
 // File operations and network activity tracking for JSON report
@@ -3076,6 +3102,12 @@ int main(int argc, char **argv) {
             printf("[+] Memory dumping enabled (will save suspicious regions to disk)\n");
         } else if (strcmp(argv[i], "--sandbox-timeout") == 0 && i + 1 < argc) {
             sandbox_timeout = atoi(argv[++i]) * 60;  // Convert minutes to seconds
+        } else if (strcmp(argv[i], "--sandbox-rescan") == 0 && i + 1 < argc) {
+            sandbox_rescan_interval = atoi(argv[++i]);
+            if (sandbox_rescan_interval < 1) {
+                fprintf(stderr, "Error: --sandbox-rescan must be >= 1 second\n");
+                return 1;
+            }
         } else if (strcmp(argv[i], "--max-dumps") == 0 && i + 1 < argc) {
             max_dumps = atoi(argv[++i]);
             if (max_dumps < 0) {
@@ -3117,6 +3149,9 @@ int main(int argc, char **argv) {
             printf("                    In sandbox mode, only counts sandbox processes\n");
             printf("  --sandbox <bin>   Sandbox mode: execute and monitor specific binary\n");
             printf("                    All remaining arguments are passed to the binary\n");
+            printf("  --sandbox-timeout <min>  Sandbox analysis timeout in minutes (default: wait for exit)\n");
+            printf("  --sandbox-rescan <sec>   Rescan interval for unpacking detection (default: 2 seconds)\n");
+            printf("                    Clears alert cache to detect XOR decryption, UPX unpacking, etc.\n");
             printf("  --help, -h        Show this help message\n\n");
             printf("Detection capabilities:\n");
             printf("  - Memory injection (memfd_create, /dev/shm execution)\n");
@@ -3125,6 +3160,7 @@ int main(int argc, char **argv) {
             printf("  - Fileless execution techniques\n");
             printf("  - Heap/stack code execution\n");
             printf("  - Suspicious environment variables (LD_PRELOAD)\n");
+            printf("  - Runtime unpacking detection (XOR, UPX, custom packers)\n");
             printf("  - File operations in /tmp, /dev/shm (sandbox mode)\n");
             printf("  - Network socket creation (sandbox mode)\n\n");
             printf("Sandbox mode examples:\n");
@@ -3448,7 +3484,7 @@ int main(int argc, char **argv) {
     }
 
     time_t last_full_scan = time(NULL);
-    time_t last_sandbox_scan = time(NULL);
+    last_sandbox_rescan = time(NULL);
 
     while (running) {
         char buf[32768];  // 32KB buffer to handle many events (reduced from 64KB)
@@ -3544,8 +3580,12 @@ int main(int argc, char **argv) {
                     
                     // Periodic rescanning (only if process still exists)
                     if (running && process_exists) {
-                        if (now - last_sandbox_scan >= 1) {
-                            // Rescan sandbox process every second
+                        if (now - last_sandbox_rescan >= sandbox_rescan_interval) {
+                            // Clear alert cache to allow re-detection of unpacked/decrypted code
+                            // This is critical for catching XOR decryption, UPX unpacking, etc.
+                            clear_alert_cache();
+                            
+                            // Rescan sandbox process
                             queue_push(&event_queue, sandbox_root_pid, 0);
                             
                             // Flush report data every 5 seconds for crash recovery
@@ -3577,7 +3617,11 @@ int main(int argc, char **argv) {
                                 fclose(children_file);
                             }
                         
-                            last_sandbox_scan = now;
+                            last_sandbox_rescan = now;
+                            
+                            if (!quiet_mode && ((now - sandbox_start_time) % 10 == 0)) {
+                                printf("[*] Sandbox rescan (detecting unpacking/decryption changes)\n");
+                            }
                         }
                     }
                 }                if (continuous_scan) {

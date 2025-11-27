@@ -1,0 +1,6 @@
+"sample_path": "/workspaces/LinProcMon/test_loaders/test_output/1_memfd_loader",
+"sample_sha1": "3484a1edfe6ab8b45336f644cc8676672df21afa",
+"sample_sha256": "716e21e0533f42c71e5353ada6faf1e4c59507069e2e502007115c9986b142da",
+"sample_type": "ELF",
+"sample_size": 16688,
+"timeout": 60

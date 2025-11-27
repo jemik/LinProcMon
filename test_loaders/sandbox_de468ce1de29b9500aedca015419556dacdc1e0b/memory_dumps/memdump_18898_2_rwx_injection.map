@@ -1,0 +1,38 @@
+Memory dump for PID 18898 (2_rwx_injection)
+Dump file: sandbox_de468ce1de29b9500aedca015419556dacdc1e0b/memory_dumps/memdump_18898_2_rwx_injection.bin
+========================================
+
+Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]
+
+[0x0000000000000000] -> 0x00005b675ab66000-0x00005b675ab67000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader [DUMPED 4096 bytes]
+[0x0000000000001000] -> 0x00005b675ab67000-0x00005b675ab68000 r-xp       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader [DUMPED 4096 bytes]
+[0x0000000000002000] -> 0x00005b675ab68000-0x00005b675ab69000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader [DUMPED 4096 bytes]
+[0x0000000000003000] -> 0x00005b675ab69000-0x00005b675ab6a000 r--p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader [DUMPED 4096 bytes]
+[0x0000000000004000] -> 0x00005b675ab6a000-0x00005b675ab6b000 rw-p       4096 bytes /workspaces/LinProcMon/test_loaders/test_output/2_rwx_injection_loader [DUMPED 4096 bytes]
+[0x0000000000005000] -> 0x00005b6775b14000-0x00005b6775b35000 rw-p     135168 bytes [heap] [DUMPED 135168 bytes]
+[0x0000000000026000] -> 0x00007df1064ae000-0x00007df1064b1000 rw-p      12288 bytes  [DUMPED 12288 bytes]
+[0x0000000000029000] -> 0x00007df1064b1000-0x00007df1064d9000 r--p     163840 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 163840 bytes]
+[0x0000000000051000] -> 0x00007df1064d9000-0x00007df106661000 r-xp    1605632 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 1605632 bytes]
+[0x00000000001d9000] -> 0x00007df106661000-0x00007df1066b0000 r--p     323584 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 323584 bytes]
+[0x0000000000228000] -> 0x00007df1066b0000-0x00007df1066b4000 r--p      16384 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 16384 bytes]
+[0x000000000022c000] -> 0x00007df1066b4000-0x00007df1066b6000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 8192 bytes]
+[0x000000000022e000] -> 0x00007df1066b6000-0x00007df1066c3000 rw-p      53248 bytes  [DUMPED 53248 bytes]
+[0x000000000023b000] -> 0x00007df1066c9000-0x00007df1066ca000 rwxp       4096 bytes  [DUMPED 4096 bytes]
+[0x000000000023c000] -> 0x00007df1066ca000-0x00007df1066cc000 rw-p       8192 bytes  [DUMPED 8192 bytes]
+[0x000000000023e000] -> 0x00007df1066cc000-0x00007df1066cd000 r--p       4096 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 4096 bytes]
+[0x000000000023f000] -> 0x00007df1066cd000-0x00007df1066f8000 r-xp     176128 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 176128 bytes]
+[0x000000000026a000] -> 0x00007df1066f8000-0x00007df106702000 r--p      40960 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 40960 bytes]
+[0x0000000000274000] -> 0x00007df106702000-0x00007df106704000 r--p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000276000] -> 0x00007df106704000-0x00007df106706000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000278000] -> 0x00007ffc32e0e000-0x00007ffc32e30000 rw-p     139264 bytes [stack] [DUMPED 139264 bytes]
+[0x000000000029a000] -> 0x00007ffc32fbf000-0x00007ffc32fc3000 r--p      16384 bytes [vvar] [READ FAILED]
+[0x000000000029a000] -> 0x00007ffc32fc3000-0x00007ffc32fc5000 r-xp       8192 bytes [vdso] [DUMPED 8192 bytes]
+
+========================================
+Total regions: 23
+Total dumped: 2.61 MB
+
+Usage:
+  - Load sandbox_de468ce1de29b9500aedca015419556dacdc1e0b/memory_dumps/memdump_18898_2_rwx_injection.bin into your reverse engineering tool
+  - Use this map file to locate specific memory regions
+  - Virtual address 0xADDR is at file offset shown in brackets

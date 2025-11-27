@@ -1,0 +1,6 @@
+"sample_path": "/workspaces/LinProcMon/test_loaders/test_output/5_preload_victim",
+"sample_sha1": "79318067227bf58d283b4ebccd3abef9dd8de211",
+"sample_sha256": "2d8bd78ba7ccd47c8866a1e844772b84cb2f8115fcb12bc9c8c84ad432869e71",
+"sample_type": "ELF",
+"sample_size": 16720,
+"timeout": 60

@@ -1,0 +1,37 @@
+Memory dump for PID 19320 (legitimate_upda)
+Dump file: sandbox_da452ea8e7092a5f38a49779d0d39cdda882f811/memory_dumps/memdump_19320_legitimate_upda.bin
+========================================
+
+Format: [Offset in dump] -> [Virtual Address Range] [Perms] [Size] [Path]
+
+[0x0000000000000000] -> 0x000064342fac6000-0x000064342fac7000 r--p       4096 bytes /tmp/legitimate_update_ju351p (deleted) [DUMPED 4096 bytes]
+[0x0000000000001000] -> 0x000064342fac7000-0x000064342fac8000 r-xp       4096 bytes /tmp/legitimate_update_ju351p (deleted) [DUMPED 4096 bytes]
+[0x0000000000002000] -> 0x000064342fac8000-0x000064342fac9000 r--p       4096 bytes /tmp/legitimate_update_ju351p (deleted) [DUMPED 4096 bytes]
+[0x0000000000003000] -> 0x000064342fac9000-0x000064342faca000 r--p       4096 bytes /tmp/legitimate_update_ju351p (deleted) [DUMPED 4096 bytes]
+[0x0000000000004000] -> 0x000064342faca000-0x000064342facb000 rw-p       4096 bytes /tmp/legitimate_update_ju351p (deleted) [DUMPED 4096 bytes]
+[0x0000000000005000] -> 0x000064346b6b8000-0x000064346b6d9000 rw-p     135168 bytes [heap] [DUMPED 135168 bytes]
+[0x0000000000026000] -> 0x000076e021373000-0x000076e021376000 rw-p      12288 bytes  [DUMPED 12288 bytes]
+[0x0000000000029000] -> 0x000076e021376000-0x000076e02139e000 r--p     163840 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 163840 bytes]
+[0x0000000000051000] -> 0x000076e02139e000-0x000076e021526000 r-xp    1605632 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 1605632 bytes]
+[0x00000000001d9000] -> 0x000076e021526000-0x000076e021575000 r--p     323584 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 323584 bytes]
+[0x0000000000228000] -> 0x000076e021575000-0x000076e021579000 r--p      16384 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 16384 bytes]
+[0x000000000022c000] -> 0x000076e021579000-0x000076e02157b000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/libc.so.6 [DUMPED 8192 bytes]
+[0x000000000022e000] -> 0x000076e02157b000-0x000076e021588000 rw-p      53248 bytes  [DUMPED 53248 bytes]
+[0x000000000023b000] -> 0x000076e02158f000-0x000076e021591000 rw-p       8192 bytes  [DUMPED 8192 bytes]
+[0x000000000023d000] -> 0x000076e021591000-0x000076e021592000 r--p       4096 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 4096 bytes]
+[0x000000000023e000] -> 0x000076e021592000-0x000076e0215bd000 r-xp     176128 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 176128 bytes]
+[0x0000000000269000] -> 0x000076e0215bd000-0x000076e0215c7000 r--p      40960 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 40960 bytes]
+[0x0000000000273000] -> 0x000076e0215c7000-0x000076e0215c9000 r--p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000275000] -> 0x000076e0215c9000-0x000076e0215cb000 rw-p       8192 bytes /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 [DUMPED 8192 bytes]
+[0x0000000000277000] -> 0x00007ffd9f10b000-0x00007ffd9f12c000 rw-p     135168 bytes [stack] [DUMPED 135168 bytes]
+[0x0000000000298000] -> 0x00007ffd9f131000-0x00007ffd9f135000 r--p      16384 bytes [vvar] [READ FAILED]
+[0x0000000000298000] -> 0x00007ffd9f135000-0x00007ffd9f137000 r-xp       8192 bytes [vdso] [DUMPED 8192 bytes]
+
+========================================
+Total regions: 22
+Total dumped: 2.60 MB
+
+Usage:
+  - Load sandbox_da452ea8e7092a5f38a49779d0d39cdda882f811/memory_dumps/memdump_19320_legitimate_upda.bin into your reverse engineering tool
+  - Use this map file to locate specific memory regions
+  - Virtual address 0xADDR is at file offset shown in brackets
