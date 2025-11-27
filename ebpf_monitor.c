@@ -10,11 +10,15 @@
  * Compile: clang -O2 -target bpf -c ebpf_monitor.c -o ebpf_monitor.o
  */
 
-#include <linux/bpf.h>
-#include <linux/ptrace.h>
-#include <linux/sched.h>
+#include <linux/types.h>
 #include <bpf/bpf_helpers.h>
 #include <bpf/bpf_tracing.h>
+
+// Minimal type definitions needed
+typedef __u8 u8;
+typedef __u16 u16;
+typedef __u32 u32;
+typedef __u64 u64;
 
 // Event types
 #define EVENT_MMAP_EXEC 1
@@ -24,13 +28,13 @@
 
 // Event structure sent to userspace
 struct exec_event {
-    __u32 pid;
-    __u32 tid;
-    __u64 addr;
-    __u64 len;
-    __u32 prot;
-    __u32 flags;
-    __u8 event_type;
+    u32 pid;
+    u32 tid;
+    u64 addr;
+    u64 len;
+    u32 prot;
+    u32 flags;
+    u8 event_type;
     char comm[16];
 };
 
@@ -40,19 +44,25 @@ struct {
     __uint(max_entries, 256 * 1024); // 256KB buffer
 } events SEC(".maps");
 
-// Helper to get current task comm
-static __always_inline void get_current_comm(char *comm) {
-    struct task_struct *task = (void *)bpf_get_current_task();
-    bpf_probe_read_kernel(comm, 16, &task->comm);
+// Tracepoint format for syscall entry (simplified)
+struct trace_event_raw_sys_enter {
+    u64 __unused;
+    long id;
+    unsigned long args[6];
+};
+
+// Helper to get current comm
+static __always_inline void get_task_comm(char *buf, int size) {
+    bpf_get_current_comm(buf, size);
 }
 
 // Hook: sys_mmap / do_mmap
 SEC("tracepoint/syscalls/sys_enter_mmap")
 int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
-    __u64 addr = ctx->args[0];
-    __u64 len = ctx->args[1];
-    __u32 prot = (__u32)ctx->args[2];
-    __u32 flags = (__u32)ctx->args[3];
+    u64 addr = ctx->args[0];
+    u64 len = ctx->args[1];
+    u32 prot = (u32)ctx->args[2];
+    u32 flags = (u32)ctx->args[3];
     
     // Check if PROT_EXEC (0x4) is set
     if (!(prot & 0x4)) {
@@ -65,14 +75,15 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
     
-    e->pid = bpf_get_current_pid_tgid() >> 32;
-    e->tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
     e->addr = addr;
     e->len = len;
     e->prot = prot;
     e->flags = flags;
     e->event_type = EVENT_MMAP_EXEC;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    get_task_comm(e->comm, sizeof(e->comm));
     
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -81,9 +92,9 @@ int trace_mmap(struct trace_event_raw_sys_enter *ctx) {
 // Hook: sys_mprotect
 SEC("tracepoint/syscalls/sys_enter_mprotect")
 int trace_mprotect(struct trace_event_raw_sys_enter *ctx) {
-    __u64 addr = ctx->args[0];
-    __u64 len = ctx->args[1];
-    __u32 prot = (__u32)ctx->args[2];
+    u64 addr = ctx->args[0];
+    u64 len = ctx->args[1];
+    u32 prot = (u32)ctx->args[2];
     
     // Check if PROT_EXEC (0x4) is being added
     if (!(prot & 0x4)) {
@@ -95,14 +106,15 @@ int trace_mprotect(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
     
-    e->pid = bpf_get_current_pid_tgid() >> 32;
-    e->tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
     e->addr = addr;
     e->len = len;
     e->prot = prot;
     e->flags = 0;
     e->event_type = EVENT_MPROTECT_EXEC;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    get_task_comm(e->comm, sizeof(e->comm));
     
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -116,14 +128,15 @@ int trace_memfd_create(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
     
-    e->pid = bpf_get_current_pid_tgid() >> 32;
-    e->tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
     e->addr = 0;
     e->len = 0;
     e->prot = 0;
-    e->flags = (__u32)ctx->args[1];  // MFD_* flags
+    e->flags = (u32)ctx->args[1];  // MFD_* flags
     e->event_type = EVENT_MEMFD_CREATE;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    get_task_comm(e->comm, sizeof(e->comm));
     
     bpf_ringbuf_submit(e, 0);
     return 0;
@@ -137,14 +150,15 @@ int trace_execve(struct trace_event_raw_sys_enter *ctx) {
         return 0;
     }
     
-    e->pid = bpf_get_current_pid_tgid() >> 32;
-    e->tid = bpf_get_current_pid_tgid() & 0xFFFFFFFF;
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
     e->addr = ctx->args[0];  // filename pointer
     e->len = 0;
     e->prot = 0;
     e->flags = 0;
     e->event_type = EVENT_EXECVE;
-    bpf_get_current_comm(&e->comm, sizeof(e->comm));
+    get_task_comm(e->comm, sizeof(e->comm));
     
     bpf_ringbuf_submit(e, 0);
     return 0;
