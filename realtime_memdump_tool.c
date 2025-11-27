@@ -2123,6 +2123,14 @@ void check_exe_link(pid_t pid) {
         suspicious_found++;
         pthread_mutex_unlock(&stats_mutex);
         printf("[!] CRITICAL: Process executing from memfd | PID=%d | exe=%s\n", pid, exe_target);
+        
+        // IMMEDIATE DUMP: This is the Meterpreter or shellcode process!
+        if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+            if (!is_already_dumped(pid)) {
+                printf("[!] Queueing IMMEDIATE dump for memfd process PID=%d\n", pid);
+                dump_queue_push(&dump_queue, pid);
+            }
+        }
     } else if (strstr(exe_target, "(deleted)")) {
         // Running from deleted file - could be legitimate (updated binary) or suspicious
         if (!quiet_mode) {
@@ -2932,13 +2940,9 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 // Queue immediate scan - HIGH PRIORITY
+                // The scan will determine if dump is needed based on what it finds
                 queue_push(&event_queue, pid, 0);
                 
-                // If full dump enabled, queue for dump immediately
-                // This is critical for catching decrypted payloads
-                if (full_dump) {
-                    dump_queue_push(&dump_queue, pid);
-                }
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree
                 if (sandbox_mode && !is_sandbox_process(pid)) {
@@ -2950,14 +2954,9 @@ void *ebpf_pipe_reader(void *arg) {
                            pid, comm);
                 }
                 
-                // Queue scan
+                // Queue scan - memfd is HIGH RISK, scan will trigger dump if suspicious
                 queue_push(&event_queue, pid, 0);
                 
-                // CRITICAL: memfd_create often means shellcode is about to be written
-                // Queue for dump immediately, then again after short delay to catch writes
-                if (full_dump) {
-                    dump_queue_push(&dump_queue, pid);
-                }
             } else if (event_type == 4) {  // EXECVE
                 // For execve events, the process has just replaced its binary
                 // This is HIGH PRIORITY - could be memfd exec with Meterpreter
@@ -2970,15 +2969,8 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 // CRITICAL: Queue scan immediately - the process just exec'd
+                // If it's memfd exec, the scan will detect it and trigger dump
                 queue_push(&event_queue, pid, 0);
-                
-                // CRITICAL: Queue for dump - this might be memfd exec with shellcode
-                // Dump AFTER exec to get the new binary's memory
-                if (full_dump) {
-                    // Add small delay to let exec complete and memory get mapped
-                    usleep(50000);  // 50ms delay
-                    dump_queue_push(&dump_queue, pid);
-                }
             }
         }
     }
