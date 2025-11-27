@@ -4,7 +4,7 @@ Real-time Linux process monitoring tool designed to detect malware, memory injec
 
 ## Overview
 
-LinProcMon is a powerful security monitoring tool that uses the Linux kernel's netlink connector to receive real-time notifications about process execution events. It analyzes process memory mappings to detect suspicious behavior patterns commonly used by malware, including:
+LinProcMon is a powerful security monitoring tool that uses the Linux kernel's netlink connector to receive real-time notifications about process execution events. **New: Optional eBPF syscall monitoring for bulletproof detection of memory operations!** It analyzes process memory mappings to detect suspicious behavior patterns commonly used by malware, including:
 
 - **Memory Injection Detection**: Identifies code execution from memfd_create, /dev/shm, and anonymous memory regions
 - **Process Replacement**: Detects binary replacement and ELF manipulation techniques
@@ -42,6 +42,14 @@ LinProcMon is a powerful security monitoring tool that uses the Linux kernel's n
 - ✅ Self-contained static binary support (no dependencies)
 
 ## Recent Improvements (November 2025)
+
+### eBPF Syscall Monitoring (NEW!)
+- **Kernel-level syscall hooks**: Monitor `mmap()`, `mprotect()`, `memfd_create()`, `execve()` in real-time
+- **Bulletproof detection**: Cannot be bypassed - hooks directly into kernel tracepoints
+- **Catches what netlink misses**: XOR decryption via `mprotect()`, fileless execution, memory injections
+- **Standalone or integrated**: Run `ebpf_standalone` monitor independently or trigger scans from events
+- **Sub-millisecond latency**: Events delivered from kernel to userspace in <1ms
+- **See**: `EBPF_README.md` for full documentation and examples
 
 ### Crash Resistance & Stability
 - **Stack overflow prevention**: Heap allocation for large buffers, reduced thread-local storage
