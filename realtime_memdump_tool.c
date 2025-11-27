@@ -2125,11 +2125,24 @@ void check_exe_link(pid_t pid) {
         printf("[!] CRITICAL: Process executing from memfd | PID=%d | exe=%s\n", pid, exe_target);
         
         // IMMEDIATE DUMP: This is the Meterpreter or shellcode process!
-        if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
-            if (!is_already_dumped(pid)) {
+        if (full_dump) {
+            if (sandbox_mode && !is_sandbox_process(pid)) {
+                printf("[DEBUG] PID=%d is memfd but not in sandbox tree, skipping\n", pid);
+            } else if (is_already_dumped(pid)) {
+                printf("[DEBUG] PID=%d already dumped, skipping\n", pid);
+            } else {
                 printf("[!] Queueing IMMEDIATE dump for memfd process PID=%d\n", pid);
-                dump_queue_push(&dump_queue, pid);
+                if (dump_queue_push(&dump_queue, pid) == 0) {
+                    pthread_mutex_lock(&stats_mutex);
+                    dumps_performed++;
+                    pthread_mutex_unlock(&stats_mutex);
+                    mark_as_dumped(pid);
+                } else {
+                    printf("[!] Failed to queue dump for PID=%d (queue full)\n", pid);
+                }
             }
+        } else {
+            printf("[DEBUG] full_dump not enabled, skipping dump\n");
         }
     } else if (strstr(exe_target, "(deleted)")) {
         // Running from deleted file - could be legitimate (updated binary) or suspicious
