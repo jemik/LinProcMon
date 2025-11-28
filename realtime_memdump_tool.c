@@ -3283,10 +3283,30 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // Don't dump at mmap - shellcode not fully written yet
-                // We'll dump at execve when it's complete
-                if (had_memfd && !quiet_mode) {
-                    printf("[eBPF] mmap after memfd - will dump at execve\n");
+                // Dump memfd at mmap (shellcode should be written by now)
+                // This is safer than waiting for execve because:
+                // 1. sys_enter_execve event gets to userspace AFTER kernel completes execve
+                // 2. After execve, the memfd FD is closed and we can't read it
+                // 3. At mmap time, the memfd file still exists and contains the shellcode
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping memfd at mmap (PID %u, shellcode written)...\n", pid);
+                    
+                    // Small delay to ensure shellcode fully written
+                    usleep(50000); // 50ms
+                    
+                    dump_memfd_files(pid);
+                    
+                    // Scan memory for alerts
+                    scan_maps_and_dump(pid);
+                    
+                    // Report alert for memfd execution
+                    if (sandbox_mode) {
+                        char alert_msg[512];
+                        snprintf(alert_msg, sizeof(alert_msg),
+                                "Fileless execution detected: Process executing from memfd (in-memory file descriptor)");
+                        report_sandbox_alert("FILELESS_EXECUTION", alert_msg, pid);
+                    }
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3334,35 +3354,18 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - DUMPING NOW\n", pid, comm);
+                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - already dumped at mmap\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
                 
-                // Queue scan immediately - but do it BEFORE execve completes
+                // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump memfd at execve (shellcode fully written, before process replacement)
-                // sys_enter_execve fires BEFORE kernel replaces process
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Scanning and dumping PID %u at execve (before process replacement)...\n", pid);
-                    
-                    // Scan memory IMMEDIATELY before dump (while loader is still in memory)
-                    // This will generate alerts for suspicious regions
-                    scan_maps_and_dump(pid);
-                    
-                    // Report alert for memfd execution
-                    if (sandbox_mode) {
-                        char alert_msg[512];
-                        snprintf(alert_msg, sizeof(alert_msg),
-                                "Fileless execution detected: Process executing from memfd (in-memory file descriptor)");
-                        report_sandbox_alert("FILELESS_EXECUTION", alert_msg, pid);
-                    }
-                    
-                    dump_memfd_files(pid);
-                }
+                // NOTE: We already dumped the memfd at mmap time (see MMAP_EXEC handler)
+                // By the time we receive this execve event in userspace, the kernel has
+                // already completed the execve syscall and closed the memfd FD
             }
         }
     }
