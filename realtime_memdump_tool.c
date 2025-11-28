@@ -2453,6 +2453,40 @@ void check_exe_link(pid_t pid) {
         if (!quiet_mode) {
             printf("[WARN] Process running from deleted file PID %d: %s\n", pid, exe_target);
         }
+        
+        // STRATEGY 5: Dump deleted binaries - this catches executables that delete themselves
+        // This is a common anti-forensics technique used by malware
+        if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+            printf("[+] Detecting deleted binary in PID %u - scanning for executable regions...\n", pid);
+            
+            // Scan /proc/PID/maps for executable regions to dump
+            // We can't read the original file, but we can dump it from memory
+            char maps_path[64];
+            snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+            FILE *maps = fopen(maps_path, "r");
+            if (maps) {
+                char line[1024];
+                while (fgets(line, sizeof(line), maps)) {
+                    unsigned long start, end;
+                    char perms[5];
+                    char path[512] = "";
+                    
+                    if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %[^\n]", &start, &end, perms, path) >= 3) {
+                        // Look for the main executable mapping (usually first r-xp region)
+                        if (strchr(perms, 'x') != NULL && strstr(path, "(deleted)") != NULL) {
+                            size_t region_size = end - start;
+                            // Only dump reasonably sized regions (avoid huge mappings)
+                            if (region_size > 100 && region_size < 50*1024*1024) {
+                                printf("[+] Dumping deleted binary region: 0x%lx-0x%lx (%zu bytes)\n", 
+                                       start, end, region_size);
+                                dump_memory_region(pid, start, end, 0);
+                            }
+                        }
+                    }
+                }
+                fclose(maps);
+            }
+        }
     }
 }
 
@@ -2474,6 +2508,41 @@ void check_env_vars(pid_t pid) {
     while (p < env_buf + len) {
         if (strstr(p, "LD_PRELOAD=") == p || strstr(p, "LD_LIBRARY_PATH=") == p) {
             printf("[!] Suspicious ENV in PID %d: %s\n", pid, p);
+            
+            // STRATEGY 6: Dump LD_PRELOAD libraries - this catches library injection
+            if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+                // Extract the library path from LD_PRELOAD=<path>
+                const char *preload_value = p + strlen("LD_PRELOAD=");
+                if (strlen(preload_value) > 0 && preload_value[0] == '/') {
+                    printf("[+] Detecting LD_PRELOAD library: %s\n", preload_value);
+                    
+                    // Scan /proc/PID/maps to find the loaded library and dump it
+                    char maps_path[64];
+                    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
+                    FILE *maps = fopen(maps_path, "r");
+                    if (maps) {
+                        char line[1024];
+                        while (fgets(line, sizeof(line), maps)) {
+                            unsigned long start, end;
+                            char perms[5];
+                            char path[512] = "";
+                            
+                            if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %[^\n]", &start, &end, perms, path) >= 3) {
+                                // Look for the preloaded library's executable regions
+                                if (strchr(perms, 'x') != NULL && strstr(path, preload_value) != NULL) {
+                                    size_t region_size = end - start;
+                                    if (region_size > 100 && region_size < 50*1024*1024) {
+                                        printf("[+] Dumping LD_PRELOAD library region: 0x%lx-0x%lx (%zu bytes)\n", 
+                                               start, end, region_size);
+                                        dump_memory_region(pid, start, end, 0);
+                                    }
+                                }
+                            }
+                        }
+                        fclose(maps);
+                    }
+                }
+            }
         }
         p += strlen(p) + 1;
     }
@@ -3264,19 +3333,33 @@ void *ebpf_pipe_reader(void *arg) {
                     if (had_memfd) {
                         printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s)\n", pid, comm);
                     } else {
-                        printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu\n", 
-                               pid, comm, (unsigned long)addr, (unsigned long)len);
+                        printf("[eBPF] mmap(PROT_EXEC) PID %u (%s) addr=0x%lx len=%lu prot=0x%x\n", 
+                               pid, comm, (unsigned long)addr, (unsigned long)len, prot);
                     }
                 }
                 
-                // Queue immediate scan
+                // Queue immediate scan for all executable mappings
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump the memfd file
-                // Don't dump process memory - dump the memfd file directly
+                // STRATEGY 1: Dump memfd files (fileless execution)
                 if (had_memfd && full_dump) {
                     printf("[+] Dumping memfd files for PID %u at mmap...\n", pid);
                     dump_memfd_files(pid);
+                }
+                
+                // STRATEGY 2: Dump suspicious RWX regions (code injection)
+                // Check if this is RWX (PROT_READ | PROT_WRITE | PROT_EXEC = 7)
+                if (full_dump && (prot & 0x7) == 0x7) {
+                    printf("[+] Detected RWX mmap in PID %u - dumping suspicious region...\n", pid);
+                    // Dump this specific region
+                    dump_memory_region(pid, addr, addr + len, 0);
+                }
+                
+                // STRATEGY 3: Dump anonymous executable mappings (possible injection)
+                // MAP_ANONYMOUS = 0x20
+                if (full_dump && !had_memfd && (flags & 0x20) && len > 0 && len < 10*1024*1024) {
+                    printf("[+] Detected anonymous executable mmap in PID %u - dumping region...\n", pid);
+                    dump_memory_region(pid, addr, addr + len, 0);
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3286,15 +3369,23 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] mprotect(PROT_EXEC) detected in PID %u (%s) addr=0x%lx len=%lu\n", 
-                           pid, comm, (unsigned long)addr, (unsigned long)len);
+                    printf("[eBPF] mprotect(PROT_EXEC) detected in PID %u (%s) addr=0x%lx len=%lu prot=0x%x\n", 
+                           pid, comm, (unsigned long)addr, (unsigned long)len, prot);
                 }
                 
                 // Queue immediate scan (will trigger alerts)
                 queue_push(&event_queue, pid, 0);
                 
-                // DON'T dump on mprotect - it's usually the loader code, not the payload
-                // The payload dump will happen on mmap or execve after memfd_create
+                // STRATEGY 4: Dump memory regions made executable via mprotect
+                // This catches heap execution and other runtime code modifications
+                if (full_dump && (prot & 0x7) == 0x7 && len > 0 && len < 10*1024*1024) {
+                    printf("[+] Detected RWX mprotect in PID %u - dumping modified region...\n", pid);
+                    dump_memory_region(pid, addr, addr + len, 0);
+                } else if (full_dump && (prot & 0x4) && len > 100 && len < 10*1024*1024) {
+                    // Even non-RWX but executable regions modified at runtime are suspicious
+                    printf("[+] Detected executable mprotect in PID %u - dumping region...\n", pid);
+                    dump_memory_region(pid, addr, addr + len, 0);
+                }
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree

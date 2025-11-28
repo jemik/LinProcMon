@@ -65,22 +65,34 @@ run_test() {
     echo -e "${BLUE}Test ${test_num}: ${test_name}${NC}"
     echo -e "${BLUE}==========================================${NC}"
     
-    local report_file="test_${test_num}_report.json"
-    
-    echo "[*] Running LinProcMon in sandbox mode..."
+    echo "[*] Running LinProcMon with eBPF integration..."
     echo "[*] Binary: ${test_binary}"
     echo "[*] Expected detection: ${detection_keywords}"
     echo
     
-    # Run LinProcMon in sandbox mode
-    local tool_path="${SCRIPT_DIR}/../realtime_memdump_tool"
+    # Run with eBPF integration via run_integrated.sh
+    local integrated_script="${SCRIPT_DIR}/../run_integrated.sh"
     
     if [ -n "$test_args" ]; then
-        echo "[*] Command: sudo ${tool_path} --threads 8 --full_dump --sandbox-timeout 1 --sandbox ${test_binary} ${test_args}"
-        sudo "${tool_path}" --threads 8 --full_dump --sandbox-timeout 1 --sandbox "${test_binary}" ${test_args} -o "${report_file}" 2>&1
+        echo "[*] Command: sudo ${integrated_script} ${test_binary} ${test_args}"
+        sudo "${integrated_script}" "${test_binary}" ${test_args} 2>&1
     else
-        echo "[*] Command: sudo ${tool_path} --threads 8 --full_dump --sandbox-timeout 1 --sandbox ${test_binary}"
-        sudo "${tool_path}" --threads 8 --full_dump --sandbox-timeout 1 --sandbox "${test_binary}" -o "${report_file}" 2>&1
+        echo "[*] Command: sudo ${integrated_script} ${test_binary}"
+        sudo "${integrated_script}" "${test_binary}" 2>&1
+    fi
+    
+    # Find and report on the most recent sandbox directory
+    local sandbox_dir=$(ls -td "${SCRIPT_DIR}/../sandbox_"* 2>/dev/null | head -1)
+    if [ -n "$sandbox_dir" ] && [ -d "$sandbox_dir" ]; then
+        echo "[*] Sandbox directory: ${sandbox_dir}"
+        echo "[*] Memory dumps: $(find "$sandbox_dir" -name "*.bin" 2>/dev/null | wc -l)"
+        
+        # Check for report.json
+        if [ -f "${sandbox_dir}/report.json" ]; then
+            echo "[*] Report generated: ${sandbox_dir}/report.json"
+            # Save test-specific copy
+            cp "${sandbox_dir}/report.json" "${OUTPUT_DIR}/test_${test_num}_report.json"
+        fi
     fi
     
     echo
@@ -117,28 +129,52 @@ run_test 4 "Heap Execution" \
     "Executable heap"
 
 # Test 5: LD_PRELOAD hijacking
-# Note: LD_PRELOAD as environment variable
-export LD_PRELOAD="${OUTPUT_DIR}/malicious_preload.so"
+# Note: The preload loader uses its own test program
+echo -e "${BLUE}==========================================${NC}"
+echo -e "${BLUE}Test 5: LD_PRELOAD Hijacking${NC}"
+echo -e "${BLUE}==========================================${NC}"
+echo "[*] Note: This test uses a wrapper script that sets LD_PRELOAD"
+echo "[*] Creating wrapper script..."
+
+# Create wrapper script
+cat > "${OUTPUT_DIR}/test5_wrapper.sh" << 'EOF'
+#!/bin/bash
+export LD_PRELOAD="$1"
+shift
+exec "$@"
+EOF
+chmod +x "${OUTPUT_DIR}/test5_wrapper.sh"
+
 run_test 5 "LD_PRELOAD Hijacking" \
-    "${OUTPUT_DIR}/5_preload_victim" \
-    "" \
+    "${OUTPUT_DIR}/test5_wrapper.sh" \
+    "${OUTPUT_DIR}/malicious_preload.so ${OUTPUT_DIR}/5_preload_victim" \
     "LD_PRELOAD"
-unset LD_PRELOAD
 
 # Summary
 echo -e "${BLUE}==========================================${NC}"
 echo -e "${BLUE}Test Suite Complete${NC}"
 echo -e "${BLUE}==========================================${NC}"
 echo
-echo "All 5 test cases executed. Check the following:"
-echo "  1. JSON reports for each test (test_N_report.json)"
-echo "  2. Memory dump files (*.dump)"
-echo "  3. Alerts in realtime_memdump_tool output"
+echo "All 5 test cases executed with eBPF integration. Check the following:"
+echo "  1. JSON reports: ${OUTPUT_DIR}/test_N_report.json"
+echo "  2. Memory dumps in sandbox_* directories"
+echo "  3. eBPF event logs in /tmp/ebpf_*.log"
+echo "  4. Alerts in output above"
+echo
+echo "Summary of sandbox directories:"
+for sandbox_dir in "${SCRIPT_DIR}/../sandbox_"*; do
+    if [ -d "$sandbox_dir" ]; then
+        dump_count=$(find "$sandbox_dir" -name "*.bin" 2>/dev/null | wc -l)
+        echo "  - $sandbox_dir: $dump_count memory dumps"
+    fi
+done
 echo
 echo "Next steps:"
-echo "  1. Verify each report contains expected alert types"
-echo "  2. Run YARA scan on memory dumps:"
-echo "     yara meterpreter_rules.yar *.dump"
+echo "  1. Verify each report contains expected alert types:"
+echo "     cat ${OUTPUT_DIR}/test_1_report.json | jq '.memory_dumps'"
+echo "  2. Run YARA scan on all dumps:"
+echo "     cd ${SCRIPT_DIR}/.."
+echo "     python3 test_loaders/yara_scan_sandbox.py"
 echo "  3. Check for meterpreter signature matches"
 echo
 echo -e "${GREEN}[✓] Test suite finished successfully${NC}"
