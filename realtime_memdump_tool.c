@@ -97,6 +97,7 @@ typedef struct {
     char name[256];
     char path[512];
     char cmdline[1024];
+    char creation_method[32];
     time_t start_time;
     int active;
 } sandbox_process_t;
@@ -873,6 +874,21 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     if (!path) path = "unknown";
     if (!cmdline) cmdline = "unknown";
     
+    // Filter out the monitoring tool itself
+    if (pid == getpid() || strstr(name, "realtime_memdum") != NULL) {
+        return;
+    }
+    
+    // Determine process creation method
+    const char *creation_method = "UNKNOWN";
+    if (strstr(path, "memfd:") != NULL) {
+        creation_method = "MEMFD_EXEC";
+    } else if (pid == sandbox_root_pid) {
+        creation_method = "SPAWN";
+    } else {
+        creation_method = "FORK_EXEC";
+    }
+    
     // Use trylock to avoid deadlocks
     if (pthread_mutex_trylock(&sandbox_proc_mutex) != 0) {
         fprintf(stderr, "[!] WARN: Could not acquire lock for PID %d, skipping report\n", pid);
@@ -907,6 +923,8 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
             sandbox_processes[idx].path[sizeof(sandbox_processes[idx].path) - 1] = '\0';
             strncpy(sandbox_processes[idx].cmdline, cmdline, sizeof(sandbox_processes[idx].cmdline) - 1);
             sandbox_processes[idx].cmdline[sizeof(sandbox_processes[idx].cmdline) - 1] = '\0';
+            strncpy(sandbox_processes[idx].creation_method, creation_method, sizeof(sandbox_processes[idx].creation_method) - 1);
+            sandbox_processes[idx].creation_method[sizeof(sandbox_processes[idx].creation_method) - 1] = '\0';
             sandbox_processes[idx].start_time = time(NULL);
             sandbox_processes[idx].active = 1;
             sandbox_process_count++;
@@ -952,8 +970,8 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
                 
                 const char *esc_cmdline = json_escape(cmdline);
                 
-                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        pid, ppid, name_copy, path_copy, esc_cmdline, time(NULL));
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"creation_method\":\"%s\",\"start_time\":%ld}\n",
+                        pid, ppid, name_copy, path_copy, esc_cmdline, creation_method, (long)time(NULL));
                 fflush(tf);
                 fclose(tf);
                 
@@ -1969,6 +1987,7 @@ void dump_memfd_files(pid_t pid) {
                             const char *filename = strrchr(dump_file, '/');
                             filename = filename ? filename + 1 : dump_file;
                             
+                            sandbox_memdumps[sandbox_memdump_count].pid = pid;
                             strncpy(sandbox_memdumps[sandbox_memdump_count].filename, filename, 
                                     sizeof(sandbox_memdumps[0].filename) - 1);
                             sandbox_memdumps[sandbox_memdump_count].size = total;
@@ -1976,6 +1995,17 @@ void dump_memfd_files(pid_t pid) {
                                     sizeof(sandbox_memdumps[0].sha1) - 1);
                             sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
                             sandbox_memdump_count++;
+                            
+                            // Write immediately to temp file
+                            char temp_file[600];
+                            snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+                            FILE *tf = fopen(temp_file, "a");
+                            if (tf) {
+                                fprintf(tf, "{\"pid\":%d,\"filename\":\"%s\",\"size\":%ld,\"sha1\":\"%s\",\"timestamp\":%ld}\n",
+                                        pid, filename, total, sha1, (long)time(NULL));
+                                fflush(tf);
+                                fclose(tf);
+                            }
                         }
                         pthread_mutex_unlock(&sandbox_proc_mutex);
                     }
@@ -4034,15 +4064,60 @@ int main(int argc, char **argv) {
                                 if (fgets(line, sizeof(line), children_file)) {
                                     // Parse space-separated PIDs
                                     char *token = strtok(line, " \n");
+                                    int child_count = 0;
                                     while (token) {
                                         pid_t child_pid = atoi(token);
                                         if (child_pid > 0) {
+                                            child_count++;
+                                            printf("[+] Found child process: PID %d (parent: %d)\n", 
+                                                   child_pid, sandbox_root_pid);
                                             queue_push(&event_queue, child_pid, sandbox_root_pid);
                                         }
                                         token = strtok(NULL, " \n");
                                     }
+                                    if (child_count > 0 && !quiet_mode) {
+                                        printf("[*] Scanning %d child process(es)\n", child_count);
+                                    }
                                 }
                                 fclose(children_file);
+                            } else if (!quiet_mode) {
+                                // Fallback: scan /proc for children
+                                DIR *proc_dir = opendir("/proc");
+                                if (proc_dir) {
+                                    struct dirent *entry;
+                                    int child_count = 0;
+                                    while ((entry = readdir(proc_dir)) != NULL) {
+                                        if (!isdigit(entry->d_name[0])) continue;
+                                        
+                                        pid_t potential_child = atoi(entry->d_name);
+                                        if (potential_child <= 0 || potential_child == sandbox_root_pid) continue;
+                                        
+                                        // Check if this process's ppid matches sandbox_root_pid
+                                        char stat_path[256];
+                                        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", potential_child);
+                                        FILE *sf = fopen(stat_path, "r");
+                                        if (sf) {
+                                            char stat_line[2048];
+                                            if (fgets(stat_line, sizeof(stat_line), sf)) {
+                                                char *p = strrchr(stat_line, ')');
+                                                if (p) {
+                                                    int ppid = 0;
+                                                    sscanf(p + 1, " %*c %d", &ppid);
+                                                    if (ppid == sandbox_root_pid) {
+                                                        child_count++;
+                                                        printf("[+] Found child via /proc scan: PID %d\n", potential_child);
+                                                        queue_push(&event_queue, potential_child, sandbox_root_pid);
+                                                    }
+                                                }
+                                            }
+                                            fclose(sf);
+                                        }
+                                    }
+                                    closedir(proc_dir);
+                                    if (child_count > 0) {
+                                        printf("[*] Found %d child process(es) via fallback scan\n", child_count);
+                                    }
+                                }
                             }
                         
                             last_sandbox_rescan = now;
