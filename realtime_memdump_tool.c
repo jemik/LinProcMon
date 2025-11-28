@@ -2128,6 +2128,10 @@ void dump_executable_mappings(pid_t pid) {
         if (strstr(path, "memfd:") != NULL) {
             should_dump = 1;
             reason = "memfd_mapping";
+        } else if (strstr(path, "(deleted)") != NULL && strstr(path, "memfd") != NULL) {
+            // Catch /memfd:xxx (deleted) pattern
+            should_dump = 1;
+            reason = "memfd_deleted";
         } else if (strstr(path, "(deleted)") != NULL) {
             should_dump = 1;
             reason = "deleted_mapping";
@@ -2147,12 +2151,16 @@ void dump_executable_mappings(pid_t pid) {
             // For memfd processes, these are HIGH PRIORITY (XOR'd ELF payload!)
             should_dump = 1;
             reason = is_memfd_process ? "fexecve_payload" : "anonymous_exec";
-        } else if (is_memfd_process && strchr(perms, 'r') && strchr(perms, 'x')) {
+        }
+        // REMOVED: This was too aggressive and dumped all system libraries
+        /*
+        else if (is_memfd_process && strchr(perms, 'r') && strchr(perms, 'x')) {
             // For memfd-flagged processes: dump ANY readable+executable region
             // This is aggressive but necessary to catch all payload variations
             should_dump = 1;
             reason = "memfd_exec_region";
         }
+        */
         
         if (should_dump) {
             size_t region_size = end - start;
@@ -3743,30 +3751,14 @@ void *ebpf_pipe_reader(void *arg) {
                 // Mark this PID for tracking
                 mark_memfd_pid(pid);
                 
-                // CRITICAL: For fexecve loaders, timing is everything
-                // The loader will: write(decrypted_elf) -> fexecve() -> process continues
-                // We need to dump AFTER fexecve() but BEFORE process exits
-                //
-                // STRATEGY: Retry multiple times with increasing delays
-                // This catches the process at different stages of execution
-                if (full_dump && sandbox_mode) {
-                    printf("[+] Fast-path: Multi-attempt dump for PID %u...\n", pid);
-                    
-                    // Attempt 1: Immediate (might catch fd before fexecve)
-                    dump_memfd_files(pid);
-                    
-                    // Attempt 2: After 20ms (likely after fexecve, before exit)
-                    usleep(20000);
-                    check_exe_link(pid);  // Detects memfd execution and dumps
-                    dump_executable_mappings(pid);
-                    
-                    // Attempt 3: After another 50ms (backup if process slow)
-                    usleep(50000);
-                    check_exe_link(pid);
-                    dump_executable_mappings(pid);
+                // DON'T dump here - too early! The process hasn't called fexecve() yet.
+                // We'll dump when we see the EXECVE event (which comes from execveat/fexecve)
+                
+                if (!quiet_mode) {
+                    printf("[+] Marked PID %u for memfd tracking (waiting for fexecve)\n", pid);
                 }
                 
-                // Also queue for worker thread (backup)
+                // Queue for worker thread
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
@@ -3786,10 +3778,20 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 pthread_mutex_unlock(&memfd_pids_mutex);
                 
-                if (!quiet_mode) {
-                    if (had_memfd) {
-                        printf("[eBPF] execve() after memfd in PID %u (%s) - already dumped at memfd_create\n", pid, comm);
-                    } else {
+                if (had_memfd) {
+                    // This is the golden moment! fexecve() just completed via execveat()
+                    // Process has transformed: /proc/PID/exe now points to memfd
+                    // /proc/PID/maps now shows the decrypted ELF payload
+                    printf("[eBPF] execve() after memfd in PID %u (%s) - DUMPING NOW!\n", pid, comm);
+                    
+                    // Small delay to ensure /proc files are fully updated
+                    usleep(5000);  // 5ms
+                    
+                    // Dump the transformed process
+                    check_exe_link(pid);  // Detects memfd execution
+                    dump_executable_mappings(pid);  // Dumps actual payload from /proc/PID/maps
+                } else {
+                    if (!quiet_mode) {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
