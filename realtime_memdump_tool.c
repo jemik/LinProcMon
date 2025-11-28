@@ -1969,6 +1969,7 @@ void dump_memfd_files(pid_t pid) {
                             const char *filename = strrchr(dump_file, '/');
                             filename = filename ? filename + 1 : dump_file;
                             
+                            sandbox_memdumps[sandbox_memdump_count].pid = pid;
                             strncpy(sandbox_memdumps[sandbox_memdump_count].filename, filename, 
                                     sizeof(sandbox_memdumps[0].filename) - 1);
                             sandbox_memdumps[sandbox_memdump_count].size = total;
@@ -1976,9 +1977,26 @@ void dump_memfd_files(pid_t pid) {
                                     sizeof(sandbox_memdumps[0].sha1) - 1);
                             sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
                             sandbox_memdump_count++;
+                            
+                            // Write immediately to temp file for signal-safe reporting
+                            char temp_file[600];
+                            snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
+                            FILE *tf = fopen(temp_file, "a");
+                            if (tf) {
+                                fprintf(tf, "{\"pid\":%d,\"filename\":\"%s\",\"size\":%ld,\"sha1\":\"%s\",\"timestamp\":%ld}\n",
+                                        pid, filename, total, sha1, (long)time(NULL));
+                                fflush(tf);
+                                fclose(tf);
+                            }
                         }
                         pthread_mutex_unlock(&sandbox_proc_mutex);
                     }
+                }
+                
+                // Scan with YARA if available
+                if (yara_rules_path) {
+                    printf("[*] Scanning memfd dump with YARA rules: %s\n", yara_rules_path);
+                    scan_with_yara(dump_file);
                 }
             }
         }
@@ -2896,6 +2914,13 @@ void scan_maps_and_dump(pid_t pid) {
         
         // Final check before reporting
         if (access(proc_check, F_OK) != 0) {
+            fclose(maps);
+            return;
+        }
+        
+        // Don't report the monitoring tool itself
+        if (pid == getpid() || strstr(comm, "realtime_memdum") != NULL || 
+            strstr(exe_path, "realtime_memdump_tool") != NULL) {
             fclose(maps);
             return;
         }
