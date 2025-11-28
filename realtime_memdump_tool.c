@@ -3019,6 +3019,28 @@ int queue_pop(event_queue_t *q, event_data_t *event) {
     return 0;
 }
 
+// Delayed dump thread - waits a bit for shellcode to be written before dumping
+void *delayed_dump_thread(void *arg) {
+    pid_t pid = *(pid_t *)arg;
+    free(arg);
+    
+    // Wait 50ms for loader to write shellcode to memfd
+    struct timespec ts = {0, 50000000};  // 50ms
+    nanosleep(&ts, NULL);
+    
+    // Check if process still exists
+    char proc_path[64];
+    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
+    if (access(proc_path, F_OK) == 0) {
+        printf("[+] Dumping PID %u after 50ms delay...\n", pid);
+        dump_full_process_memory(pid);
+    } else {
+        printf("[!] PID %u exited before delayed dump\n", pid);
+    }
+    
+    return NULL;
+}
+
 // eBPF event pipe reader thread
 void *ebpf_pipe_reader(void *arg) {
     const char *pipe_path = (const char *)arg;
@@ -3073,18 +3095,25 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump NOW (before execve)
-                // This is our ONLY chance before the process replaces itself
+                // If this is after memfd_create, schedule delayed dump
+                // We need a small delay for the loader to write shellcode to memfd
+                // But we can't block this thread, so spawn a detached thread
                 if (had_memfd && full_dump && !is_already_dumped(pid)) {
                     mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u immediately after memfd+mmap (before shellcode writes/execve)...\n", pid);
+                    printf("[+] Scheduling delayed dump for PID %u after memfd+mmap...\n", pid);
                     
-                    // Give the loader a moment to write shellcode to memfd
-                    // Use nanosleep for precise short delay
-                    struct timespec ts = {0, 50000000};  // 50ms
-                    nanosleep(&ts, NULL);
+                    // Create detached thread for delayed dump
+                    pthread_t dump_thread;
+                    pthread_attr_t attr;
+                    pthread_attr_init(&attr);
+                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
                     
-                    dump_full_process_memory(pid);
+                    pid_t *pid_copy = malloc(sizeof(pid_t));
+                    if (pid_copy) {
+                        *pid_copy = pid;
+                        pthread_create(&dump_thread, &attr, delayed_dump_thread, pid_copy);
+                    }
+                    pthread_attr_destroy(&attr);
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
