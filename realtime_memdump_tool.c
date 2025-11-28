@@ -2653,14 +2653,23 @@ void check_exe_link(pid_t pid) {
         pthread_mutex_unlock(&stats_mutex);
         printf("[!] CRITICAL: Process executing from memfd | PID=%d | exe=%s\n", pid, exe_target);
         
-        // IMMEDIATE DUMP: This is the Meterpreter or shellcode process!
+        // Mark this PID for tracking
+        mark_memfd_exec_pid(pid);
+        
+        // IMMEDIATE DUMP: This is the fexecve'd process with decrypted payload!
         if (full_dump) {
             if (sandbox_mode && !is_sandbox_process(pid)) {
                 printf("[DEBUG] PID=%d is memfd but not in sandbox tree, skipping\n", pid);
             } else {
-                // Strategy: Dump memfd files directly
+                // BULLETPROOF MULTI-STRATEGY:
+                // 1. Try dumping from /proc/PID/fd (works if fd still open - rare after fexecve)
                 printf("[+] Dumping memfd files from PID=%d...\n", pid);
                 dump_memfd_files(pid);
+                
+                // 2. CRITICAL: Dump from /proc/PID/maps (ALWAYS works after fexecve!)
+                //    This is where the decrypted ELF payload lives in memory
+                printf("[+] Scanning executable memory regions in PID %d...\n", pid);
+                dump_executable_mappings(pid);
             }
         } else {
             printf("[DEBUG] full_dump not enabled, skipping dump\n");
@@ -3728,23 +3737,16 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] memfd_create() detected in PID %u (%s) - fast-track dumping\n",
-                           pid, comm);
+                    printf("[eBPF] memfd_create() detected in PID %u (%s)\n", pid, comm);
                 }
                 
-                // Mark this PID - for future MMAP/EXECVE events
+                // Mark this PID for tracking
                 mark_memfd_pid(pid);
                 
-                // CRITICAL: memfd_create() is called BEFORE fexecve()
-                // If we dump now, we'll only get the encrypted loader or empty fd
-                // 
-                // STRATEGY: Just mark the PID and wait for EXECVE event
-                // The EXECVE event fires AFTER fexecve() replaces the process
-                // At that point /proc/PID/maps shows the decrypted ELF mappings
-                
-                printf("[+] memfd PID %u marked - will dump after execve()\n", pid);
-                
-                // Also queue for regular scanning (backup)
+                // Queue for worker thread processing
+                // The worker calls scan_maps_and_dump() which:
+                // 1. Calls check_exe_link() - detects memfd execution and dumps
+                // 2. Calls dump_executable_mappings() if memfd flag is set
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
@@ -3753,7 +3755,7 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if memfd flag is set (but DON'T clear it yet)
+                // Check if memfd flag is set
                 int had_memfd = 0;
                 pthread_mutex_lock(&memfd_pids_mutex);
                 for (int i = 0; i < memfd_pids_count; i++) {
@@ -3766,49 +3768,16 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - CRITICAL DUMP POINT\n", pid, comm);
+                        printf("[eBPF] execve() after memfd_create in PID %u (%s) - queueing for dump\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
                 
-                // BULLETPROOF STRATEGY FOR MEMFD+EXECVE:
-                // This is fexecve() - process just replaced itself with decrypted ELF
-                // The memory mappings NOW contain the real payload
-                // We MUST dump immediately before process exits (typically 1-2 seconds)
-                if (full_dump && had_memfd) {
-                    // Create thread context for async dump
-                    typedef struct {
-                        pid_t pid;
-                        char comm[16];
-                    } execve_dump_ctx_t;
-                    
-                    execve_dump_ctx_t *ctx = malloc(sizeof(execve_dump_ctx_t));
-                    if (ctx) {
-                        ctx->pid = pid;
-                        strncpy(ctx->comm, comm, sizeof(ctx->comm) - 1);
-                        ctx->comm[sizeof(ctx->comm) - 1] = '\0';
-                        
-                        // Spawn dedicated post-execve dump thread
-                        pthread_t dump_thread;
-                        pthread_attr_t attr;
-                        pthread_attr_init(&attr);
-                        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                        
-                        // Thread will dump the transformed process
-                        extern void *memfd_dump_thread(void *arg);
-                        if (pthread_create(&dump_thread, &attr, memfd_dump_thread, ctx) != 0) {
-                            fprintf(stderr, "[!] Failed to spawn post-execve dump thread\n");
-                            free(ctx);
-                        } else {
-                            printf("[+] Post-execve dump thread spawned for PID %u\n", pid);
-                        }
-                        
-                        pthread_attr_destroy(&attr);
-                    }
-                }
-                
-                // Queue immediate scan for all processes
+                // Queue for immediate processing by worker thread
+                // scan_maps_and_dump() will:
+                // 1. call check_exe_link() which detects /proc/PID/exe -> /memfd:...
+                // 2. call dump_executable_mappings() which dumps the payload from memory
                 queue_push(&event_queue, pid, 0);
             }
         }
