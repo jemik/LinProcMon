@@ -1907,6 +1907,13 @@ void dump_full_process_memory(pid_t pid) {
         }
         fclose(comm_file);
     }
+    
+    // Skip dumping if process is "sh" - we want the loader, not the shell
+    if (strcmp(comm, "sh") == 0 || strstr(comm, "bash") != NULL) {
+        printf("[!] Skipping dump of PID %d - process is shell (%s), not loader\n", pid, comm);
+        fclose(maps);
+        return;
+    }
 
     // Create single dump file and map file
     char dump_file[512], map_file[512];
@@ -2095,8 +2102,8 @@ void dump_full_process_memory(pid_t pid) {
     printf("[+] Dump file: %s\n", dump_file);
     printf("[+] Memory map: %s\n", map_file);
     
-    // Mark this PID as dumped to prevent duplicates
-    mark_as_dumped(pid);
+    // DON'T mark as dumped here - we may dump again at execve
+    // Deduplication handled by checking comm name (avoid dumping "sh")
     
     // Calculate hashes of memory dump
     char sha1[41], sha256[65];
@@ -3019,28 +3026,6 @@ int queue_pop(event_queue_t *q, event_data_t *event) {
     return 0;
 }
 
-// Delayed dump thread - waits a bit for shellcode to be written before dumping
-void *delayed_dump_thread(void *arg) {
-    pid_t pid = *(pid_t *)arg;
-    free(arg);
-    
-    // Wait 50ms for loader to write shellcode to memfd
-    struct timespec ts = {0, 50000000};  // 50ms
-    nanosleep(&ts, NULL);
-    
-    // Check if process still exists
-    char proc_path[64];
-    snprintf(proc_path, sizeof(proc_path), "/proc/%d", pid);
-    if (access(proc_path, F_OK) == 0) {
-        printf("[+] Dumping PID %u after 50ms delay...\n", pid);
-        dump_full_process_memory(pid);
-    } else {
-        printf("[!] PID %u exited before delayed dump\n", pid);
-    }
-    
-    return NULL;
-}
-
 // eBPF event pipe reader thread
 void *ebpf_pipe_reader(void *arg) {
     const char *pipe_path = (const char *)arg;
@@ -3095,25 +3080,11 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, schedule delayed dump
-                // We need a small delay for the loader to write shellcode to memfd
-                // But we can't block this thread, so spawn a detached thread
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Scheduling delayed dump for PID %u after memfd+mmap...\n", pid);
-                    
-                    // Create detached thread for delayed dump
-                    pthread_t dump_thread;
-                    pthread_attr_t attr;
-                    pthread_attr_init(&attr);
-                    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                    
-                    pid_t *pid_copy = malloc(sizeof(pid_t));
-                    if (pid_copy) {
-                        *pid_copy = pid;
-                        pthread_create(&dump_thread, &attr, delayed_dump_thread, pid_copy);
-                    }
-                    pthread_attr_destroy(&attr);
+                // If this is after memfd_create, dump now (early dump)
+                // Shellcode might not be fully written yet, but we'll dump again at execve
+                if (had_memfd && full_dump) {
+                    printf("[+] Early dump at mmap for PID %u (will re-dump at execve if larger)...\n", pid);
+                    dump_full_process_memory(pid);
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3170,11 +3141,12 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Don't dump on execve - it's TOO LATE
-                // By the time eBPF event fires, process memory is already replaced
-                // We already dumped at mmap time (before execve)
-                if (had_memfd && !quiet_mode) {
-                    printf("[eBPF] execve after memfd (memory already dumped at mmap)\n");
+                // Dump again on execve (final dump with full shellcode)
+                // sys_enter_execve fires BEFORE kernel replaces process
+                // This should have the complete shellcode written to memfd
+                if (had_memfd && full_dump) {
+                    printf("[+] Final dump at execve for PID %u (before process replacement)...\n", pid);
+                    dump_full_process_memory(pid);
                 }
             }
         }
