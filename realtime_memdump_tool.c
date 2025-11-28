@@ -1868,6 +1868,129 @@ void dump_memory_region(pid_t pid, unsigned long start, unsigned long end, int s
     close(out_fd);
 }
 
+// Dump memfd file contents - this is where the decrypted shellcode lives
+void dump_memfd_files(pid_t pid) {
+    char fd_dir[64];
+    snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+    
+    DIR *dir = opendir(fd_dir);
+    if (!dir) {
+        fprintf(stderr, "[-] Cannot open /proc/%d/fd\n", pid);
+        return;
+    }
+    
+    // Get process name
+    char comm[256] = "unknown";
+    char comm_path[64];
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    FILE *comm_file = fopen(comm_path, "r");
+    if (comm_file) {
+        if (fgets(comm, sizeof(comm), comm_file)) {
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n')
+                comm[len-1] = '\0';
+        }
+        fclose(comm_file);
+    }
+    
+    struct dirent *entry;
+    int memfd_found = 0;
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        char fd_path[128], link_target[512];
+        snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%s", pid, entry->d_name);
+        
+        ssize_t len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+        if (len > 0) {
+            link_target[len] = '\0';
+            
+            // Check if this is a memfd
+            if (strstr(link_target, "/memfd:") != NULL || strstr(link_target, "memfd:") == link_target) {
+                memfd_found = 1;
+                printf("[+] Found memfd in PID %d: fd/%s -> %s\n", pid, entry->d_name, link_target);
+                
+                // Open and dump the memfd contents
+                int fd = open(fd_path, O_RDONLY);
+                if (fd < 0) {
+                    fprintf(stderr, "[-] Cannot open memfd: %s\n", strerror(errno));
+                    continue;
+                }
+                
+                // Get file size
+                struct stat st;
+                if (fstat(fd, &st) < 0) {
+                    fprintf(stderr, "[-] Cannot stat memfd: %s\n", strerror(errno));
+                    close(fd);
+                    continue;
+                }
+                
+                printf("[+] Memfd size: %ld bytes\n", st.st_size);
+                
+                // Create dump file
+                char dump_file[512];
+                if (sandbox_mode && strlen(sandbox_memdump_dir) > 0) {
+                    snprintf(dump_file, sizeof(dump_file), "%s/memfd_dump_%d_%s.bin", 
+                             sandbox_memdump_dir, pid, comm);
+                } else {
+                    snprintf(dump_file, sizeof(dump_file), "memfd_dump_%d_%s.bin", pid, comm);
+                }
+                
+                int out_fd = open(dump_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (out_fd < 0) {
+                    fprintf(stderr, "[-] Cannot create dump file: %s\n", strerror(errno));
+                    close(fd);
+                    continue;
+                }
+                
+                // Copy memfd contents
+                char buffer[8192];
+                ssize_t total = 0;
+                ssize_t n;
+                while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+                    write(out_fd, buffer, n);
+                    total += n;
+                }
+                
+                close(fd);
+                close(out_fd);
+                
+                printf("[+] Dumped memfd to %s (%ld bytes)\n", dump_file, total);
+                
+                // Calculate hash and report
+                char sha1[41];
+                if (calculate_sha1(dump_file, sha1) == 0) {
+                    printf("[+] Memfd dump SHA-1: %s\n", sha1);
+                    
+                    if (sandbox_mode) {
+                        pthread_mutex_lock(&sandbox_proc_mutex);
+                        if (sandbox_memdump_count < MAX_SANDBOX_MEMDUMPS) {
+                            const char *filename = strrchr(dump_file, '/');
+                            filename = filename ? filename + 1 : dump_file;
+                            
+                            strncpy(sandbox_memdumps[sandbox_memdump_count].filename, filename, 
+                                    sizeof(sandbox_memdumps[0].filename) - 1);
+                            sandbox_memdumps[sandbox_memdump_count].size = total;
+                            strncpy(sandbox_memdumps[sandbox_memdump_count].sha1, sha1, 
+                                    sizeof(sandbox_memdumps[0].sha1) - 1);
+                            sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
+                            sandbox_memdump_count++;
+                        }
+                        pthread_mutex_unlock(&sandbox_proc_mutex);
+                    }
+                }
+            }
+        }
+    }
+    
+    closedir(dir);
+    
+    if (!memfd_found) {
+        printf("[!] No memfd found in PID %d\n", pid);
+    }
+}
+
 // Dump all memory regions of a process for dynamic unpacking analysis
 // Creates a single contiguous dump file for easy reverse engineering
 void dump_full_process_memory(pid_t pid) {
@@ -3080,11 +3203,11 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump now (early dump)
-                // Shellcode might not be fully written yet, but we'll dump again at execve
+                // If this is after memfd_create, dump the memfd file
+                // Don't dump process memory - dump the memfd file directly
                 if (had_memfd && full_dump) {
-                    printf("[+] Early dump at mmap for PID %u (will re-dump at execve if larger)...\n", pid);
-                    dump_full_process_memory(pid);
+                    printf("[+] Dumping memfd files for PID %u at mmap...\n", pid);
+                    dump_memfd_files(pid);
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3141,12 +3264,11 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump again on execve (final dump with full shellcode)
-                // sys_enter_execve fires BEFORE kernel replaces process
-                // This should have the complete shellcode written to memfd
+                // Dump memfd again at execve (final chance before process replacement)
+                // At this point shellcode should be fully written
                 if (had_memfd && full_dump) {
-                    printf("[+] Final dump at execve for PID %u (before process replacement)...\n", pid);
-                    dump_full_process_memory(pid);
+                    printf("[+] Final memfd dump at execve for PID %u...\n", pid);
+                    dump_memfd_files(pid);
                 }
             }
         }
