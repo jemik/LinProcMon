@@ -3743,10 +3743,23 @@ void *ebpf_pipe_reader(void *arg) {
                 // Mark this PID for tracking
                 mark_memfd_pid(pid);
                 
-                // Queue for worker thread processing
-                // The worker calls scan_maps_and_dump() which:
-                // 1. Calls check_exe_link() - detects memfd execution and dumps
-                // 2. Calls dump_executable_mappings() if memfd flag is set
+                // CRITICAL: For fexecve loaders, we must dump IMMEDIATELY
+                // The loader will: write(decrypted_elf) -> fexecve() -> exit in microseconds
+                // If we wait for EXECVE event or queue processing, it's too late
+                if (full_dump && sandbox_mode) {
+                    printf("[+] Fast-path: Dumping memfd from PID %u immediately...\n", pid);
+                    
+                    // Small delay to let write() complete (loader needs time to decrypt and write)
+                    usleep(50000);  // 50ms - enough for write() to complete, fast enough to catch fexecve
+                    
+                    // Try to dump from fd first (might work before fexecve)
+                    dump_memfd_files(pid);
+                    
+                    // Also scan process state (will detect memfd execution if fexecve already happened)
+                    scan_maps_and_dump(pid);
+                }
+                
+                // Also queue for worker thread (backup)
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
@@ -3768,21 +3781,14 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() after memfd_create in PID %u (%s) - IMMEDIATE DUMP\n", pid, comm);
+                        printf("[eBPF] execve() after memfd in PID %u (%s) - already dumped at memfd_create\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
                 
-                // CRITICAL FIX: For memfd+execve (fexecve), process exits in ~2 seconds
-                // Queue processing is too slow - dump IMMEDIATELY in eBPF reader thread
-                if (full_dump && had_memfd && sandbox_mode) {
-                    printf("[+] Fast-path: Scanning PID %u immediately (fexecve detected)...\n", pid);
-                    scan_maps_and_dump(pid);
-                } else {
-                    // Queue for normal processing
-                    queue_push(&event_queue, pid, 0);
-                }
+                // Queue for worker thread (will report process transformation)
+                queue_push(&event_queue, pid, 0);
             }
         }
     }
