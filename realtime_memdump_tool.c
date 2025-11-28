@@ -3073,12 +3073,10 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump immediately
-                // The shellcode will be written shortly, and we'll get it before execve
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after memfd+mmap...\n", pid);
-                    dump_full_process_memory(pid);
+                // If this is after memfd_create, DON'T dump yet
+                // Wait for execve to dump when payload is fully written
+                if (had_memfd && !quiet_mode) {
+                    printf("[eBPF] Detected mmap after memfd_create - will dump on execve\n");
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3095,12 +3093,8 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan (will trigger alerts)
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump on large mprotect (UPX unpacking, code decryption)
-                if (full_dump && len > 100000 && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after large mprotect(PROT_EXEC) len=%lu (unpacked code)...\n", pid, (unsigned long)len);
-                    dump_full_process_memory(pid);
-                }
+                // DON'T dump on mprotect - it's usually the loader code, not the payload
+                // The payload dump will happen on mmap or execve after memfd_create
                 
             } else if (event_type == 3) {  // MEMFD_CREATE
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3130,7 +3124,7 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd in PID %u (%s)\n", pid, comm);
+                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - DUMPING NOW\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
@@ -3139,10 +3133,11 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // If memfd+execve and not dumped yet, dump now (last chance)
+                // Dump on memfd+execve (both UPX and non-UPX)
+                // At this point, shellcode has been written to memfd
                 if (had_memfd && full_dump && !is_already_dumped(pid)) {
                     mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after memfd execve (backup dump)...\n", pid);
+                    printf("[+] Dumping PID %u after memfd+execve...\n", pid);
                     dump_full_process_memory(pid);
                 }
             }
