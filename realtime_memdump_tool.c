@@ -97,6 +97,7 @@ typedef struct {
     char name[256];
     char path[512];
     char cmdline[1024];
+    char creation_method[16];  // "SPAWN", "FORK_EXEC", "MEMFD_EXEC"
     time_t start_time;
     int active;
 } sandbox_process_t;
@@ -873,6 +874,16 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     if (!path) path = "unknown";
     if (!cmdline) cmdline = "unknown";
     
+    // Determine process creation method
+    const char *creation_method = "UNKNOWN";
+    if (strstr(path, "memfd:") != NULL) {
+        creation_method = "MEMFD_EXEC";
+    } else if (pid == sandbox_root_pid) {
+        creation_method = "SPAWN";
+    } else {
+        creation_method = "FORK_EXEC";
+    }
+    
     // Use trylock to avoid deadlocks
     if (pthread_mutex_trylock(&sandbox_proc_mutex) != 0) {
         fprintf(stderr, "[!] WARN: Could not acquire lock for PID %d, skipping report\n", pid);
@@ -907,6 +918,8 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
             sandbox_processes[idx].path[sizeof(sandbox_processes[idx].path) - 1] = '\0';
             strncpy(sandbox_processes[idx].cmdline, cmdline, sizeof(sandbox_processes[idx].cmdline) - 1);
             sandbox_processes[idx].cmdline[sizeof(sandbox_processes[idx].cmdline) - 1] = '\0';
+            strncpy(sandbox_processes[idx].creation_method, creation_method, sizeof(sandbox_processes[idx].creation_method) - 1);
+            sandbox_processes[idx].creation_method[sizeof(sandbox_processes[idx].creation_method) - 1] = '\0';
             sandbox_processes[idx].start_time = time(NULL);
             sandbox_processes[idx].active = 1;
             sandbox_process_count++;
@@ -952,8 +965,8 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
                 
                 const char *esc_cmdline = json_escape(cmdline);
                 
-                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
-                        pid, ppid, name_copy, path_copy, esc_cmdline, time(NULL));
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"%s\",\"path\":\"%s\",\"cmdline\":\"%s\",\"creation_method\":\"%s\",\"start_time\":%ld}\n",
+                        pid, ppid, name_copy, path_copy, esc_cmdline, creation_method, time(NULL));
                 fflush(tf);
                 fclose(tf);
                 
@@ -1726,11 +1739,20 @@ void cleanup(int sig) {
 // YARA callback function for match reporting
 static int yara_callback(YR_SCAN_CONTEXT *context, int message, void *message_data, void *user_data) {
     (void)context;  // Mark as intentionally unused
-    (void)user_data;  // Mark as intentionally unused
     
     if (message == CALLBACK_MSG_RULE_MATCHING) {
         YR_RULE *rule = (YR_RULE *) message_data;
-        printf("[YARA] Match: %s\n", rule->identifier);
+        const char *filename = (const char *)user_data;
+        printf("[YARA] Match: %s in %s\n", rule->identifier, filename ? filename : "unknown");
+        
+        // Report alert if in sandbox mode
+        if (sandbox_mode) {
+            char alert_msg[512];
+            snprintf(alert_msg, sizeof(alert_msg),
+                    "YARA rule '%s' matched in file: %s", 
+                    rule->identifier, filename ? filename : "unknown");
+            report_sandbox_alert("MALWARE_DETECTION", alert_msg, 0);
+        }
     }
     return CALLBACK_CONTINUE;
 }
@@ -1781,7 +1803,7 @@ int scan_with_yara(const char *filename) {
     printf("[YARA] Scanning %s\n", filename);
 
     int result = 0;
-    yr_scanner_set_callback(scanner, yara_callback, NULL);
+    yr_scanner_set_callback(scanner, yara_callback, (void *)filename);
 
     if (yr_scanner_scan_file(scanner, filename) != ERROR_SUCCESS)
         result = -1;
@@ -3228,11 +3250,10 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump the memfd file
-                // Don't dump process memory - dump the memfd file directly
-                if (had_memfd && full_dump) {
-                    printf("[+] Dumping memfd files for PID %u at mmap...\n", pid);
-                    dump_memfd_files(pid);
+                // Don't dump at mmap - shellcode not fully written yet
+                // We'll dump at execve when it's complete
+                if (had_memfd && !quiet_mode) {
+                    printf("[eBPF] mmap after memfd - will dump at execve\n");
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3286,13 +3307,27 @@ void *ebpf_pipe_reader(void *arg) {
                     }
                 }
                 
-                // Queue scan immediately
+                // Queue scan immediately - but do it BEFORE execve completes
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump memfd again at execve (final chance before process replacement)
-                // At this point shellcode should be fully written
-                if (had_memfd && full_dump) {
-                    printf("[+] Final memfd dump at execve for PID %u...\n", pid);
+                // Dump memfd at execve (shellcode fully written, before process replacement)
+                // sys_enter_execve fires BEFORE kernel replaces process
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Scanning and dumping PID %u at execve (before process replacement)...\n", pid);
+                    
+                    // Scan memory IMMEDIATELY before dump (while loader is still in memory)
+                    // This will generate alerts for suspicious regions
+                    scan_maps_and_dump(pid);
+                    
+                    // Report alert for memfd execution
+                    if (sandbox_mode) {
+                        char alert_msg[512];
+                        snprintf(alert_msg, sizeof(alert_msg),
+                                "Fileless execution detected: Process executing from memfd (in-memory file descriptor)");
+                        report_sandbox_alert("FILELESS_EXECUTION", alert_msg, pid);
+                    }
+                    
                     dump_memfd_files(pid);
                 }
             }
@@ -4059,15 +4094,55 @@ int main(int argc, char **argv) {
                                 if (fgets(line, sizeof(line), children_file)) {
                                     // Parse space-separated PIDs
                                     char *token = strtok(line, " \n");
+                                    int child_count = 0;
                                     while (token) {
                                         pid_t child_pid = atoi(token);
                                         if (child_pid > 0) {
+                                            child_count++;
+                                            printf("[+] Found child process: PID %d (parent: %d)\n", 
+                                                   child_pid, sandbox_root_pid);
                                             queue_push(&event_queue, child_pid, sandbox_root_pid);
                                         }
                                         token = strtok(NULL, " \n");
                                     }
+                                    if (child_count > 0 && !quiet_mode) {
+                                        printf("[*] Scanning %d child process(es)\n", child_count);
+                                    }
                                 }
                                 fclose(children_file);
+                            } else if (!quiet_mode) {
+                                // Try alternate method - /proc/PID/task/PID/children might not exist on all kernels
+                                DIR *proc_dir = opendir("/proc");
+                                if (proc_dir) {
+                                    struct dirent *entry;
+                                    while ((entry = readdir(proc_dir)) != NULL) {
+                                        if (!isdigit(entry->d_name[0])) continue;
+                                        
+                                        pid_t potential_child = atoi(entry->d_name);
+                                        if (potential_child <= 0) continue;
+                                        
+                                        // Check if this process's ppid matches sandbox_root_pid
+                                        char stat_path[256];
+                                        snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", potential_child);
+                                        FILE *sf = fopen(stat_path, "r");
+                                        if (sf) {
+                                            char stat_line[2048];
+                                            if (fgets(stat_line, sizeof(stat_line), sf)) {
+                                                char *p = strrchr(stat_line, ')');
+                                                if (p) {
+                                                    int ppid = 0;
+                                                    sscanf(p + 1, " %*c %d", &ppid);
+                                                    if (ppid == sandbox_root_pid) {
+                                                        printf("[+] Found child via /proc scan: PID %d\n", potential_child);
+                                                        queue_push(&event_queue, potential_child, sandbox_root_pid);
+                                                    }
+                                                }
+                                            }
+                                            fclose(sf);
+                                        }
+                                    }
+                                    closedir(proc_dir);
+                                }
                             }
                         
                             last_sandbox_rescan = now;
