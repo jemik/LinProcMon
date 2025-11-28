@@ -2060,15 +2060,15 @@ void dump_memfd_files(pid_t pid) {
     }
 }
 
-// Comprehensive fexecve dumping - handles memfd, anonymous fds, and regular file fds
-// This is the bulletproof approach for catching XOR'd ELFs and other obfuscated loaders
-void dump_all_executable_fds(pid_t pid) {
-    char fd_dir[64];
-    snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+// Dump executable memory regions from /proc/PID/maps
+// This catches XOR'd ELFs, UPX unpacked code, and runtime payloads in memory
+void dump_executable_mappings(pid_t pid) {
+    char maps_path[64];
+    snprintf(maps_path, sizeof(maps_path), "/proc/%d/maps", pid);
     
-    DIR *dir = opendir(fd_dir);
-    if (!dir) {
-        fprintf(stderr, "[-] Cannot open /proc/%d/fd for comprehensive dump\n", pid);
+    FILE *maps = fopen(maps_path, "r");
+    if (!maps) {
+        fprintf(stderr, "[-] Cannot open /proc/%d/maps for dumping\n", pid);
         return;
     }
     
@@ -2086,166 +2086,159 @@ void dump_all_executable_fds(pid_t pid) {
         fclose(comm_file);
     }
     
-    struct dirent *entry;
+    char line[1024];
     int dumps_created = 0;
     
-    printf("[+] Scanning ALL file descriptors in PID %d for executable content...\n", pid);
+    printf("[+] Scanning executable memory regions in PID %d...\n", pid);
     
-    while ((entry = readdir(dir)) != NULL) {
-        if (entry->d_name[0] == '.') continue;
+    while (fgets(line, sizeof(line), maps)) {
+        unsigned long start, end;
+        char perms[5];
+        char path[512] = "";
         
-        char fd_path[128], link_target[512];
-        snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%s", pid, entry->d_name);
+        if (sscanf(line, "%lx-%lx %4s %*s %*s %*s %[^\n]", &start, &end, perms, path) < 3)
+            continue;
         
-        ssize_t len = readlink(fd_path, link_target, sizeof(link_target) - 1);
-        if (len > 0) {
-            link_target[len] = '\0';
+        // Only dump executable regions with suspicious characteristics:
+        // 1. Anonymous executable (RWX shellcode, reflective loading)
+        // 2. memfd executable (fileless execution)
+        // 3. Deleted executable (anti-forensics)
+        // 4. /tmp or /dev/shm executable (suspicious locations)
+        
+        int is_executable = strchr(perms, 'x') != NULL;
+        if (!is_executable) continue;
+        
+        int should_dump = 0;
+        const char *reason = NULL;
+        
+        // Check for suspicious patterns
+        int is_anonymous = (strlen(path) == 0 || path[0] != '/');
+        
+        if (strstr(path, "memfd:") != NULL) {
+            should_dump = 1;
+            reason = "memfd_mapping";
+        } else if (strstr(path, "(deleted)") != NULL) {
+            should_dump = 1;
+            reason = "deleted_mapping";
+        } else if (strstr(path, "/tmp/") != NULL) {
+            should_dump = 1;
+            reason = "tmp_executable";
+        } else if (strstr(path, "/dev/shm") != NULL) {
+            should_dump = 1;
+            reason = "shm_executable";
+        } else if (is_anonymous && 
+                   strstr(path, "[stack]") == NULL &&
+                   strstr(path, "[vdso]") == NULL &&
+                   strstr(path, "[vvar]") == NULL &&
+                   strstr(path, "[vsyscall]") == NULL) {
+            // Anonymous executable (but not kernel pages)
+            should_dump = 1;
+            reason = "anonymous_exec";
+        }
+        
+        if (should_dump) {
+            size_t region_size = end - start;
             
-            // Dump ANY suspicious fd:
-            // 1. memfd: files (fileless execution)
-            // 2. Anonymous pipes/sockets with executable content
-            // 3. Deleted files (anti-forensics)
-            // 4. /dev/shm (shared memory execution)
-            // 5. Regular files that might be XOR'd ELFs
-            
-            int should_dump = 0;
-            const char *reason = NULL;
-            
-            if (strstr(link_target, "memfd:") != NULL) {
-                should_dump = 1;
-                reason = "memfd";
-            } else if (strstr(link_target, "(deleted)") != NULL) {
-                should_dump = 1;
-                reason = "deleted";
-            } else if (strstr(link_target, "/dev/shm") != NULL) {
-                should_dump = 1;
-                reason = "shm";
-            } else if (strstr(link_target, "pipe:") == NULL && 
-                       strstr(link_target, "socket:") == NULL &&
-                       strstr(link_target, "anon_inode") == NULL &&
-                       link_target[0] == '/') {
-                // Regular file - could be XOR'd ELF or encrypted payload
-                // Check if it's actually readable and has content
-                should_dump = 1;
-                reason = "file";
+            // Only dump reasonable sizes (avoid huge mappings, but allow up to 50MB for UPX)
+            if (region_size < 100 || region_size > 50*1024*1024) {
+                continue;
             }
             
-            if (should_dump) {
-                printf("[+] Found suspicious fd in PID %d: fd/%s -> %s [%s]\n", 
-                       pid, entry->d_name, link_target, reason);
-                
-                // Open and dump the fd contents
-                int fd = open(fd_path, O_RDONLY);
-                if (fd < 0) {
-                    fprintf(stderr, "[-] Cannot open fd %s: %s\n", fd_path, strerror(errno));
-                    continue;
-                }
-                
-                // Get file size (may fail for some special files, that's ok)
-                struct stat st;
-                off_t expected_size = 0;
-                if (fstat(fd, &st) == 0) {
-                    expected_size = st.st_size;
-                    printf("[+] FD size: %ld bytes\n", expected_size);
-                }
-                
-                // Skip if too large (> 100MB)
-                if (expected_size > 100*1024*1024) {
-                    printf("[!] FD too large (%ld bytes), skipping\n", expected_size);
-                    close(fd);
-                    continue;
-                }
-                
-                // Create dump file with descriptive name
-                char dump_file[512];
-                const char *safe_name = strrchr(link_target, '/');
-                safe_name = safe_name ? safe_name + 1 : reason;
-                
-                if (sandbox_mode && strlen(sandbox_memdump_dir) > 0) {
-                    snprintf(dump_file, sizeof(dump_file), "%s/fexecve_fd%s_%s_pid%d.bin", 
-                             sandbox_memdump_dir, entry->d_name, safe_name, pid);
-                } else {
-                    snprintf(dump_file, sizeof(dump_file), "fexecve_fd%s_%s_pid%d.bin", 
-                             entry->d_name, safe_name, pid);
-                }
-                
-                int out_fd = open(dump_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (out_fd < 0) {
-                    fprintf(stderr, "[-] Cannot create dump file: %s\n", strerror(errno));
-                    close(fd);
-                    continue;
-                }
-                
-                // Copy fd contents
-                char buffer[8192];
-                ssize_t total = 0;
-                ssize_t n;
-                while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
-                    write(out_fd, buffer, n);
-                    total += n;
-                    
-                    // Safety limit: stop at 100MB even if size unknown
-                    if (total > 100*1024*1024) {
-                        printf("[!] Read limit reached, truncating dump\n");
-                        break;
-                    }
-                }
-                
-                close(fd);
+            printf("[+] Found suspicious executable region: 0x%lx-0x%lx (%zu bytes) [%s] %s\n",
+                   start, end, region_size, reason, path);
+            
+            // Open /proc/PID/mem for reading
+            char mem_path[64];
+            snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
+            int mem_fd = open(mem_path, O_RDONLY);
+            if (mem_fd < 0) {
+                fprintf(stderr, "[-] Cannot open /proc/%d/mem: %s\n", pid, strerror(errno));
+                continue;
+            }
+            
+            // Seek to region start
+            if (lseek(mem_fd, start, SEEK_SET) == -1) {
+                fprintf(stderr, "[-] Cannot seek to 0x%lx: %s\n", start, strerror(errno));
+                close(mem_fd);
+                continue;
+            }
+            
+            // Create dump file
+            char dump_file[512];
+            if (sandbox_mode && strlen(sandbox_memdump_dir) > 0) {
+                snprintf(dump_file, sizeof(dump_file), "%s/memdump_%d_%s_0x%lx.bin",
+                         sandbox_memdump_dir, pid, reason, start);
+            } else {
+                snprintf(dump_file, sizeof(dump_file), "memdump_%d_%s_0x%lx.bin",
+                         pid, reason, start);
+            }
+            
+            int out_fd = open(dump_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (out_fd < 0) {
+                fprintf(stderr, "[-] Cannot create %s: %s\n", dump_file, strerror(errno));
+                close(mem_fd);
+                continue;
+            }
+            
+            // Read and write memory region
+            char *buffer = malloc(region_size);
+            if (!buffer) {
+                fprintf(stderr, "[-] Cannot allocate %zu bytes\n", region_size);
+                close(mem_fd);
+                close(out_fd);
+                unlink(dump_file);
+                continue;
+            }
+            
+            ssize_t bytes_read = read(mem_fd, buffer, region_size);
+            close(mem_fd);
+            
+            if (bytes_read > 0) {
+                ssize_t bytes_written = write(out_fd, buffer, bytes_read);
                 close(out_fd);
                 
-                // Only keep dumps with actual content
-                if (total > 0) {
-                    printf("[+] Dumped fd to %s (%ld bytes)\n", dump_file, total);
+                if (bytes_written == bytes_read) {
+                    printf("[+] Dumped %ld bytes to %s\n", bytes_read, dump_file);
                     dumps_created++;
                     
-                    // Calculate hash and check for ELF signature
+                    // Calculate SHA1 and register
                     char sha1[41];
                     if (calculate_sha1(dump_file, sha1) == 0) {
-                        printf("[+] FD dump SHA-1: %s\n", sha1);
+                        printf("[+] Memory dump SHA-1: %s\n", sha1);
                         
-                        // Check if it's an ELF file (XOR'd ELF detection)
-                        int elf_fd = open(dump_file, O_RDONLY);
-                        if (elf_fd >= 0) {
-                            unsigned char magic[4];
-                            if (read(elf_fd, magic, 4) == 4) {
-                                if (magic[0] == 0x7f && magic[1] == 'E' && 
-                                    magic[2] == 'L' && magic[3] == 'F') {
-                                    printf("[!] DETECTED: ELF binary in fd (likely decrypted/XOR'd payload!)\n");
-                                }
-                            }
-                            close(elf_fd);
+                        // Check for ELF magic
+                        if (bytes_read >= 4 && 
+                            (unsigned char)buffer[0] == 0x7f && buffer[1] == 'E' &&
+                            buffer[2] == 'L' && buffer[3] == 'F') {
+                            printf("[!] DETECTED: ELF binary in memory (XOR'd/decrypted/UPX unpacked!)\n");
                         }
                         
-                        // Use separate memory dump tracking (not EDR telemetry lock)
+                        // Register with SHA1 deduplication
                         if (sandbox_mode) {
                             pthread_mutex_lock(&memdump_mutex);
                             
-                            // Check if this exact dump already exists (SHA1 deduplication)
                             if (!is_duplicate_memdump(sha1)) {
                                 if (memdump_record_count < MAX_MEMDUMP_RECORDS) {
                                     const char *filename = strrchr(dump_file, '/');
                                     filename = filename ? filename + 1 : dump_file;
                                     
                                     memdump_records[memdump_record_count].pid = pid;
-                                    strncpy(memdump_records[memdump_record_count].filename, filename, 
+                                    strncpy(memdump_records[memdump_record_count].filename, filename,
                                             sizeof(memdump_records[0].filename) - 1);
-                                    memdump_records[memdump_record_count].size = total;
-                                    strncpy(memdump_records[memdump_record_count].sha1, sha1, 
+                                    memdump_records[memdump_record_count].size = bytes_read;
+                                    strncpy(memdump_records[memdump_record_count].sha1, sha1,
                                             sizeof(memdump_records[0].sha1) - 1);
                                     memdump_records[memdump_record_count].timestamp = time(NULL);
                                     memdump_records[memdump_record_count].written_to_disk = 1;
                                     memdump_record_count++;
                                     
-                                    // Register to prevent future duplicates
                                     register_memdump(sha1, pid);
                                     
-                                    printf("[+] Registered memory dump %d: %s (SHA1: %s)\n", 
+                                    printf("[+] Registered memory dump %d: %s (SHA1: %s)\n",
                                            memdump_record_count, filename, sha1);
                                 }
                             } else {
                                 printf("[!] Skipping duplicate dump (SHA1: %s already captured)\n", sha1);
-                                // Remove duplicate dump file
                                 unlink(dump_file);
                             }
                             
@@ -2253,19 +2246,24 @@ void dump_all_executable_fds(pid_t pid) {
                         }
                     }
                 } else {
-                    // Remove empty dump
+                    fprintf(stderr, "[-] Write failed for %s\n", dump_file);
                     unlink(dump_file);
                 }
+            } else {
+                fprintf(stderr, "[-] Cannot read memory region 0x%lx-0x%lx: %s\n",
+                        start, end, strerror(errno));
+                close(out_fd);
+                unlink(dump_file);
             }
+            
+            free(buffer);
         }
     }
     
-    closedir(dir);
+    fclose(maps);
     
-    if (dumps_created == 0) {
-        printf("[!] No suspicious file descriptors found in PID %d\n", pid);
-    } else {
-        printf("[+] Created %d file descriptor dumps from PID %d\n", dumps_created, pid);
+    if (dumps_created > 0) {
+        printf("[+] Created %d memory dumps from PID %d\n", dumps_created, pid);
     }
 }
 
@@ -2641,18 +2639,10 @@ void check_exe_link(pid_t pid) {
         if (full_dump) {
             if (sandbox_mode && !is_sandbox_process(pid)) {
                 printf("[DEBUG] PID=%d is memfd but not in sandbox tree, skipping\n", pid);
-            } else if (is_already_dumped(pid)) {
-                printf("[DEBUG] PID=%d already dumped, skipping\n", pid);
             } else {
-                printf("[!] Queueing IMMEDIATE dump for memfd process PID=%d\n", pid);
-                if (dump_queue_push(&dump_queue, pid) == 0) {
-                    pthread_mutex_lock(&stats_mutex);
-                    dumps_performed++;
-                    pthread_mutex_unlock(&stats_mutex);
-                    mark_as_dumped(pid);
-                } else {
-                    printf("[!] Failed to queue dump for PID=%d (queue full)\n", pid);
-                }
+                // Strategy: Dump memfd files directly
+                printf("[+] Dumping memfd files from PID=%d...\n", pid);
+                dump_memfd_files(pid);
             }
         } else {
             printf("[DEBUG] full_dump not enabled, skipping dump\n");
@@ -3266,6 +3256,12 @@ void scan_maps_and_dump(pid_t pid) {
     check_exe_link(pid);
     check_env_vars(pid);
     
+    // BULLETPROOF STRATEGY: After checking exe link, dump executable memory regions
+    // This catches XOR'd ELFs, UPX unpacked code, and runtime payloads
+    if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+        dump_executable_mappings(pid);
+    }
+    
     // Print process info only in verbose mode
     if (!quiet_mode) {
         print_process_info(pid);
@@ -3630,21 +3626,17 @@ void *ebpf_pipe_reader(void *arg) {
                     }
                 }
                 
-                // Queue scan immediately
-                queue_push(&event_queue, pid, 0);
-                
-                // BULLETPROOF DUMPING STRATEGY:
-                // On ANY execve(), dump ALL file descriptors (not just memfd)
-                // This catches:
-                // 1. memfd_create + fexecve (fileless)
-                // 2. XOR'd ELF written to regular fd + fexecve
-                // 3. Encrypted payloads decrypted to fd + fexecve
-                // 4. Deleted files + fexecve
-                // 5. /dev/shm shared memory + fexecve
-                if (full_dump) {
-                    printf("[+] Comprehensive dump: scanning ALL file descriptors for PID %u...\n", pid);
-                    dump_all_executable_fds(pid);
+                // BULLETPROOF MULTI-STRATEGY APPROACH:
+                // Strategy 1: Dump memfd files (original working logic)
+                if (full_dump && had_memfd) {
+                    printf("[+] Strategy 1: Dumping memfd files for PID %u...\n", pid);
+                    dump_memfd_files(pid);
                 }
+                
+                // Strategy 2: Queue immediate memory scan
+                // This catches XOR'd ELFs, UPX unpacking, and runtime payloads
+                // The scan will examine /proc/PID/exe and executable mappings
+                queue_push(&event_queue, pid, 0);
             }
         }
     }
