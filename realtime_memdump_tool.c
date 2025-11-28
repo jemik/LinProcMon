@@ -3073,10 +3073,18 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, DON'T dump yet
-                // Wait for execve to dump when payload is fully written
-                if (had_memfd && !quiet_mode) {
-                    printf("[eBPF] Detected mmap after memfd_create - will dump on execve\n");
+                // If this is after memfd_create, dump NOW (before execve)
+                // This is our ONLY chance before the process replaces itself
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
+                    printf("[+] Dumping PID %u immediately after memfd+mmap (before shellcode writes/execve)...\n", pid);
+                    
+                    // Give the loader a moment to write shellcode to memfd
+                    // Use nanosleep for precise short delay
+                    struct timespec ts = {0, 50000000};  // 50ms
+                    nanosleep(&ts, NULL);
+                    
+                    dump_full_process_memory(pid);
                 }
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
@@ -3133,12 +3141,11 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump on memfd+execve (both UPX and non-UPX)
-                // At this point, shellcode has been written to memfd
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping PID %u after memfd+execve...\n", pid);
-                    dump_full_process_memory(pid);
+                // Don't dump on execve - it's TOO LATE
+                // By the time eBPF event fires, process memory is already replaced
+                // We already dumped at mmap time (before execve)
+                if (had_memfd && !quiet_mode) {
+                    printf("[eBPF] execve after memfd (memory already dumped at mmap)\n");
                 }
             }
         }
