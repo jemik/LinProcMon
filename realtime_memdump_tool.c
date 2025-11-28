@@ -2111,6 +2111,17 @@ void dump_executable_mappings(pid_t pid) {
         int should_dump = 0;
         const char *reason = NULL;
         
+        // Check if this process has memfd flag (indicates fexecve'd process)
+        int is_memfd_process = 0;
+        pthread_mutex_lock(&memfd_pids_mutex);
+        for (int i = 0; i < memfd_pids_count; i++) {
+            if (memfd_pids[i] == pid) {
+                is_memfd_process = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&memfd_pids_mutex);
+        
         // Check for suspicious patterns
         int is_anonymous = (strlen(path) == 0 || path[0] != '/');
         
@@ -2120,9 +2131,10 @@ void dump_executable_mappings(pid_t pid) {
         } else if (strstr(path, "(deleted)") != NULL) {
             should_dump = 1;
             reason = "deleted_mapping";
-        } else if (strstr(path, "/tmp/") != NULL) {
-            should_dump = 1;
-            reason = "tmp_executable";
+        } else if (strstr(path, "/tmp/") != NULL && is_memfd_process) {
+            // For memfd processes, even /tmp mappings might be the original loader stub
+            // But we want the actual payload, so be selective
+            should_dump = 0;  // Skip the original encrypted loader
         } else if (strstr(path, "/dev/shm") != NULL) {
             should_dump = 1;
             reason = "shm_executable";
@@ -2132,8 +2144,14 @@ void dump_executable_mappings(pid_t pid) {
                    strstr(path, "[vvar]") == NULL &&
                    strstr(path, "[vsyscall]") == NULL) {
             // Anonymous executable (but not kernel pages)
+            // For memfd processes, these are HIGH PRIORITY (XOR'd ELF payload!)
             should_dump = 1;
-            reason = "anonymous_exec";
+            reason = is_memfd_process ? "fexecve_payload" : "anonymous_exec";
+        } else if (is_memfd_process && strchr(perms, 'r') && strchr(perms, 'x')) {
+            // For memfd-flagged processes: dump ANY readable+executable region
+            // This is aggressive but necessary to catch all payload variations
+            should_dump = 1;
+            reason = "memfd_exec_region";
         }
         
         if (should_dump) {
@@ -3520,8 +3538,9 @@ int queue_pop(event_queue_t *q, event_data_t *event) {
     return 0;
 }
 
-// Fast-response thread for memfd dumping
-// Spawned immediately when memfd_create is detected to catch fast-exiting loaders
+// Post-execve dump thread for fexecve'd processes
+// Spawned when EXECVE event detected after memfd_create
+// This catches the process AFTER it has replaced itself with the decrypted payload
 void *memfd_dump_thread(void *arg) {
     typedef struct {
         pid_t pid;
@@ -3531,52 +3550,65 @@ void *memfd_dump_thread(void *arg) {
     memfd_dump_ctx_t *ctx = (memfd_dump_ctx_t *)arg;
     pid_t pid = ctx->pid;
     
-    printf("[MEMFD-THREAD] Starting IMMEDIATE dump for PID %d\n", pid);
+    printf("[POST-EXECVE] Starting dump for transformed PID %d\n", pid);
     
-    // NO DELAY - dump immediately!
-    // The memfd is created and written to instantly, fexecve happens in microseconds
-    // We need to catch it RIGHT NOW before it exits
+    // Small initial delay to let fexecve complete and mappings stabilize
+    // fexecve() replaces the process but needs a few milliseconds to set up mappings
+    usleep(20000);  // 20ms
     
-    // Try multiple times with small delays between attempts
-    // This handles the race between write() completion and fexecve()
-    for (int attempt = 0; attempt < 5; attempt++) {
+    // Track if we got any useful dumps
+    int initial_dump_count = 0;
+    pthread_mutex_lock(&memdump_mutex);
+    initial_dump_count = memdump_record_count;
+    pthread_mutex_unlock(&memdump_mutex);
+    
+    // Retry multiple times - process exits in ~2 seconds, we have a window
+    for (int attempt = 0; attempt < 10; attempt++) {
         // Verify process still exists
         char proc_check[64];
         snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
         if (access(proc_check, F_OK) != 0) {
-            printf("[MEMFD-THREAD] PID %d exited (attempt %d)\n", pid, attempt + 1);
-            free(ctx);
-            return NULL;
+            printf("[POST-EXECVE] PID %d exited after attempt %d\n", pid, attempt + 1);
+            break;
         }
         
         // Verify it's still a sandbox process
         if (sandbox_mode && !is_sandbox_process(pid)) {
-            printf("[MEMFD-THREAD] PID %d not in sandbox tree (attempt %d)\n", pid, attempt + 1);
-            free(ctx);
-            return NULL;
-        }
-        
-        printf("[MEMFD-THREAD] PID %d alive (attempt %d), dumping...\n", pid, attempt + 1);
-        
-        // MULTI-STRATEGY DUMP:
-        // 1. Try /proc/PID/fd (might fail if fexecve consumed fd)
-        dump_memfd_files(pid);
-        
-        // 2. Dump from /proc/PID/maps (CRITICAL - works after fexecve!)
-        dump_executable_mappings(pid);
-        
-        // Check if we got any dumps
-        pthread_mutex_lock(&memdump_mutex);
-        int dump_count = memdump_record_count;
-        pthread_mutex_unlock(&memdump_mutex);
-        
-        if (dump_count > 0) {
-            printf("[MEMFD-THREAD] Success! Got %d dumps for PID %d\n", dump_count, pid);
+            printf("[POST-EXECVE] PID %d left sandbox tree\n", pid);
             break;
         }
         
-        // Small delay before retry (10ms)
-        usleep(10000);
+        // Check /proc/PID/exe to see the transformation
+        char exe_path[512];
+        char exe_link[64];
+        snprintf(exe_link, sizeof(exe_link), "/proc/%d/exe", pid);
+        ssize_t len = readlink(exe_link, exe_path, sizeof(exe_path) - 1);
+        if (len > 0) {
+            exe_path[len] = '\0';
+            if (attempt == 0) {
+                printf("[POST-EXECVE] PID %d exe: %s\n", pid, exe_path);
+            }
+        }
+        
+        printf("[POST-EXECVE] Attempt %d: Dumping memory mappings for PID %d...\n", attempt + 1, pid);
+        
+        // PRIMARY STRATEGY: Dump ALL executable mappings
+        // For fexecve'd processes, the decrypted ELF is now in memory
+        dump_executable_mappings(pid);
+        
+        // Check if we got new dumps
+        pthread_mutex_lock(&memdump_mutex);
+        int current_dump_count = memdump_record_count;
+        pthread_mutex_unlock(&memdump_mutex);
+        
+        if (current_dump_count > initial_dump_count) {
+            printf("[POST-EXECVE] SUCCESS! Captured %d new dumps for PID %d\n", 
+                   current_dump_count - initial_dump_count, pid);
+            break;
+        }
+        
+        // Retry with increasing delay (20ms -> 200ms over 10 attempts)
+        usleep(20000 + (attempt * 20000));
     }
     
     // Also ensure we report this process
@@ -3703,43 +3735,14 @@ void *ebpf_pipe_reader(void *arg) {
                 // Mark this PID - for future MMAP/EXECVE events
                 mark_memfd_pid(pid);
                 
-                // CRITICAL FIX: fexecve() loaders exit in ~2 seconds
-                // Standard queue processing is TOO SLOW (worker thread has other events)
+                // CRITICAL: memfd_create() is called BEFORE fexecve()
+                // If we dump now, we'll only get the encrypted loader or empty fd
                 // 
-                // SOLUTION: Spawn dedicated thread for immediate processing
-                // This gives the process time to fexecve() (replace itself)
-                // but dumps BEFORE it exits
+                // STRATEGY: Just mark the PID and wait for EXECVE event
+                // The EXECVE event fires AFTER fexecve() replaces the process
+                // At that point /proc/PID/maps shows the decrypted ELF mappings
                 
-                if (full_dump) {
-                    // Create thread context for async dump
-                    typedef struct {
-                        pid_t pid;
-                        char comm[16];
-                    } memfd_dump_ctx_t;
-                    
-                    memfd_dump_ctx_t *ctx = malloc(sizeof(memfd_dump_ctx_t));
-                    if (ctx) {
-                        ctx->pid = pid;
-                        strncpy(ctx->comm, comm, sizeof(ctx->comm) - 1);
-                        ctx->comm[sizeof(ctx->comm) - 1] = '\0';
-                        
-                        // Spawn dedicated fast-response thread
-                        pthread_t dump_thread;
-                        pthread_attr_t attr;
-                        pthread_attr_init(&attr);
-                        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
-                        
-                        // Thread will handle the dump asynchronously
-                        extern void *memfd_dump_thread(void *arg);
-                        if (pthread_create(&dump_thread, &attr, memfd_dump_thread, ctx) != 0) {
-                            fprintf(stderr, "[!] Failed to spawn memfd dump thread\n");
-                            free(ctx);
-                        }
-                        
-                        pthread_attr_destroy(&attr);
-                        printf("[+] Fast-track thread spawned for PID %u\n", pid);
-                    }
-                }
+                printf("[+] memfd PID %u marked - will dump after execve()\n", pid);
                 
                 // Also queue for regular scanning (backup)
                 queue_push(&event_queue, pid, 0);
@@ -3750,27 +3753,62 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Check if memfd flag is set
-                int had_memfd = check_and_clear_memfd_pid(pid);
+                // Check if memfd flag is set (but DON'T clear it yet)
+                int had_memfd = 0;
+                pthread_mutex_lock(&memfd_pids_mutex);
+                for (int i = 0; i < memfd_pids_count; i++) {
+                    if (memfd_pids[i] == pid) {
+                        had_memfd = 1;
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&memfd_pids_mutex);
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - DUMPING NOW\n", pid, comm);
+                        printf("[eBPF] execve() AFTER memfd in PID %u (%s) - CRITICAL DUMP POINT\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
                 
-                // BULLETPROOF MULTI-STRATEGY APPROACH:
-                // Strategy 1: Dump memfd files (original working logic)
+                // BULLETPROOF STRATEGY FOR MEMFD+EXECVE:
+                // This is fexecve() - process just replaced itself with decrypted ELF
+                // The memory mappings NOW contain the real payload
+                // We MUST dump immediately before process exits (typically 1-2 seconds)
                 if (full_dump && had_memfd) {
-                    printf("[+] Strategy 1: Dumping memfd files for PID %u...\n", pid);
-                    dump_memfd_files(pid);
+                    // Create thread context for async dump
+                    typedef struct {
+                        pid_t pid;
+                        char comm[16];
+                    } execve_dump_ctx_t;
+                    
+                    execve_dump_ctx_t *ctx = malloc(sizeof(execve_dump_ctx_t));
+                    if (ctx) {
+                        ctx->pid = pid;
+                        strncpy(ctx->comm, comm, sizeof(ctx->comm) - 1);
+                        ctx->comm[sizeof(ctx->comm) - 1] = '\0';
+                        
+                        // Spawn dedicated post-execve dump thread
+                        pthread_t dump_thread;
+                        pthread_attr_t attr;
+                        pthread_attr_init(&attr);
+                        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+                        
+                        // Thread will dump the transformed process
+                        extern void *memfd_dump_thread(void *arg);
+                        if (pthread_create(&dump_thread, &attr, memfd_dump_thread, ctx) != 0) {
+                            fprintf(stderr, "[!] Failed to spawn post-execve dump thread\n");
+                            free(ctx);
+                        } else {
+                            printf("[+] Post-execve dump thread spawned for PID %u\n", pid);
+                        }
+                        
+                        pthread_attr_destroy(&attr);
+                    }
                 }
                 
-                // Strategy 2: Queue immediate memory scan
-                // This catches XOR'd ELFs, UPX unpacking, and runtime payloads
-                // The scan will examine /proc/PID/exe and executable mappings
+                // Queue immediate scan for all processes
                 queue_push(&event_queue, pid, 0);
             }
         }
