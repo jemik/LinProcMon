@@ -3531,44 +3531,59 @@ void *memfd_dump_thread(void *arg) {
     memfd_dump_ctx_t *ctx = (memfd_dump_ctx_t *)arg;
     pid_t pid = ctx->pid;
     
-    printf("[MEMFD-THREAD] Starting fast-response dump for PID %d\n", pid);
+    printf("[MEMFD-THREAD] Starting IMMEDIATE dump for PID %d\n", pid);
     
-    // TIMING STRATEGY:
-    // 1. Wait 100ms for fexecve() to complete (process replacement)
-    // 2. Dump immediately before process exits (~2 seconds total lifetime)
-    usleep(100000);  // 100ms delay
+    // NO DELAY - dump immediately!
+    // The memfd is created and written to instantly, fexecve happens in microseconds
+    // We need to catch it RIGHT NOW before it exits
     
-    // Verify process still exists
-    char proc_check[64];
-    snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
-    if (access(proc_check, F_OK) != 0) {
-        printf("[MEMFD-THREAD] PID %d already exited\n", pid);
-        free(ctx);
-        return NULL;
+    // Try multiple times with small delays between attempts
+    // This handles the race between write() completion and fexecve()
+    for (int attempt = 0; attempt < 5; attempt++) {
+        // Verify process still exists
+        char proc_check[64];
+        snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
+        if (access(proc_check, F_OK) != 0) {
+            printf("[MEMFD-THREAD] PID %d exited (attempt %d)\n", pid, attempt + 1);
+            free(ctx);
+            return NULL;
+        }
+        
+        // Verify it's still a sandbox process
+        if (sandbox_mode && !is_sandbox_process(pid)) {
+            printf("[MEMFD-THREAD] PID %d not in sandbox tree (attempt %d)\n", pid, attempt + 1);
+            free(ctx);
+            return NULL;
+        }
+        
+        printf("[MEMFD-THREAD] PID %d alive (attempt %d), dumping...\n", pid, attempt + 1);
+        
+        // MULTI-STRATEGY DUMP:
+        // 1. Try /proc/PID/fd (might fail if fexecve consumed fd)
+        dump_memfd_files(pid);
+        
+        // 2. Dump from /proc/PID/maps (CRITICAL - works after fexecve!)
+        dump_executable_mappings(pid);
+        
+        // Check if we got any dumps
+        pthread_mutex_lock(&memdump_mutex);
+        int dump_count = memdump_record_count;
+        pthread_mutex_unlock(&memdump_mutex);
+        
+        if (dump_count > 0) {
+            printf("[MEMFD-THREAD] Success! Got %d dumps for PID %d\n", dump_count, pid);
+            break;
+        }
+        
+        // Small delay before retry (10ms)
+        usleep(10000);
     }
     
-    // Verify it's still a sandbox process
-    if (sandbox_mode && !is_sandbox_process(pid)) {
-        printf("[MEMFD-THREAD] PID %d not in sandbox tree\n", pid);
-        free(ctx);
-        return NULL;
-    }
-    
-    printf("[MEMFD-THREAD] PID %d still alive, executing dump...\n", pid);
-    
-    // MULTI-STRATEGY DUMP:
-    // 1. Try /proc/PID/fd (might fail if fexecve consumed fd)
-    dump_memfd_files(pid);
-    
-    // 2. Dump from /proc/PID/maps (CRITICAL - works after fexecve!)
-    printf("[MEMFD-THREAD] Dumping executable mappings for PID %d...\n", pid);
-    dump_executable_mappings(pid);
-    
-    // 3. Also run full scan for completeness
-    printf("[MEMFD-THREAD] Running comprehensive scan for PID %d...\n", pid);
+    // Also ensure we report this process
+    printf("[MEMFD-THREAD] Triggering full scan for PID %d...\n", pid);
     scan_maps_and_dump(pid);
     
-    printf("[MEMFD-THREAD] Completed dump for PID %d\n", pid);
+    printf("[MEMFD-THREAD] Completed for PID %d\n", pid);
     
     free(ctx);
     return NULL;
