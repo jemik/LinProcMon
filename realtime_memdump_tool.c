@@ -2060,6 +2060,215 @@ void dump_memfd_files(pid_t pid) {
     }
 }
 
+// Comprehensive fexecve dumping - handles memfd, anonymous fds, and regular file fds
+// This is the bulletproof approach for catching XOR'd ELFs and other obfuscated loaders
+void dump_all_executable_fds(pid_t pid) {
+    char fd_dir[64];
+    snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+    
+    DIR *dir = opendir(fd_dir);
+    if (!dir) {
+        fprintf(stderr, "[-] Cannot open /proc/%d/fd for comprehensive dump\n", pid);
+        return;
+    }
+    
+    // Get process name
+    char comm[256] = "unknown";
+    char comm_path[64];
+    snprintf(comm_path, sizeof(comm_path), "/proc/%d/comm", pid);
+    FILE *comm_file = fopen(comm_path, "r");
+    if (comm_file) {
+        if (fgets(comm, sizeof(comm), comm_file)) {
+            size_t len = strlen(comm);
+            if (len > 0 && comm[len-1] == '\n')
+                comm[len-1] = '\0';
+        }
+        fclose(comm_file);
+    }
+    
+    struct dirent *entry;
+    int dumps_created = 0;
+    
+    printf("[+] Scanning ALL file descriptors in PID %d for executable content...\n", pid);
+    
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        
+        char fd_path[128], link_target[512];
+        snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%s", pid, entry->d_name);
+        
+        ssize_t len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+        if (len > 0) {
+            link_target[len] = '\0';
+            
+            // Dump ANY suspicious fd:
+            // 1. memfd: files (fileless execution)
+            // 2. Anonymous pipes/sockets with executable content
+            // 3. Deleted files (anti-forensics)
+            // 4. /dev/shm (shared memory execution)
+            // 5. Regular files that might be XOR'd ELFs
+            
+            int should_dump = 0;
+            const char *reason = NULL;
+            
+            if (strstr(link_target, "memfd:") != NULL) {
+                should_dump = 1;
+                reason = "memfd";
+            } else if (strstr(link_target, "(deleted)") != NULL) {
+                should_dump = 1;
+                reason = "deleted";
+            } else if (strstr(link_target, "/dev/shm") != NULL) {
+                should_dump = 1;
+                reason = "shm";
+            } else if (strstr(link_target, "pipe:") == NULL && 
+                       strstr(link_target, "socket:") == NULL &&
+                       strstr(link_target, "anon_inode") == NULL &&
+                       link_target[0] == '/') {
+                // Regular file - could be XOR'd ELF or encrypted payload
+                // Check if it's actually readable and has content
+                should_dump = 1;
+                reason = "file";
+            }
+            
+            if (should_dump) {
+                printf("[+] Found suspicious fd in PID %d: fd/%s -> %s [%s]\n", 
+                       pid, entry->d_name, link_target, reason);
+                
+                // Open and dump the fd contents
+                int fd = open(fd_path, O_RDONLY);
+                if (fd < 0) {
+                    fprintf(stderr, "[-] Cannot open fd %s: %s\n", fd_path, strerror(errno));
+                    continue;
+                }
+                
+                // Get file size (may fail for some special files, that's ok)
+                struct stat st;
+                off_t expected_size = 0;
+                if (fstat(fd, &st) == 0) {
+                    expected_size = st.st_size;
+                    printf("[+] FD size: %ld bytes\n", expected_size);
+                }
+                
+                // Skip if too large (> 100MB)
+                if (expected_size > 100*1024*1024) {
+                    printf("[!] FD too large (%ld bytes), skipping\n", expected_size);
+                    close(fd);
+                    continue;
+                }
+                
+                // Create dump file with descriptive name
+                char dump_file[512];
+                const char *safe_name = strrchr(link_target, '/');
+                safe_name = safe_name ? safe_name + 1 : reason;
+                
+                if (sandbox_mode && strlen(sandbox_memdump_dir) > 0) {
+                    snprintf(dump_file, sizeof(dump_file), "%s/fexecve_fd%s_%s_pid%d.bin", 
+                             sandbox_memdump_dir, entry->d_name, safe_name, pid);
+                } else {
+                    snprintf(dump_file, sizeof(dump_file), "fexecve_fd%s_%s_pid%d.bin", 
+                             entry->d_name, safe_name, pid);
+                }
+                
+                int out_fd = open(dump_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (out_fd < 0) {
+                    fprintf(stderr, "[-] Cannot create dump file: %s\n", strerror(errno));
+                    close(fd);
+                    continue;
+                }
+                
+                // Copy fd contents
+                char buffer[8192];
+                ssize_t total = 0;
+                ssize_t n;
+                while ((n = read(fd, buffer, sizeof(buffer))) > 0) {
+                    write(out_fd, buffer, n);
+                    total += n;
+                    
+                    // Safety limit: stop at 100MB even if size unknown
+                    if (total > 100*1024*1024) {
+                        printf("[!] Read limit reached, truncating dump\n");
+                        break;
+                    }
+                }
+                
+                close(fd);
+                close(out_fd);
+                
+                // Only keep dumps with actual content
+                if (total > 0) {
+                    printf("[+] Dumped fd to %s (%ld bytes)\n", dump_file, total);
+                    dumps_created++;
+                    
+                    // Calculate hash and check for ELF signature
+                    char sha1[41];
+                    if (calculate_sha1(dump_file, sha1) == 0) {
+                        printf("[+] FD dump SHA-1: %s\n", sha1);
+                        
+                        // Check if it's an ELF file (XOR'd ELF detection)
+                        int elf_fd = open(dump_file, O_RDONLY);
+                        if (elf_fd >= 0) {
+                            unsigned char magic[4];
+                            if (read(elf_fd, magic, 4) == 4) {
+                                if (magic[0] == 0x7f && magic[1] == 'E' && 
+                                    magic[2] == 'L' && magic[3] == 'F') {
+                                    printf("[!] DETECTED: ELF binary in fd (likely decrypted/XOR'd payload!)\n");
+                                }
+                            }
+                            close(elf_fd);
+                        }
+                        
+                        // Use separate memory dump tracking (not EDR telemetry lock)
+                        if (sandbox_mode) {
+                            pthread_mutex_lock(&memdump_mutex);
+                            
+                            // Check if this exact dump already exists (SHA1 deduplication)
+                            if (!is_duplicate_memdump(sha1)) {
+                                if (memdump_record_count < MAX_MEMDUMP_RECORDS) {
+                                    const char *filename = strrchr(dump_file, '/');
+                                    filename = filename ? filename + 1 : dump_file;
+                                    
+                                    memdump_records[memdump_record_count].pid = pid;
+                                    strncpy(memdump_records[memdump_record_count].filename, filename, 
+                                            sizeof(memdump_records[0].filename) - 1);
+                                    memdump_records[memdump_record_count].size = total;
+                                    strncpy(memdump_records[memdump_record_count].sha1, sha1, 
+                                            sizeof(memdump_records[0].sha1) - 1);
+                                    memdump_records[memdump_record_count].timestamp = time(NULL);
+                                    memdump_records[memdump_record_count].written_to_disk = 1;
+                                    memdump_record_count++;
+                                    
+                                    // Register to prevent future duplicates
+                                    register_memdump(sha1, pid);
+                                    
+                                    printf("[+] Registered memory dump %d: %s (SHA1: %s)\n", 
+                                           memdump_record_count, filename, sha1);
+                                }
+                            } else {
+                                printf("[!] Skipping duplicate dump (SHA1: %s already captured)\n", sha1);
+                                // Remove duplicate dump file
+                                unlink(dump_file);
+                            }
+                            
+                            pthread_mutex_unlock(&memdump_mutex);
+                        }
+                    }
+                } else {
+                    // Remove empty dump
+                    unlink(dump_file);
+                }
+            }
+        }
+    }
+    
+    closedir(dir);
+    
+    if (dumps_created == 0) {
+        printf("[!] No suspicious file descriptors found in PID %d\n", pid);
+    } else {
+        printf("[+] Created %d file descriptor dumps from PID %d\n", dumps_created, pid);
+    }
+}
+
 // Dump all memory regions of a process for dynamic unpacking analysis
 // Creates a single contiguous dump file for easy reverse engineering
 void dump_full_process_memory(pid_t pid) {
@@ -3424,10 +3633,17 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump memfd at execve (shellcode fully written)
-                if (had_memfd && full_dump) {
-                    printf("[+] Dumping memfd files at execve for PID %u...\n", pid);
-                    dump_memfd_files(pid);
+                // BULLETPROOF DUMPING STRATEGY:
+                // On ANY execve(), dump ALL file descriptors (not just memfd)
+                // This catches:
+                // 1. memfd_create + fexecve (fileless)
+                // 2. XOR'd ELF written to regular fd + fexecve
+                // 3. Encrypted payloads decrypted to fd + fexecve
+                // 4. Deleted files + fexecve
+                // 5. /dev/shm shared memory + fexecve
+                if (full_dump) {
+                    printf("[+] Comprehensive dump: scanning ALL file descriptors for PID %u...\n", pid);
+                    dump_all_executable_fds(pid);
                 }
             }
         }
