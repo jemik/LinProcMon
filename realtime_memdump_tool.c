@@ -3743,20 +3743,27 @@ void *ebpf_pipe_reader(void *arg) {
                 // Mark this PID for tracking
                 mark_memfd_pid(pid);
                 
-                // CRITICAL: For fexecve loaders, we must dump IMMEDIATELY
-                // The loader will: write(decrypted_elf) -> fexecve() -> exit in microseconds
-                // If we wait for EXECVE event or queue processing, it's too late
+                // CRITICAL: For fexecve loaders, timing is everything
+                // The loader will: write(decrypted_elf) -> fexecve() -> process continues
+                // We need to dump AFTER fexecve() but BEFORE process exits
+                //
+                // STRATEGY: Retry multiple times with increasing delays
+                // This catches the process at different stages of execution
                 if (full_dump && sandbox_mode) {
-                    printf("[+] Fast-path: Dumping memfd from PID %u immediately...\n", pid);
+                    printf("[+] Fast-path: Multi-attempt dump for PID %u...\n", pid);
                     
-                    // Small delay to let write() complete (loader needs time to decrypt and write)
-                    usleep(50000);  // 50ms - enough for write() to complete, fast enough to catch fexecve
-                    
-                    // Try to dump from fd first (might work before fexecve)
+                    // Attempt 1: Immediate (might catch fd before fexecve)
                     dump_memfd_files(pid);
                     
-                    // Also scan process state (will detect memfd execution if fexecve already happened)
-                    scan_maps_and_dump(pid);
+                    // Attempt 2: After 20ms (likely after fexecve, before exit)
+                    usleep(20000);
+                    check_exe_link(pid);  // Detects memfd execution and dumps
+                    dump_executable_mappings(pid);
+                    
+                    // Attempt 3: After another 50ms (backup if process slow)
+                    usleep(50000);
+                    check_exe_link(pid);
+                    dump_executable_mappings(pid);
                 }
                 
                 // Also queue for worker thread (backup)
