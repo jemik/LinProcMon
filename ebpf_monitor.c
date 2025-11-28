@@ -184,4 +184,26 @@ int trace_execve(struct syscall_trace_enter *ctx) {
     return 0;
 }
 
+// Hook: sys_execveat (used by fexecve())
+SEC("tracepoint/syscalls/sys_enter_execveat")
+int trace_execveat(struct syscall_trace_enter *ctx) {
+    struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        return 0;
+    }
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
+    e->addr = ctx->args[1];  // pathname pointer (args[0] is dirfd)
+    e->len = 0;
+    e->prot = 0;
+    e->flags = 0;
+    e->event_type = EVENT_EXECVE;
+    get_task_comm(e->comm, sizeof(e->comm));
+    
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
 char LICENSE[] SEC("license") = "GPL";
