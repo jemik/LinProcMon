@@ -3768,17 +3768,21 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 if (!quiet_mode) {
                     if (had_memfd) {
-                        printf("[eBPF] execve() after memfd_create in PID %u (%s) - queueing for dump\n", pid, comm);
+                        printf("[eBPF] execve() after memfd_create in PID %u (%s) - IMMEDIATE DUMP\n", pid, comm);
                     } else {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
                 }
                 
-                // Queue for immediate processing by worker thread
-                // scan_maps_and_dump() will:
-                // 1. call check_exe_link() which detects /proc/PID/exe -> /memfd:...
-                // 2. call dump_executable_mappings() which dumps the payload from memory
-                queue_push(&event_queue, pid, 0);
+                // CRITICAL FIX: For memfd+execve (fexecve), process exits in ~2 seconds
+                // Queue processing is too slow - dump IMMEDIATELY in eBPF reader thread
+                if (full_dump && had_memfd && sandbox_mode) {
+                    printf("[+] Fast-path: Scanning PID %u immediately (fexecve detected)...\n", pid);
+                    scan_maps_and_dump(pid);
+                } else {
+                    // Queue for normal processing
+                    queue_push(&event_queue, pid, 0);
+                }
             }
         }
     }
