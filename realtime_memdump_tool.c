@@ -3233,13 +3233,8 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue immediate scan
                 queue_push(&event_queue, pid, 0);
                 
-                // If this is after memfd_create, dump the memfd file
-                // Don't dump process memory - dump the memfd file directly
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Dumping memfd files for PID %u at mmap...\n", pid);
-                    dump_memfd_files(pid);
-                }
+                // Don't dump at mmap - wait for execve
+                // The shellcode may not be fully written yet at mmap time
                 
             } else if (event_type == 2) {  // MPROTECT_EXEC
                 // In sandbox mode, check if this PID is in sandbox tree
@@ -3295,11 +3290,9 @@ void *ebpf_pipe_reader(void *arg) {
                 // Queue scan immediately
                 queue_push(&event_queue, pid, 0);
                 
-                // Dump memfd again at execve (final chance before process replacement)
-                // At this point shellcode should be fully written
-                if (had_memfd && full_dump && !is_already_dumped(pid)) {
-                    mark_as_dumped(pid);
-                    printf("[+] Final memfd dump at execve for PID %u...\n", pid);
+                // Dump memfd at execve (shellcode fully written)
+                if (had_memfd && full_dump) {
+                    printf("[+] Dumping memfd files at execve for PID %u...\n", pid);
                     dump_memfd_files(pid);
                 }
             }
