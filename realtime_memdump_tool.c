@@ -3235,7 +3235,8 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 // If this is after memfd_create, dump the memfd file
                 // Don't dump process memory - dump the memfd file directly
-                if (had_memfd && full_dump) {
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
                     printf("[+] Dumping memfd files for PID %u at mmap...\n", pid);
                     dump_memfd_files(pid);
                 }
@@ -3296,7 +3297,8 @@ void *ebpf_pipe_reader(void *arg) {
                 
                 // Dump memfd again at execve (final chance before process replacement)
                 // At this point shellcode should be fully written
-                if (had_memfd && full_dump) {
+                if (had_memfd && full_dump && !is_already_dumped(pid)) {
+                    mark_as_dumped(pid);
                     printf("[+] Final memfd dump at execve for PID %u...\n", pid);
                     dump_memfd_files(pid);
                 }
@@ -3843,6 +3845,7 @@ int main(int argc, char **argv) {
         sandbox_processes[0].start_time = sandbox_start_time;
         snprintf(sandbox_processes[0].name, sizeof(sandbox_processes[0].name), "sandbox_root");
         snprintf(sandbox_processes[0].path, sizeof(sandbox_processes[0].path), "%s", sandbox_binary);
+        snprintf(sandbox_processes[0].creation_method, sizeof(sandbox_processes[0].creation_method), "SPAWN");
         sandbox_process_count = 1;
         
         // Write root process to temp file immediately
@@ -3859,7 +3862,7 @@ int main(int argc, char **argv) {
                 
                 const char *esc_cmdline = json_escape(sandbox_binary);
                 
-                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"sandbox_root\",\"path\":\"%s\",\"cmdline\":\"%s\",\"start_time\":%ld}\n",
+                fprintf(tf, "{\"pid\":%d,\"ppid\":%d,\"name\":\"sandbox_root\",\"path\":\"%s\",\"cmdline\":\"%s\",\"creation_method\":\"SPAWN\",\"start_time\":%ld}\n",
                         sandbox_root_pid, getpid(), path_copy, esc_cmdline, sandbox_start_time);
                 fflush(tf);
                 fclose(tf);
