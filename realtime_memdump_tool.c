@@ -985,6 +985,39 @@ void report_sandbox_process(pid_t pid, pid_t ppid, const char *name, const char 
     pthread_mutex_unlock(&sandbox_proc_mutex);
 }
 
+// Add alert to sandbox report
+void report_sandbox_alert(const char *alert_type, const char *message, pid_t pid) {
+    if (!sandbox_mode || strlen(sandbox_report_dir) == 0) return;
+    if (alerts_written >= MAX_ALERTS_TO_FILE) return;
+    
+    // Safety: ensure strings are not NULL
+    if (!alert_type) alert_type = "UNKNOWN";
+    if (!message) message = "No description";
+    
+    char alert_tmp[600];
+    snprintf(alert_tmp, sizeof(alert_tmp), "%s/.alerts.tmp", sandbox_report_dir);
+    FILE *af = fopen(alert_tmp, "a");
+    if (af) {
+        // Escape strings separately to avoid buffer reuse
+        const char *esc_type = json_escape(alert_type);
+        char type_copy[256];
+        strncpy(type_copy, esc_type, sizeof(type_copy) - 1);
+        type_copy[sizeof(type_copy) - 1] = '\0';
+        
+        const char *esc_msg = json_escape(message);
+        
+        fprintf(af, "{\"pid\":%d,\"type\":\"%s\",\"message\":\"%s\",\"timestamp\":%ld}\n",
+                pid, type_copy, esc_msg, time(NULL));
+        fflush(af);
+        fclose(af);
+        __sync_fetch_and_add(&alerts_written, 1);
+        
+        if (alerts_written == MAX_ALERTS_TO_FILE) {
+            fprintf(stderr, "[!] WARN: Alert limit (%d) reached, no more alerts will be written to file\n", MAX_ALERTS_TO_FILE);
+        }
+    }
+}
+
 // Add file operation to report
 // Add file operation to report (async - non-blocking)
 void report_file_operation(pid_t pid, const char *operation, const char *filepath, int risk_score, const char *category) {
