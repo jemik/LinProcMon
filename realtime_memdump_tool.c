@@ -3257,12 +3257,12 @@ void scan_maps_and_dump(pid_t pid) {
     check_env_vars(pid);
     
     // CRITICAL: Check if this PID has memfd flag set (from MEMFD_CREATE event)
-    // If so, dump memfd files immediately - this catches fexecve() loaders
-    // that don't generate EXECVE events
+    // For memfd processes, we use a MULTI-STRATEGY approach:
+    // 1. Try dump from /proc/PID/fd (works if fd still open)
+    // 2. Dump from /proc/PID/maps (works after fexecve when fd is consumed)
+    int has_memfd = 0;
     if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
-        // Check if memfd flag is set (don't clear it yet)
         pthread_mutex_lock(&memfd_pids_mutex);
-        int has_memfd = 0;
         for (int i = 0; i < memfd_pids_count; i++) {
             if (memfd_pids[i] == pid) {
                 has_memfd = 1;
@@ -3272,14 +3272,21 @@ void scan_maps_and_dump(pid_t pid) {
         pthread_mutex_unlock(&memfd_pids_mutex);
         
         if (has_memfd) {
-            printf("[+] PID %d has memfd flag - dumping memfd files NOW...\n", pid);
+            printf("[+] PID %d has memfd flag - using multi-strategy dump...\n", pid);
+            // Try fd-based dump first (might fail if fexecve already consumed it)
             dump_memfd_files(pid);
         }
     }
     
-    // BULLETPROOF STRATEGY: After checking exe link, dump executable memory regions
-    // This catches XOR'd ELFs, UPX unpacked code, and runtime payloads
+    // BULLETPROOF STRATEGY: Dump executable memory regions
+    // This catches:
+    // - XOR'd ELFs and UPX unpacked code
+    // - memfd processes AFTER fexecve (fd consumed but memory remains!)
+    // - Runtime payloads
     if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+        if (has_memfd) {
+            printf("[+] Dumping memfd process from memory maps (post-fexecve)...\n");
+        }
         dump_executable_mappings(pid);
     }
     
@@ -3620,22 +3627,25 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] memfd_create() detected in PID %u (%s) - will dump memfd contents\n",
+                    printf("[eBPF] memfd_create() detected in PID %u (%s) - will dump after fexecve\n",
                            pid, comm);
                 }
                 
-                // Mark this PID - we'll dump on the NEXT mmap(PROT_EXEC) or EXECVE
+                // Mark this PID - for future MMAP/EXECVE events
                 mark_memfd_pid(pid);
                 
-                // CRITICAL FIX: For fexecve() loaders that don't generate EXECVE events,
-                // we need to queue for immediate scanning and dumping
-                // This catches XOR'd ELF loaders that:
-                // 1. memfd_create()
-                // 2. write(decrypted_elf)  
-                // 3. fexecve() → replaces process in-place (no EXECVE event!)
-                // 4. exits quickly
+                // CRITICAL FIX: For fexecve() loaders, the fd is consumed by fexecve()
+                // and no longer accessible in /proc/PID/fd after the call.
+                // We CANNOT dump the fd directly - we must wait for the process to
+                // be replaced by fexecve(), then dump from /proc/PID/maps.
                 //
-                // Queue scan with priority - worker will check for memfd flag and dump
+                // Strategy: Queue for IMMEDIATE scanning - the worker will:
+                // 1. Check exe link (detects /memfd:xxx)
+                // 2. dump_executable_mappings() - captures from /proc/PID/maps
+                //
+                // This works because after fexecve(), the process memory contains
+                // the decrypted ELF, even if the fd is gone.
+                
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
