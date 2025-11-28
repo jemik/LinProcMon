@@ -3256,6 +3256,27 @@ void scan_maps_and_dump(pid_t pid) {
     check_exe_link(pid);
     check_env_vars(pid);
     
+    // CRITICAL: Check if this PID has memfd flag set (from MEMFD_CREATE event)
+    // If so, dump memfd files immediately - this catches fexecve() loaders
+    // that don't generate EXECVE events
+    if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
+        // Check if memfd flag is set (don't clear it yet)
+        pthread_mutex_lock(&memfd_pids_mutex);
+        int has_memfd = 0;
+        for (int i = 0; i < memfd_pids_count; i++) {
+            if (memfd_pids[i] == pid) {
+                has_memfd = 1;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&memfd_pids_mutex);
+        
+        if (has_memfd) {
+            printf("[+] PID %d has memfd flag - dumping memfd files NOW...\n", pid);
+            dump_memfd_files(pid);
+        }
+    }
+    
     // BULLETPROOF STRATEGY: After checking exe link, dump executable memory regions
     // This catches XOR'd ELFs, UPX unpacked code, and runtime payloads
     if (full_dump && sandbox_mode && is_sandbox_process(pid)) {
@@ -3599,14 +3620,22 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 
                 if (!quiet_mode) {
-                    printf("[eBPF] memfd_create() detected in PID %u (%s) - marking for dump on next mmap\n",
+                    printf("[eBPF] memfd_create() detected in PID %u (%s) - will dump memfd contents\n",
                            pid, comm);
                 }
                 
-                // Mark this PID - we'll dump on the NEXT mmap(PROT_EXEC)
+                // Mark this PID - we'll dump on the NEXT mmap(PROT_EXEC) or EXECVE
                 mark_memfd_pid(pid);
                 
-                // Queue scan
+                // CRITICAL FIX: For fexecve() loaders that don't generate EXECVE events,
+                // we need to queue for immediate scanning and dumping
+                // This catches XOR'd ELF loaders that:
+                // 1. memfd_create()
+                // 2. write(decrypted_elf)  
+                // 3. fexecve() → replaces process in-place (no EXECVE event!)
+                // 4. exits quickly
+                //
+                // Queue scan with priority - worker will check for memfd flag and dump
                 queue_push(&event_queue, pid, 0);
                 
             } else if (event_type == 4) {  // EXECVE
