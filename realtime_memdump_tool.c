@@ -3787,17 +3787,19 @@ void *ebpf_pipe_reader(void *arg) {
                     // Small delay to ensure /proc files are fully updated
                     usleep(5000);  // 5ms
                     
-                    // Dump the transformed process
+                    // Dump the transformed process SYNCHRONOUSLY in this thread
                     check_exe_link(pid);  // Detects memfd execution
                     dump_executable_mappings(pid);  // Dumps actual payload from /proc/PID/maps
+                    
+                    // DON'T queue to worker threads - we already dumped here
+                    // Worker threads would race and try to dump after process exits
                 } else {
                     if (!quiet_mode) {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
                     }
+                    // Queue for worker thread (will report process transformation)
+                    queue_push(&event_queue, pid, 0);
                 }
-                
-                // Queue for worker thread (will report process transformation)
-                queue_push(&event_queue, pid, 0);
             }
         }
     }
