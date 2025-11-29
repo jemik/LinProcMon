@@ -3767,6 +3767,12 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
+                // Prevent duplicate processing (multiple EXECVE events for same PID)
+                if (is_already_processed(pid)) {
+                    continue;
+                }
+                mark_as_processed(pid);
+                
                 // Check if memfd flag is set
                 int had_memfd = 0;
                 pthread_mutex_lock(&memfd_pids_mutex);
@@ -3782,17 +3788,13 @@ void *ebpf_pipe_reader(void *arg) {
                     // This is the golden moment! fexecve() just completed via execveat()
                     // Process has transformed: /proc/PID/exe now points to memfd
                     // /proc/PID/maps now shows the decrypted ELF payload
-                    printf("[eBPF] execve() after memfd in PID %u (%s) - DUMPING NOW!\n", pid, comm);
+                    printf("[eBPF] execve() after memfd in PID %u (%s) - will dump\n", pid, comm);
                     
-                    // Small delay to ensure /proc files are fully updated
-                    usleep(5000);  // 5ms
+                    // Mark as memfd_exec so worker thread prioritizes it
+                    mark_memfd_exec_pid(pid);
                     
-                    // Dump the transformed process SYNCHRONOUSLY in this thread
-                    check_exe_link(pid);  // Detects memfd execution
-                    dump_executable_mappings(pid);  // Dumps actual payload from /proc/PID/maps
-                    
-                    // DON'T queue to worker threads - we already dumped here
-                    // Worker threads would race and try to dump after process exits
+                    // Queue ONCE to worker thread - first worker to grab it will dump
+                    queue_push(&event_queue, pid, 0);
                 } else {
                     if (!quiet_mode) {
                         printf("[eBPF] execve() detected in PID %u (%s)\n", pid, comm);
