@@ -3857,6 +3857,12 @@ void handle_proc_event(struct cn_msg *cn_hdr) {
     struct proc_event *ev = (struct proc_event *)cn_hdr->data;
 
     if (ev->what == PROC_EVENT_EXEC) {
+        // If eBPF mode is enabled, skip netlink EXEC events
+        // eBPF provides more accurate exec detection via tracepoints
+        if (ebpf_pipe_path) {
+            return;  // Let eBPF handle EXEC events
+        }
+        
         pid_t pid = ev->event_data.exec.process_pid;
         pid_t ppid = ev->event_data.exec.process_tgid;
         
