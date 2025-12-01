@@ -4288,6 +4288,14 @@ int main(int argc, char **argv) {
         if (child_pid == 0) {
             // Child process - execute the sandbox binary
             
+            // Redirect stdin to /dev/null to prevent sample from reading our debug output
+            // This is critical for samples that read stdin (e.g., password prompts, crackmes)
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+            
             // If the binary doesn't contain '/', prepend './' for relative path
             char actual_path[512];
             if (strchr(sandbox_binary, '/') == NULL) {
