@@ -4335,21 +4335,28 @@ int main(int argc, char **argv) {
             
             // Redirect stdin to a blocking pipe to prevent sample from exiting on EOF
             // This is critical for samples that read stdin (e.g., password prompts, crackmes)
-            // Strategy: Pre-populate pipe with dummy attempts to keep sample alive longer
+            // Strategy: Fill pipe buffer completely to maximize time before EOF
             int pipe_fds[2];
             if (pipe(pipe_fds) == 0) {
-                // Make write end non-blocking to avoid hanging parent
+                // Make write end non-blocking to fill buffer completely
                 int flags = fcntl(pipe_fds[1], F_GETFL, 0);
                 fcntl(pipe_fds[1], F_SETFL, flags | O_NONBLOCK);
                 
-                // Pre-fill pipe with dummy password attempts (for crackmes)
-                // This gives us ~5-10 attempts worth of time before sample exits
-                for (int i = 0; i < 5; i++) {
-                    write(pipe_fds[1], "dummy_attempt\n", 14);
-                }
-                close(pipe_fds[1]);  // Close write end
+                // Fill entire pipe buffer (typically 64KB on Linux)
+                // Write many dummy password attempts to keep crackmes busy
+                const char *dummy = "wrong_password_attempt_to_keep_sample_alive_longer\n";
+                size_t dummy_len = strlen(dummy);
                 
-                // Redirect read end to stdin - sample will read our dummy attempts
+                // Write until pipe buffer is full (write() returns EAGAIN)
+                for (int i = 0; i < 2000; i++) {  // 2000 * ~52 bytes = ~100KB attempt
+                    ssize_t result = write(pipe_fds[1], dummy, dummy_len);
+                    if (result < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;  // Buffer full, stop writing
+                    }
+                }
+                close(pipe_fds[1]);  // Close write end after filling buffer
+                
+                // Redirect read end to stdin - sample will read from full buffer
                 dup2(pipe_fds[0], STDIN_FILENO);
                 close(pipe_fds[0]);
             }
