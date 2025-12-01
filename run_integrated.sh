@@ -1,6 +1,7 @@
 #!/bin/bash
 # Integrated eBPF + Memory Dumping
 # Runs both tools together and correlates events
+# Broken version
 
 if [ "$EUID" -ne 0 ]; then
     echo "[!] Please run as root"
