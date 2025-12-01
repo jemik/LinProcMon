@@ -2090,6 +2090,13 @@ void dump_executable_mappings(pid_t pid) {
     int dumps_created = 0;
     
     printf("[+] Scanning executable memory regions in PID %d...\n", pid);
+    printf("[INFO] Process: %s\n", comm);
+    
+    // Debug: if comm starts with "memfd:", this is a fexecve'd process
+    int comm_is_memfd = (strncmp(comm, "memfd:", 6) == 0);
+    if (comm_is_memfd) {
+        printf("[DEBUG] Comm indicates fexecve from memfd - looking for payload regions\n");
+    }
     
     while (fgets(line, sizeof(line), maps)) {
         unsigned long start, end;
@@ -2125,6 +2132,8 @@ void dump_executable_mappings(pid_t pid) {
         // Check for suspicious patterns
         int is_anonymous = (strlen(path) == 0 || path[0] != '/');
         
+        // HIGH PRIORITY: memfd mappings (fexecve'd processes)
+        // Path might be: "memfd:name", "/memfd:name (deleted)", or even empty for some regions
         if (strstr(path, "memfd:") != NULL) {
             should_dump = 1;
             reason = "memfd_mapping";
@@ -2132,6 +2141,17 @@ void dump_executable_mappings(pid_t pid) {
             // Catch /memfd:xxx (deleted) pattern
             should_dump = 1;
             reason = "memfd_deleted";
+        } else if (comm_is_memfd && is_anonymous) {
+            // CRITICAL: If comm shows "memfd:", anonymous regions are the payload!
+            // After fexecve(), the ELF gets mapped and the memfd fd is closed.
+            // /proc/PID/maps may show these as anonymous or with empty path.
+            should_dump = 1;
+            reason = "fexecve_payload";
+        } else if (is_memfd_process && strlen(path) > 0 && strstr(path, "/tmp") == NULL && strstr(path, "/usr") == NULL && strstr(path, "/lib") == NULL) {
+            // For memfd-flagged processes: dump any non-system, non-loader executable region
+            // This catches cases where /proc/PID/maps shows unusual paths for fexecve'd code
+            should_dump = 1;
+            reason = "memfd_process_exec";
         } else if (strstr(path, "(deleted)") != NULL) {
             should_dump = 1;
             reason = "deleted_mapping";
@@ -3804,6 +3824,10 @@ void *ebpf_pipe_reader(void *arg) {
                     // Process has transformed: /proc/PID/exe now points to memfd
                     // /proc/PID/maps now shows the decrypted ELF payload
                     printf("[eBPF] execve() after memfd in PID %u (%s) - will dump\n", pid, comm);
+                    
+                    // CRITICAL: Give the kernel a moment to finish the execve transformation
+                    // The syscall has ENTERED but may not be complete. Wait for memory to settle.
+                    usleep(50000);  // 50ms - enough for kernel to finish exec
                     
                     // Mark as memfd_exec so worker thread prioritizes it
                     mark_memfd_exec_pid(pid);
