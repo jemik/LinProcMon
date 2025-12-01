@@ -131,6 +131,35 @@ typedef struct {
 memdump_hash_t memdump_hashes[MAX_MEMDUMP_HASHES];
 int memdump_hash_count = 0;
 
+// Deduplication for memory regions by (pid, address) to prevent re-dumping same region
+typedef struct {
+    pid_t pid;
+    unsigned long address;
+} memdump_region_t;
+
+#define MAX_MEMDUMP_REGIONS 64
+memdump_region_t memdump_regions[MAX_MEMDUMP_REGIONS];
+int memdump_region_count = 0;
+
+// Check if we already dumped this memory region (by PID + address)
+static int is_duplicate_region(pid_t pid, unsigned long address) {
+    for (int i = 0; i < memdump_region_count; i++) {
+        if (memdump_regions[i].pid == pid && memdump_regions[i].address == address) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Register a memory region to prevent duplicate dumps
+static void register_region(pid_t pid, unsigned long address) {
+    if (memdump_region_count < MAX_MEMDUMP_REGIONS) {
+        memdump_regions[memdump_region_count].pid = pid;
+        memdump_regions[memdump_region_count].address = address;
+        memdump_region_count++;
+    }
+}
+
 // Check if we already dumped this exact content (by SHA1)
 static int is_duplicate_memdump(const char *sha1) {
     for (int i = 0; i < memdump_hash_count; i++) {
@@ -2186,6 +2215,16 @@ void dump_executable_mappings(pid_t pid) {
                 continue;
             }
             
+            // CRITICAL: Check if we already dumped this region to prevent re-reads
+            pthread_mutex_lock(&memdump_mutex);
+            int already_dumped = is_duplicate_region(pid, start);
+            pthread_mutex_unlock(&memdump_mutex);
+            
+            if (already_dumped) {
+                printf("[!] Skipping region 0x%lx - already dumped\n", start);
+                continue;
+            }
+            
             printf("[+] Found suspicious executable region: 0x%lx-0x%lx (%zu bytes) [%s] %s\n",
                    start, end, region_size, reason, path);
             
@@ -2275,6 +2314,7 @@ void dump_executable_mappings(pid_t pid) {
                                     memdump_record_count++;
                                     
                                     register_memdump(sha1, pid);
+                                    register_region(pid, start);  // Mark this region as dumped
                                     
                                     printf("[+] Registered memory dump %d: %s (SHA1: %s)\n",
                                            memdump_record_count, filename, sha1);
