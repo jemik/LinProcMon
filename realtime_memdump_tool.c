@@ -4294,12 +4294,14 @@ int main(int argc, char **argv) {
         if (child_pid == 0) {
             // Child process - execute the sandbox binary
             
-            // Redirect stdin to /dev/null to prevent sample from reading our debug output
+            // Redirect stdin to a blocking pipe to prevent sample from exiting on EOF
             // This is critical for samples that read stdin (e.g., password prompts, crackmes)
-            int devnull = open("/dev/null", O_RDONLY);
-            if (devnull >= 0) {
-                dup2(devnull, STDIN_FILENO);
-                close(devnull);
+            // Using a pipe instead of /dev/null keeps the sample waiting instead of getting EOF
+            int pipe_fds[2];
+            if (pipe(pipe_fds) == 0) {
+                close(pipe_fds[1]);  // Close write end, keep read end open (will block)
+                dup2(pipe_fds[0], STDIN_FILENO);
+                close(pipe_fds[0]);
             }
             
             // If the binary doesn't contain '/', prepend './' for relative path

@@ -43,11 +43,26 @@ echo "      [✓] Named pipe created: $PIPE_PATH"
 echo "[1/3] Starting eBPF syscall monitor..."
 ./ebpf_standalone --pipe "$PIPE_PATH" > "$EBPF_LOG" 2>&1 &
 EBPF_PID=$!
-sleep 1
+
+# Wait for eBPF to fully attach (check log for ready message)
+echo "      [*] Waiting for eBPF to attach..."
+for i in {1..30}; do
+    if grep -q "Press Ctrl-C to stop" "$EBPF_LOG" 2>/dev/null; then
+        break
+    fi
+    sleep 0.1
+done
 
 if ! kill -0 $EBPF_PID 2>/dev/null; then
     echo "[!] eBPF monitor failed to start"
     cat "$EBPF_LOG"
+    exit 1
+fi
+
+if ! grep -q "Press Ctrl-C to stop" "$EBPF_LOG" 2>/dev/null; then
+    echo "[!] eBPF monitor did not attach within 3 seconds"
+    cat "$EBPF_LOG"
+    kill $EBPF_PID 2>/dev/null
     exit 1
 fi
 
