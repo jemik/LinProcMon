@@ -159,30 +159,8 @@ int main(int argc, char **argv) {
         }
     }
     
-    // Open pipe if specified
-    if (pipe_path) {
-        // Open pipe in non-blocking mode first to avoid hanging
-        // (fopen on FIFO blocks until reader connects)
-        int pipe_fd = open(pipe_path, O_WRONLY | O_NONBLOCK);
-        if (pipe_fd < 0) {
-            fprintf(stderr, "[!] Failed to open pipe %s: %s\n", pipe_path, strerror(errno));
-            return 1;
-        }
-        
-        // Convert to FILE* and switch back to blocking mode
-        pipe_output = fdopen(pipe_fd, "w");
-        if (!pipe_output) {
-            fprintf(stderr, "[!] Failed to create FILE* from pipe: %s\n", strerror(errno));
-            close(pipe_fd);
-            return 1;
-        }
-        
-        // Clear non-blocking flag (make writes block if pipe is full)
-        int flags = fcntl(pipe_fd, F_GETFL);
-        fcntl(pipe_fd, F_SETFL, flags & ~O_NONBLOCK);
-        
-        printf("[+] Writing events to pipe: %s\n", pipe_path);
-    }
+    // DON'T open pipe yet - will open after eBPF attaches
+    // This prevents blocking/hanging during startup
     
     // Check root
     if (geteuid() != 0) {
@@ -261,6 +239,20 @@ int main(int argc, char **argv) {
     }
     printf("[+] Press Ctrl-C to stop\n");
     printf("\n");
+    
+    // NOW open pipe after eBPF is fully ready
+    // At this point, memory dumper should be starting and will open read end
+    if (pipe_path) {
+        printf("[+] Opening pipe for IPC: %s\n", pipe_path);
+        pipe_output = fopen(pipe_path, "w");
+        if (!pipe_output) {
+            fprintf(stderr, "[!] Failed to open pipe %s: %s\n", pipe_path, strerror(errno));
+            fprintf(stderr, "[!] Make sure realtime_memdump_tool is reading from pipe\n");
+            err = -1;
+            goto cleanup;
+        }
+        printf("[+] Pipe opened successfully\n");
+    }
     
     // Poll for events
     while (running) {
