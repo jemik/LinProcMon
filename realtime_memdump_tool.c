@@ -1506,23 +1506,19 @@ void finalize_sandbox_report_signal_safe() {
     }
     fprintf(sandbox_json_report, "  ],\n");
     
+    // Write memory dumps from centralized array (same as normal path)
     fprintf(sandbox_json_report, "  \"memory_dumps\": [\n");
-    snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
-    tf = fopen(temp_file, "r");
-    if (tf) {
-        char line[MAX_LINE];
-        int first = 1;
-        while (fgets(line, sizeof(line), tf)) {
-            line[sizeof(line) - 1] = '\0';
-            size_t len = strlen(line);
-            if (len > 0 && line[len-1] == '\n') line[len-1] = '\0';
-            if (!first) fprintf(sandbox_json_report, ",\n");
-            fprintf(sandbox_json_report, "    %s", line);
-            first = 0;
-        }
-        fclose(tf);
-        if (!first) fprintf(sandbox_json_report, "\n");
+    // Note: In signal handler we skip mutex to avoid deadlock - accept potential inconsistency
+    for (int i = 0; i < memdump_record_count && i < MAX_MEMDUMP_RECORDS; i++) {
+        if (i > 0) fprintf(sandbox_json_report, ",\n");
+        fprintf(sandbox_json_report, "    {\"pid\":%d,\"filename\":\"%s\",\"size\":%zu,\"sha1\":\"%s\",\"timestamp\":%ld}",
+                memdump_records[i].pid,
+                memdump_records[i].filename,
+                memdump_records[i].size,
+                memdump_records[i].sha1,
+                (long)memdump_records[i].timestamp);
     }
+    if (memdump_record_count > 0) fprintf(sandbox_json_report, "\n");
     fprintf(sandbox_json_report, "  ],\n");
     
     fprintf(sandbox_json_report, "  \"alerts\": [\n");
@@ -2555,48 +2551,40 @@ void dump_full_process_memory(pid_t pid) {
     if (calculate_sha1(dump_file, sha1) == 0) {
         printf("[+] Memory dump SHA-1: %s\n", sha1);
         
-        // Report to JSON if in sandbox mode
+        // Report to JSON if in sandbox mode - use centralized deduplication
         if (sandbox_mode) {
-            pthread_mutex_lock(&sandbox_proc_mutex);
+            pthread_mutex_lock(&memdump_mutex);
             
-            // Check for duplicate (same PID and SHA-1 already reported)
-            int already_reported = 0;
-            for (int i = 0; i < sandbox_memdump_count; i++) {
-                if (sandbox_memdumps[i].pid == pid &&
-                    strcmp(sandbox_memdumps[i].sha1, sha1) == 0) {
-                    already_reported = 1;
-                    break;
+            // Use the same deduplication system as dump_memfd_files/dump_executable_mappings
+            if (!is_duplicate_memdump(sha1)) {
+                if (memdump_record_count < MAX_MEMDUMP_RECORDS) {
+                    const char *filename = strrchr(dump_file, '/');
+                    filename = filename ? filename + 1 : dump_file;
+                    
+                    memdump_records[memdump_record_count].pid = pid;
+                    strncpy(memdump_records[memdump_record_count].filename, filename, 
+                            sizeof(memdump_records[0].filename) - 1);
+                    memdump_records[memdump_record_count].size = total_dumped;
+                    strncpy(memdump_records[memdump_record_count].sha1, sha1, 
+                            sizeof(memdump_records[0].sha1) - 1);
+                    memdump_records[memdump_record_count].timestamp = time(NULL);
+                    memdump_records[memdump_record_count].written_to_disk = 1;
+                    memdump_record_count++;
+                    
+                    // Register to prevent future duplicates
+                    register_memdump(sha1, pid);
+                    
+                    printf("[+] Registered memory dump %d: %s (SHA1: %s)\n", 
+                           memdump_record_count, filename, sha1);
                 }
+            } else {
+                printf("[!] Skipping duplicate dump (SHA1: %s already captured)\n", sha1);
+                // Delete the duplicate file to save disk space
+                unlink(dump_file);
+                unlink(map_file);
             }
             
-            // Only add if not already reported
-            if (!already_reported && sandbox_memdump_count < MAX_SANDBOX_MEMDUMPS) {
-                const char *filename = strrchr(dump_file, '/');
-                filename = filename ? filename + 1 : dump_file;
-                
-                sandbox_memdumps[sandbox_memdump_count].pid = pid;
-                strncpy(sandbox_memdumps[sandbox_memdump_count].filename, filename, sizeof(sandbox_memdumps[0].filename) - 1);
-                sandbox_memdumps[sandbox_memdump_count].size = total_dumped;
-                strncpy(sandbox_memdumps[sandbox_memdump_count].sha1, sha1, sizeof(sandbox_memdumps[0].sha1) - 1);
-                sandbox_memdumps[sandbox_memdump_count].timestamp = time(NULL);
-                sandbox_memdump_count++;
-                
-                // BULLETPROOF: Write immediately to temp file
-                char temp_file[600];
-                snprintf(temp_file, sizeof(temp_file), "%s/.memdumps.tmp", sandbox_report_dir);
-                FILE *tf = fopen(temp_file, "a");
-                if (tf) {
-                    fprintf(tf, "{\"pid\":%d,\"filename\":\"%s\",\"size\":%zu,\"sha1\":\"%s\",\"timestamp\":%ld}\n",
-                            pid, json_escape(filename), total_dumped, sha1, time(NULL));
-                    fflush(tf);
-                    fclose(tf);
-                    fprintf(stderr, "[DEBUG] Wrote memory dump to temp file: %s\n", temp_file);
-                } else {
-                    fprintf(stderr, "[DEBUG] ERROR: Could not open memdumps temp file: %s\n", temp_file);
-                }
-            }
-            
-            pthread_mutex_unlock(&sandbox_proc_mutex);
+            pthread_mutex_unlock(&memdump_mutex);
         }
     }
     if (calculate_sha256(dump_file, sha256) == 0) {
