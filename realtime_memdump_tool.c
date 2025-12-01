@@ -2251,6 +2251,11 @@ void dump_executable_mappings(pid_t pid) {
             printf("[+] Found suspicious executable region: 0x%lx-0x%lx (%zu bytes) [%s] %s\n",
                    start, end, region_size, reason, path);
             
+            // Register region IMMEDIATELY to prevent concurrent dump attempts
+            pthread_mutex_lock(&memdump_mutex);
+            register_region(pid, start);
+            pthread_mutex_unlock(&memdump_mutex);
+            
             // Open /proc/PID/mem for reading
             char mem_path[64];
             snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", pid);
@@ -2337,7 +2342,7 @@ void dump_executable_mappings(pid_t pid) {
                                     memdump_record_count++;
                                     
                                     register_memdump(sha1, pid);
-                                    register_region(pid, start);  // Mark this region as dumped
+                                    // Note: register_region already called above unconditionally
                                     
                                     printf("[+] Registered memory dump %d: %s (SHA1: %s)\n",
                                            memdump_record_count, filename, sha1);
