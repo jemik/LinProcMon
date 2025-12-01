@@ -233,7 +233,7 @@ int main(int argc, char **argv) {
     }
     
     printf("[+] eBPF programs attached successfully\n");
-    printf("[+] Monitoring syscalls: mmap, mprotect, memfd_create, execve\n");
+    printf("[+] Monitoring syscalls: mmap, mprotect, memfd_create, execve (enter+exit)\n");
     if (filter_pid > 0) {
         printf("[+] Filtering PID: %d\n", filter_pid);
     }

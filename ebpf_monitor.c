@@ -61,7 +61,7 @@ struct {
     __uint(max_entries, 256 * 1024); // 256KB buffer
 } events SEC(".maps");
 
-// Tracepoint context structure
+// Tracepoint context structure for enter
 struct syscall_trace_enter {
     unsigned short common_type;
     unsigned char common_flags;
@@ -69,6 +69,16 @@ struct syscall_trace_enter {
     int common_pid;
     long syscall_nr;
     unsigned long args[6];
+};
+
+// Tracepoint context structure for exit
+struct syscall_trace_exit {
+    unsigned short common_type;
+    unsigned char common_flags;
+    unsigned char common_preempt_count;
+    int common_pid;
+    long syscall_nr;
+    long ret;  // Return value
 };
 
 // Helper to get current comm
@@ -162,7 +172,7 @@ int trace_memfd_create(struct syscall_trace_enter *ctx) {
     return 0;
 }
 
-// Hook: sys_execve
+// Hook: sys_execve (enter - before transformation)
 SEC("tracepoint/syscalls/sys_enter_execve")
 int trace_execve(struct syscall_trace_enter *ctx) {
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -184,7 +194,36 @@ int trace_execve(struct syscall_trace_enter *ctx) {
     return 0;
 }
 
-// Hook: sys_execveat (used by fexecve())
+// Hook: sys_execve (exit - after transformation, captures new comm like "memfd:...")
+SEC("tracepoint/syscalls/sys_exit_execve")
+int trace_execve_exit(struct syscall_trace_exit *ctx) {
+    // Only emit event if execve succeeded (return value >= 0)
+    // Failed execve returns negative errno
+    if (ctx->ret < 0) {
+        return 0;
+    }
+    
+    struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        return 0;
+    }
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
+    e->addr = 0;  // Not available at exit
+    e->len = 0;
+    e->prot = 0;
+    e->flags = 0;
+    e->event_type = EVENT_EXECVE;
+    // CRITICAL: At exit, comm reflects the NEW process name (e.g., "memfd:memfd_fla")
+    get_task_comm(e->comm, sizeof(e->comm));
+    
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// Hook: sys_execveat (enter - before transformation, used by fexecve())
 SEC("tracepoint/syscalls/sys_enter_execveat")
 int trace_execveat(struct syscall_trace_enter *ctx) {
     struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
@@ -200,6 +239,34 @@ int trace_execveat(struct syscall_trace_enter *ctx) {
     e->prot = 0;
     e->flags = 0;
     e->event_type = EVENT_EXECVE;
+    get_task_comm(e->comm, sizeof(e->comm));
+    
+    bpf_ringbuf_submit(e, 0);
+    return 0;
+}
+
+// Hook: sys_execveat (exit - after transformation, captures memfd comm)
+SEC("tracepoint/syscalls/sys_exit_execveat")
+int trace_execveat_exit(struct syscall_trace_exit *ctx) {
+    // Only emit event if execveat succeeded
+    if (ctx->ret < 0) {
+        return 0;
+    }
+    
+    struct exec_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
+    if (!e) {
+        return 0;
+    }
+    
+    u64 pid_tgid = bpf_get_current_pid_tgid();
+    e->pid = pid_tgid >> 32;
+    e->tid = pid_tgid & 0xFFFFFFFF;
+    e->addr = 0;
+    e->len = 0;
+    e->prot = 0;
+    e->flags = 0;
+    e->event_type = EVENT_EXECVE;
+    // CRITICAL: For fexecve(), this captures "memfd:..." comm after transformation
     get_task_comm(e->comm, sizeof(e->comm));
     
     bpf_ringbuf_submit(e, 0);
