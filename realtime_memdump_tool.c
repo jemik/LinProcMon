@@ -3767,13 +3767,7 @@ void *ebpf_pipe_reader(void *arg) {
                     continue;
                 }
                 
-                // Prevent duplicate processing (multiple EXECVE events for same PID)
-                if (is_already_processed(pid)) {
-                    continue;
-                }
-                mark_as_processed(pid);
-                
-                // Check if memfd flag is set
+                // Check if memfd flag is set FIRST
                 int had_memfd = 0;
                 pthread_mutex_lock(&memfd_pids_mutex);
                 for (int i = 0; i < memfd_pids_count; i++) {
@@ -3783,6 +3777,16 @@ void *ebpf_pipe_reader(void *arg) {
                     }
                 }
                 pthread_mutex_unlock(&memfd_pids_mutex);
+                
+                // For memfd processes, DON'T skip duplicates
+                // They do execve() twice: initial load + fexecve() to decrypted payload
+                if (!had_memfd) {
+                    // For normal processes, prevent duplicate processing
+                    if (is_already_processed(pid)) {
+                        continue;
+                    }
+                    mark_as_processed(pid);
+                }
                 
                 if (had_memfd) {
                     // This is the golden moment! fexecve() just completed via execveat()
