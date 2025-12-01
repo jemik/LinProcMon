@@ -10,6 +10,12 @@ echo " Building LinProcMon"
 echo "========================================"
 echo ""
 
+# Clean old binaries
+echo "[0/3] Cleaning old binaries..."
+rm -f ebpf_monitor.o realtime_memdump_tool ebpf_standalone
+echo "      [✓] Clean complete"
+echo ""
+
 # 1. Compile eBPF program
 echo "[1/3] Compiling eBPF monitor..."
 clang -O2 -target bpf -c ebpf_monitor.c -o ebpf_monitor.o

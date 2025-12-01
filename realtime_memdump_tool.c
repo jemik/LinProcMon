@@ -4335,10 +4335,21 @@ int main(int argc, char **argv) {
             
             // Redirect stdin to a blocking pipe to prevent sample from exiting on EOF
             // This is critical for samples that read stdin (e.g., password prompts, crackmes)
-            // Using a pipe instead of /dev/null keeps the sample waiting instead of getting EOF
+            // Strategy: Pre-populate pipe with dummy attempts to keep sample alive longer
             int pipe_fds[2];
             if (pipe(pipe_fds) == 0) {
-                close(pipe_fds[1]);  // Close write end, keep read end open (will block)
+                // Make write end non-blocking to avoid hanging parent
+                int flags = fcntl(pipe_fds[1], F_GETFL, 0);
+                fcntl(pipe_fds[1], F_SETFL, flags | O_NONBLOCK);
+                
+                // Pre-fill pipe with dummy password attempts (for crackmes)
+                // This gives us ~5-10 attempts worth of time before sample exits
+                for (int i = 0; i < 5; i++) {
+                    write(pipe_fds[1], "dummy_attempt\n", 14);
+                }
+                close(pipe_fds[1]);  // Close write end
+                
+                // Redirect read end to stdin - sample will read our dummy attempts
                 dup2(pipe_fds[0], STDIN_FILENO);
                 close(pipe_fds[0]);
             }
