@@ -3680,6 +3680,10 @@ void *ebpf_pipe_reader(void *arg) {
                 }
                 pthread_mutex_unlock(&memfd_pids_mutex);
                 
+                // CRITICAL FIX: Check if process comm indicates post-fexecve memfd execution
+                // After fexecve(), the process name will be "memfd:..." even if memfd fd is closed
+                int is_memfd_process = (strncmp(comm, "memfd:", 6) == 0);
+                
                 if (!quiet_mode) {
                     if (had_memfd) {
                         printf("[eBPF] mmap(PROT_EXEC) AFTER memfd_create in PID %u (%s)\n", pid, comm);
@@ -3689,8 +3693,15 @@ void *ebpf_pipe_reader(void *arg) {
                     }
                 }
                 
-                // Queue immediate scan for all executable mappings
-                queue_push(&event_queue, pid, 0);
+                // If this is a memfd process (post-fexecve), dump it immediately
+                if (is_memfd_process && full_dump) {
+                    printf("[+] Detected memfd process '%s' (PID %u) - dumping post-fexecve memory...\n", comm, pid);
+                    // Don't use queue - dump synchronously while memory is still valid
+                    scan_maps_and_dump(pid);
+                } else {
+                    // Queue immediate scan for all executable mappings
+                    queue_push(&event_queue, pid, 0);
+                }
                 
                 // STRATEGY 1: Dump memfd files (fileless execution)
                 if (had_memfd && full_dump) {
