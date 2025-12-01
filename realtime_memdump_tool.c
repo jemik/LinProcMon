@@ -160,6 +160,29 @@ static void register_region(pid_t pid, unsigned long address) {
     }
 }
 
+// Track PIDs that have had full memory dumps to prevent repeated dumps
+#define MAX_FULL_DUMP_PIDS 64
+pid_t full_dump_pids[MAX_FULL_DUMP_PIDS];
+int full_dump_pid_count = 0;
+
+// Check if we already did a full dump for this PID
+static int is_full_dump_done(pid_t pid) {
+    for (int i = 0; i < full_dump_pid_count; i++) {
+        if (full_dump_pids[i] == pid) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+// Register that we did a full dump for this PID
+static void register_full_dump(pid_t pid) {
+    if (full_dump_pid_count < MAX_FULL_DUMP_PIDS) {
+        full_dump_pids[full_dump_pid_count] = pid;
+        full_dump_pid_count++;
+    }
+}
+
 // Check if we already dumped this exact content (by SHA1)
 static int is_duplicate_memdump(const char *sha1) {
     for (int i = 0; i < memdump_hash_count; i++) {
@@ -2358,6 +2381,16 @@ void dump_full_process_memory(pid_t pid) {
         return;
     }
     
+    // Check if we already dumped this PID to prevent duplicate dumps
+    pthread_mutex_lock(&memdump_mutex);
+    int already_dumped = is_full_dump_done(pid);
+    pthread_mutex_unlock(&memdump_mutex);
+    
+    if (already_dumped) {
+        printf("[!] Skipping full dump of PID %d - already dumped\n", pid);
+        return;
+    }
+    
     // Check if process exists before attempting dump
     char proc_check[64];
     snprintf(proc_check, sizeof(proc_check), "/proc/%d", pid);
@@ -2613,6 +2646,7 @@ void dump_full_process_memory(pid_t pid) {
                     
                     // Register to prevent future duplicates
                     register_memdump(sha1, pid);
+                    register_full_dump(pid);  // Mark this PID as fully dumped
                     
                     printf("[+] Registered memory dump %d: %s (SHA1: %s)\n", 
                            memdump_record_count, filename, sha1);
@@ -2623,6 +2657,9 @@ void dump_full_process_memory(pid_t pid) {
                 unlink(dump_file);
                 unlink(map_file);
             }
+            
+            // Mark this PID as dumped even if duplicate (prevent retries)
+            register_full_dump(pid);
             
             pthread_mutex_unlock(&memdump_mutex);
         }
