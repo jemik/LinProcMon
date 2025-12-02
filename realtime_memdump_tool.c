@@ -3350,6 +3350,15 @@ void scan_maps_and_dump(pid_t pid) {
         print_process_info(pid);
     }
 
+    // Reopen maps file for alert detection (dump functions consumed it)
+    // This ensures alerts are properly generated and written
+    fclose(maps);
+    maps = fopen(maps_path, "r");
+    if (!maps) {
+        // Process may have exited, this is normal
+        return;
+    }
+
     char line[MAX_LINE];
     int suspicious_count = 0;
     
