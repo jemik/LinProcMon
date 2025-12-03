@@ -217,14 +217,21 @@ def scan_pid_worker(args):
     pid, rule_path, max_region, only_exec, only_anon, only_memfd = args
     results = []
 
+    # Resolve process
     try:
         proc = psutil.Process(pid)
-        status = proc.status()
-        if status in ("zombie", "dead", "disk-sleep"):
-            return results
     except Exception:
         return results
 
+    # Skip dead/zombie
+    try:
+        status = proc.status()
+        if status in ("zombie", "dead"):
+            return results
+    except Exception:
+        pass
+
+    # Must have an exe (skip kernel threads etc.)
     try:
         exe = proc.exe()
         if not exe:
@@ -232,21 +239,23 @@ def scan_pid_worker(args):
     except Exception:
         return results
 
+    # Compile rules in worker
     try:
         rules = yara.compile(filepath=rule_path)
     except Exception:
         return results
 
-    # Detect architecture
+    # Arch detection
     hdr = read_elf_header(exe)
     arch = detect_arch_from_elf(hdr)
-    md = get_disassembler(arch)
 
     maps_path = f"/proc/{pid}/maps"
     mem_path = f"/proc/{pid}/mem"
     fd_dir = f"/proc/{pid}/fd"
 
-    # --- Scan /proc/<pid>/maps regions ---
+    # --------------------------
+    # Scan memory maps
+    # --------------------------
     try:
         maps_f = open(maps_path, "r")
         mem_f = open(mem_path, "rb", 0)
@@ -263,13 +272,19 @@ def scan_pid_worker(args):
 
                 addr_range, perms = parts[0], parts[1]
 
+                # Filters
                 if only_exec and "x" not in perms:
                     continue
-                if only_anon:
-                    if len(parts) < 6 or parts[5] != "0":
-                        continue
                 if "r" not in perms:
                     continue
+
+                inode = parts[4] if len(parts) >= 5 else None
+                pathname = parts[5] if len(parts) >= 6 else ""
+
+                if only_anon:
+                    # Anonymous regions: inode == 0 and no path
+                    if not ((inode == "0") and (pathname == "" or pathname == "0")):
+                        continue
 
                 start_s, end_s = addr_range.split("-")
                 start = int(start_s, 16)
@@ -279,17 +294,14 @@ def scan_pid_worker(args):
                     continue
 
                 try:
-                    if size <= max_region:
-                        # Read the whole region (safe)
-                        mem_f.seek(start)
-                        region = mem_f.read(size)
-                    else:
-                        # Read the last max_region bytes of the region
-                        region_start = start + (size - max_region)
-                        mem_f.seek(region_start)
-                        region = mem_f.read(max_region)
-                except OSError as e:
-                    # EIO means unreadable region
+                    # Always read from the start of the region
+                    mem_f.seek(start)
+                    read_len = min(size, max_region)
+                    region = mem_f.read(read_len)
+                except Exception as e:
+                    # If region is unreadable, just skip it
+                    # (kernel protected, vsyscall, etc.)
+                    # print(Fore.RED + f"[!] Failed to read memory for PID {pid}: {e}")
                     continue
 
                 if not region:
@@ -298,7 +310,8 @@ def scan_pid_worker(args):
                 try:
                     matches = rules.match(data=region)
                 except Exception as e:
-                    print(Fore.RED + f"[!] YARA scan error in PID {pid}: {e}")
+                    # If rule throws, skip this region
+                    # print(Fore.RED + f"[!] YARA error in PID {pid}: {e}")
                     continue
 
                 if matches:
@@ -312,13 +325,15 @@ def scan_pid_worker(args):
                         "arch": arch,
                     })
 
-    # --- Scan /proc/<pid>/fd file descriptors ---
+    # --------------------------
+    # Scan file descriptors
+    # --------------------------
     if os.path.isdir(fd_dir):
         try:
             for fd in os.listdir(fd_dir):
-                path = os.path.join(fd_dir, fd)
+                fd_path = os.path.join(fd_dir, fd)
                 try:
-                    target = os.readlink(path)
+                    target = os.readlink(fd_path)
                 except Exception:
                     continue
 
@@ -328,8 +343,9 @@ def scan_pid_worker(args):
                     continue
 
                 try:
-                    with open(path, "rb", 0) as f:
-                        data = f.read()
+                    with open(fd_path, "rb", 0) as f:
+                        # Here we can also cap to max_region if you like
+                        data = f.read(max_region)
                 except Exception:
                     continue
 
@@ -345,7 +361,7 @@ def scan_pid_worker(args):
                     results.append({
                         "pid": pid,
                         "type": "fd",
-                        "fd_path": path,
+                        "fd_path": fd_path,
                         "fd_target": target,
                         "data": data,
                         "entropy": shannon_entropy(data),
