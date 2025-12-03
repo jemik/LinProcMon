@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-process_mem_scanner_v5.1 — Hybrid Scanner
+process_mem_scanner_v5.6 — Hybrid Scanner + JSON report
+
+Based on your last known-good v5.1:
 
 PHASE 1:
     - YARA native process scan (rules.match(pid=pid))
     - Fast, safe, correct offsets from YARA CLI behavior
+    - Skips own PID and parent PID
 
 PHASE 2 (only for matched PIDs):
     - Enumerate readable regions from /proc/<pid>/maps
     - Re-scan each region with YARA to get offsets
-    - Hex dump around matched bytes
-    - Capstone disassembly
+    - Hex dump around matched bytes (printed to terminal)
+    - Capstone disassembly (printed to terminal)
     - Injection indicator detection
     - memfd file descriptor scanning
-    - ELF carving (simple header-based)
+    - Simple ELF carving via header (unchanged behaviour)
+
+EXTRA (v5.6):
+    - Optional JSON report (--json-report FILE)
+      Includes:
+        * Process metadata
+        * Injection indicators
+        * Region matches (address, perms, entropy, rule, string, offsets, snippet)
+        * FD matches
 """
 
 import os
@@ -25,6 +36,7 @@ import struct
 import hashlib
 import math
 import datetime
+import json
 
 from colorama import Fore, Style, init as colorama_init
 from capstone import *
@@ -69,24 +81,36 @@ def detect_arch(exe_path):
     e_machine = struct.unpack("<H", hdr[18:20])[0]
 
     if ei_class == 2:
-        if e_machine == 0x3E: return "x86_64"
-        if e_machine == 0xB7: return "arm64"
+        if e_machine == 0x3E:
+            return "x86_64"
+        if e_machine == 0xB7:
+            return "arm64"
     else:
-        if e_machine == 0x03: return "x86"
-        if e_machine == 0x28: return "arm"
+        if e_machine == 0x03:
+            return "x86"
+        if e_machine == 0x28:
+            return "arm"
 
     return "x86_64"
 
 
 def get_disassembler(arch):
-    if arch == "x86_64": return Cs(CS_ARCH_X86, CS_MODE_64)
-    if arch == "x86": return Cs(CS_ARCH_X86, CS_MODE_32)
-    if arch == "arm64": return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
-    if arch == "arm": return Cs(CS_ARCH_ARM, CS_MODE_ARM)
+    if arch == "x86_64":
+        return Cs(CS_ARCH_X86, CS_MODE_64)
+    if arch == "x86":
+        return Cs(CS_ARCH_X86, CS_MODE_32)
+    if arch == "arm64":
+        return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    if arch == "arm":
+        return Cs(CS_ARCH_ARM, CS_MODE_ARM)
     return Cs(CS_ARCH_X86, CS_MODE_64)
 
 
 def hex_dump_highlight(data, base, match_off, match_len, ctx=256):
+    """
+    Print a 256-byte window (default) around match_off, highlighting matched bytes.
+    This is your original terminal hex dump behaviour.
+    """
     half = ctx // 2
     start = max(0, match_off - half)
     end = min(len(data), match_off + match_len + half)
@@ -146,11 +170,13 @@ def detect_injection_indicators(pid):
         current = None
         with open(smaps_path, "r") as f:
             for line in f:
+                # Region header line (e.g. "7f...-7f... r-xp ...")
                 if "-" in line and ":" not in line:
                     current = line.split()[0]
                 if line.startswith("VmFlags:"):
                     fl = line.split(":")[1].strip().split()
-                    if "ex" in fl and ("mr" in fl or "mw" in fl):
+                    # Only append if we actually know the region (avoid "None")
+                    if current and "ex" in fl and ("mr" in fl or "mw" in fl):
                         indicators.append(f"VmFlags transition: {current}")
     except Exception:
         pass
@@ -172,17 +198,46 @@ def read_region(pid, start, size, max_bytes):
 
 
 # ======================================================================
-# Deep Scan of Memory Regions
+# Deep Scan of Memory Regions (terminal + JSON collection)
 # ======================================================================
 
 def deep_scan_memory(pid, rules, dump_dir, max_read):
+    """
+    Your original deep scan + hex dump + disassembly (terminal),
+    plus JSON-friendly collection of region matches.
+
+    Returns:
+        regions_report: list of dicts:
+        [
+          {
+            "address": "7f....-7f....",
+            "perms": "rw-p",
+            "entropy": 4.123,
+            "dump_file": "/path/to/region.bin" or None,
+            "matches": [
+               {
+                 "rule": "ELF_TROJ_MSF_SHELL",
+                 "string_id": "$opcode",
+                 "absolute_offset": 0x...,   # int
+                 "match_length": 14,
+                 "snippet_va": 0x...,        # int, start of hex snippet
+                 "snippet_hex": "aa bb cc ..."  # hex of same 256B window
+               },
+               ...
+            ]
+          },
+          ...
+        ]
+    """
     maps_path = f"/proc/{pid}/maps"
     try:
         maps = open(maps_path).read().splitlines()
     except Exception:
-        return
+        return []
 
     print(Fore.YELLOW + "\n[*] Deep scanning memory maps...")
+
+    regions_report = []
 
     for line in maps:
         parts = line.split()
@@ -215,7 +270,16 @@ def deep_scan_memory(pid, rules, dump_dir, max_read):
             continue
 
         print(Fore.GREEN + f"\n  [+] Region match at {addr_range} perms={perms}")
-        print(f"      Entropy: {shannon_entropy(region):.3f}")
+        ent = shannon_entropy(region)
+        print(f"      Entropy: {ent:.3f}")
+
+        region_entry = {
+            "address": addr_range,
+            "perms": perms,
+            "entropy": ent,
+            "dump_file": None,
+            "matches": []
+        }
 
         for m in matches:
             print(Fore.MAGENTA + f"    Rule: {m.rule}")
@@ -227,9 +291,18 @@ def deep_scan_memory(pid, rules, dump_dir, max_read):
                     abs_off = start + off
 
                     print(Fore.CYAN + f"\n    String {ident}: offset={hex(abs_off)} len={mlen}")
+                    # Terminal hex dump (unchanged)
                     hex_dump_highlight(region, start, off, mlen)
 
-                    # disassembly fragment
+                    # For JSON: capture the same snippet window in hex
+                    half = 128
+                    snip_start = max(0, off - half)
+                    snip_end = min(len(region), off + mlen + half)
+                    snippet = region[snip_start:snip_end]
+                    snippet_va = start + snip_start
+                    snippet_hex = snippet.hex()
+
+                    # disassembly fragment (terminal only, unchanged)
                     md = get_disassembler(detect_arch(psutil.Process(pid).exe()))
                     ctx_start = max(0, off - 64)
                     ctx_end = min(len(region), off + mlen + 64)
@@ -242,29 +315,63 @@ def deep_scan_memory(pid, rules, dump_dir, max_read):
                             prefix = ">>" if high else "  "
                             color = Fore.RED if high else ""
                             print(color + f"      {prefix} 0x{ins.address:x}: {ins.mnemonic} {ins.op_str}")
-                    except:
+                    except Exception:
                         print("      <failed disassembly>")
 
-                    # Dump region
-                    if dump_dir:
-                        outdir = os.path.join(dump_dir, f"pid_{pid}")
-                        os.makedirs(outdir, exist_ok=True)
-                        path = os.path.join(outdir, f"region_{addr_range.replace('-', '_')}.bin")
-                        with open(path, "wb") as f:
-                            f.write(region)
-                        print(Fore.GREEN + f"    Dumped region to: {path}")
+                    region_entry["matches"].append({
+                        "rule": m.rule,
+                        "string_id": ident,
+                        "absolute_offset": abs_off,
+                        "match_length": mlen,
+                        "snippet_va": snippet_va,
+                        "snippet_hex": snippet_hex
+                    })
+
+        # Dump region (unchanged, plus JSON path)
+        if region_entry["matches"] and dump_dir:
+            try:
+                outdir = os.path.join(dump_dir, f"pid_{pid}")
+                os.makedirs(outdir, exist_ok=True)
+                path = os.path.join(outdir, f"region_{addr_range.replace('-', '_')}.bin")
+                with open(path, "wb") as f:
+                    f.write(region)
+                print(Fore.GREEN + f"    Dumped region to: {path}")
+                region_entry["dump_file"] = path
+            except Exception:
+                pass
+
+        if region_entry["matches"]:
+            regions_report.append(region_entry)
+
+    return regions_report
 
 
 # ======================================================================
-# FD (memfd) scan
+# FD (memfd) scan (terminal + JSON collection)
 # ======================================================================
 
 def scan_fds(pid, rules, dump_dir, max_read):
+    """
+    Unchanged behaviour (terminal),
+    plus JSON-friendly fd_matches list:
+
+    [
+      {
+        "fd": "3",
+        "target": "/memfd:xyz (deleted)",
+        "rules": ["ELF_TROJ_MSF_SHELL"],
+        "dump_file": ".../fd_3.bin" or None
+      },
+      ...
+    ]
+    """
     fd_path = f"/proc/{pid}/fd"
     if not os.path.isdir(fd_path):
-        return
+        return []
 
     print(Fore.YELLOW + "\n[*] Scanning file descriptors...")
+
+    fd_matches = []
 
     for fd in os.listdir(fd_path):
         full = os.path.join(fd_path, fd)
@@ -289,16 +396,32 @@ def scan_fds(pid, rules, dump_dir, max_read):
 
         if matches:
             print(Fore.GREEN + f"  [+] FD match: {full} → {target}")
+            rule_names = [m.rule for m in matches]
             for m in matches:
                 print(Fore.MAGENTA + f"    Rule: {m.rule}")
 
+            entry = {
+                "fd": fd,
+                "target": target,
+                "rules": rule_names,
+                "dump_file": None
+            }
+
             if dump_dir:
-                out = os.path.join(dump_dir, f"pid_{pid}")
-                os.makedirs(out, exist_ok=True)
-                p = os.path.join(out, f"fd_{fd}.bin")
-                with open(p, "wb") as f:
-                    f.write(data)
-                print(Fore.GREEN + f"    Dumped FD: {p}")
+                try:
+                    out = os.path.join(dump_dir, f"pid_{pid}")
+                    os.makedirs(out, exist_ok=True)
+                    p = os.path.join(out, f"fd_{fd}.bin")
+                    with open(p, "wb") as f:
+                        f.write(data)
+                    print(Fore.GREEN + f"    Dumped FD: {p}")
+                    entry["dump_file"] = p
+                except Exception:
+                    pass
+
+            fd_matches.append(entry)
+
+    return fd_matches
 
 
 # ======================================================================
@@ -306,14 +429,24 @@ def scan_fds(pid, rules, dump_dir, max_read):
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.3 (threaded)")
+    parser = argparse.ArgumentParser(
+        description="Hybrid YARA Memory Scanner v5.6 (threaded + JSON)"
+    )
     parser.add_argument("-r", "--rule", required=True, help="YARA rule file")
     parser.add_argument("--dump-dir", help="Dump directory for matched regions/FDs")
-    parser.add_argument("--max-read", type=int, default=5*1024*1024, help="Max bytes to read per region/FD")
-    parser.add_argument("--threads", type=int, default=4, help="Number of threads for Phase 1 PID scan")
+    parser.add_argument("--max-read", type=int, default=5*1024*1024,
+                        help="Max bytes to read per region/FD")
+    parser.add_argument("--threads", type=int, default=4,
+                        help="Number of threads for Phase 1 PID scan")
     parser.add_argument("--no-fd-scan", action="store_true",
                         help="Disable scanning /proc/<pid>/fd descriptors (faster)")
+    parser.add_argument("--json-report",
+                        help="If set, write full JSON report to this file")
+
     args = parser.parse_args()
+
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
 
     print(Fore.CYAN + f"[*] Loading YARA rules: {args.rule}")
     rules = yara.compile(filepath=args.rule)
@@ -326,10 +459,14 @@ def main():
     # PHASE 1 — threaded native PID scanning
     # --------------------------------------------------------------
     print(Fore.CYAN + "[*] Phase 1 — YARA native PID scan (threaded)")
+    print(Fore.CYAN + f"[*] Skipping scanner PID={self_pid} and parent PID={parent_pid}\n")
 
     matched = {}
 
     def scan_one(pid):
+        # Skip own process + parent to avoid self/noise
+        if pid == self_pid or pid == parent_pid:
+            return pid, []
         try:
             res = rules.match(pid=pid)
             return pid, res
@@ -348,16 +485,20 @@ def main():
                     exe = proc.exe()
                     cmd = " ".join(proc.cmdline())
                     name = proc.name()
+                    sha = compute_sha256(exe)
                 except Exception:
                     exe = "<unknown>"
                     cmd = "<unknown>"
                     name = "<unknown>"
+                    sha = None
 
                 rule_names = [m.rule for m in res]
                 print(
                     Fore.GREEN +
-                    f"[+] Match in PID {pid} | Name: {name} | EXE: {exe} | "
-                    f"CMD: {cmd} | Rules: {rule_names}"
+                    f"[+] Match in PID {pid} | Name: {name} | EXE: {exe}\n"
+                    f"    CMD: {cmd}\n"
+                    f"    SHA256: {sha}\n"
+                    f"    Rules: {rule_names}\n"
                 )
 
     print(f"\n[*] Phase 1 done. Matched {len(matched)} processes.\n")
@@ -365,8 +506,21 @@ def main():
     # --------------------------------------------------------------
     # PHASE 2 — deep forensics per matched PID
     # --------------------------------------------------------------
+    json_results = []
+
     for pid, yara_matches in matched.items():
         print(Fore.CYAN + f"\n==================== PID {pid} ====================")
+
+        proc_entry = {
+            "pid": pid,
+            "name": None,
+            "exe": None,
+            "cmdline": None,
+            "sha256": None,
+            "injection_indicators": [],
+            "regions": [],
+            "fd_matches": []
+        }
 
         # process metadata
         try:
@@ -381,11 +535,18 @@ def main():
             print(f"  EXE    : {exe}")
             print(f"  CMD    : {cmd}")
             print(f"  SHA256 : {sha}")
+
+            proc_entry["name"] = proc.name()
+            proc_entry["exe"] = exe
+            proc_entry["cmdline"] = cmd
+            proc_entry["sha256"] = sha
         except Exception:
             print("  <metadata unavailable>")
 
         # injection indicators
         indicators = detect_injection_indicators(pid)
+        proc_entry["injection_indicators"] = indicators
+
         print(Fore.YELLOW + "\nInjection Indicators:")
         if indicators:
             for i in indicators:
@@ -393,16 +554,38 @@ def main():
         else:
             print("  <none>")
 
-        # Deep memory region scanning
-        deep_scan_memory(pid, rules, args.dump_dir, args.max_read)
+        # Deep memory region scanning (terminal + JSON)
+        regions_report = deep_scan_memory(pid, rules, args.dump_dir, args.max_read)
+        proc_entry["regions"] = regions_report
 
-        # FD scanning (new condition)
+        # FD scanning (terminal + JSON)
         if not args.no_fd_scan:
-            scan_fds(pid, rules, args.dump_dir, args.max_read)
+            fd_report = scan_fds(pid, rules, args.dump_dir, args.max_read)
+            proc_entry["fd_matches"] = fd_report
         else:
             print(Fore.YELLOW + "Skipping FD scan (--no-fd-scan enabled)")
 
         print(Fore.CYAN + f"\n====================================================\n")
+
+        json_results.append(proc_entry)
+
+    # --------------------------------------------------------------
+    # JSON report
+    # --------------------------------------------------------------
+    if args.json_report:
+        report = {
+            "generated_at": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            "rule_file": args.rule,
+            "results": json_results
+        }
+        try:
+            with open(args.json_report, "w") as f:
+                json.dump(report, f, indent=2)
+            print(Fore.CYAN + f"[*] JSON report written → {args.json_report}")
+        except Exception as e:
+            print(Fore.RED + f"[!] Failed to write JSON report: {e}")
+
+    print(Fore.GREEN + "\n[*] DONE.\n")
 
 
 if __name__ == "__main__":
