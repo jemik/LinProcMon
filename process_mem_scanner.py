@@ -2,23 +2,23 @@
 """
 process_mem_scanner.py
 
-Linux process memory scanner using YARA.
+Linux process memory scanner using YARA with full support for yara-python >= 4.3
+(including 4.5.x).
+
 Features:
-- Scans all readable memory regions from /proc/<pid>/mem
-- Prints PID, PPID, path, cmdline, SHA256
-- Shows parent and children
-- Shows YARA matches with offset and 256 bytes around match
+- Scans all readable memory regions in /proc/<pid>/mem
+- Skips scanning its own PID (and its parent)
+- Displays PID, PPID, exe path, cmdline, SHA256
+- Displays parent and children
+- Shows YARA matches with offset and 256 bytes of hex context
 - Highlights matched bytes in RED
-- Skips scanning itself (and its parent)
 """
 
 import argparse
 import os
 import sys
-import time
 import datetime
 import hashlib
-
 import psutil
 import yara
 from colorama import Fore, Style, init as colorama_init
@@ -26,12 +26,11 @@ from colorama import Fore, Style, init as colorama_init
 colorama_init(autoreset=True)
 
 
-# ----------------------------------------------------------------------
-# Utility Functions
-# ----------------------------------------------------------------------
+# -------------------------------------------------------------
+# Utility
+# -------------------------------------------------------------
 
 def compute_sha256(path):
-    """Return SHA256 of file or None."""
     if not path or not os.path.isfile(path):
         return None
     h = hashlib.sha256()
@@ -44,22 +43,21 @@ def compute_sha256(path):
         return None
 
 
-def get_process_info(proc: psutil.Process):
-    """Return info about process as dict."""
+def get_process_info(proc):
     info = {
         "pid": None,
         "ppid": None,
+        "name": None,
         "exe": None,
         "cmdline": None,
-        "name": None,
         "sha256": None,
     }
     try:
         info["pid"] = proc.pid
         info["ppid"] = proc.ppid()
+        info["name"] = proc.name()
         info["exe"] = proc.exe()
         info["cmdline"] = " ".join(proc.cmdline())
-        info["name"] = proc.name()
         info["sha256"] = compute_sha256(info["exe"])
     except Exception:
         pass
@@ -71,39 +69,33 @@ def print_process_info(title, info, indent=""):
     if not info:
         print(f"{indent}  <unavailable>")
         return
+    print(f"{indent}  PID   : {info['pid']}")
+    print(f"{indent}  Name  : {info['name']}")
+    print(f"{indent}  PPID  : {info['ppid']}")
+    print(f"{indent}  EXE   : {info['exe']}")
+    print(f"{indent}  CMD   : {info['cmdline']}")
+    print(f"{indent}  SHA256: {info['sha256']}")
 
-    print(f"{indent}  PID   : {info.get('pid')}")
-    print(f"{indent}  Name  : {info.get('name')}")
-    print(f"{indent}  PPID  : {info.get('ppid')}")
-    print(f"{indent}  EXE   : {info.get('exe')}")
-    print(f"{indent}  CMD   : {info.get('cmdline')}")
-    print(f"{indent}  SHA256: {info.get('sha256')}")
 
-
-def hex_dump_with_highlight(data: bytes, base_addr: int, match_offset: int,
-                            match_len: int, context_bytes: int = 256):
-    """
-    Dump hex around matched bytes (256 bytes) with red highlighting.
-    """
-    half = context_bytes // 2
+def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=256):
+    half = context // 2
     start = max(0, match_offset - half)
     end = min(len(data), match_offset + match_len + half)
-
     snippet = data[start:end]
     snippet_base = base_addr + start
 
     print(f"      Hex dump (0x{snippet_base:016x} - 0x{snippet_base + len(snippet):016x}):")
 
     for i in range(0, len(snippet), 16):
-        line = snippet[i:i + 16]
+        line = snippet[i:i+16]
         addr = snippet_base + i
 
         hex_parts = []
         ascii_parts = []
 
         for j, b in enumerate(line):
-            global_index = start + i + j
-            in_match = match_offset <= global_index < match_offset + match_len
+            gi = start + i + j  # index in region data
+            in_match = match_offset <= gi < (match_offset + match_len)
 
             h = f"{b:02x}"
             c = chr(b) if 32 <= b <= 126 else "."
@@ -121,12 +113,14 @@ def hex_dump_with_highlight(data: bytes, base_addr: int, match_offset: int,
         print(f"        0x{addr:016x}  {hex_str:<48}  {ascii_str}")
 
 
-# ----------------------------------------------------------------------
-# Memory Scanning
-# ----------------------------------------------------------------------
+# -------------------------------------------------------------
+# Memory scanning
+# -------------------------------------------------------------
 
-def scan_process(pid: int, rules, max_region_size: int):
-    """Scan memory regions for a single PID. Returns match tuples."""
+def scan_process(pid, rules, max_region):
+    """
+    Returns list of (match_object, proc_info, region_base, region_data)
+    """
     results = []
 
     maps_path = f"/proc/{pid}/maps"
@@ -152,6 +146,7 @@ def scan_process(pid: int, rules, max_region_size: int):
             addr_range = parts[0]
             perms = parts[1]
 
+            # Only read readable regions
             if "r" not in perms:
                 continue
 
@@ -163,7 +158,7 @@ def scan_process(pid: int, rules, max_region_size: int):
             if region_size <= 0:
                 continue
 
-            read_size = min(region_size, max_region_size)
+            read_size = min(region_size, max_region)
 
             try:
                 mem_f.seek(region_start)
@@ -175,42 +170,39 @@ def scan_process(pid: int, rules, max_region_size: int):
                 continue
 
             try:
-                rule_matches = rules.match(data=region_data)
+                matches = rules.match(data=region_data)
             except Exception:
                 continue
 
-            if not rule_matches:
+            if not matches:
                 continue
 
-            pinfo = get_process_info(proc)
+            proc_info = get_process_info(proc)
 
-            for m in rule_matches:
-                results.append((m, pinfo, region_start, region_data))
+            for m in matches:
+                results.append((m, proc_info, region_start, region_data))
 
     return results
 
 
-# ----------------------------------------------------------------------
+# -------------------------------------------------------------
 # MAIN
-# ----------------------------------------------------------------------
+# -------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Scan Linux processes with YARA and show memory offsets + context."
-    )
-    parser.add_argument("-r", "--rule", required=True, help="Path to YARA rule file")
-    parser.add_argument("--max-region-size", type=int, default=50 * 1024 * 1024,
-                        help="Max bytes per memory region (default 50MB)")
+    parser = argparse.ArgumentParser(description="Scan live processes with YARA.")
+    parser.add_argument("-r", "--rule", required=True, help="Path to YARA rule")
+    parser.add_argument("--max-region-size", type=int, default=50*1024*1024,
+                        help="Max bytes per memory region (default=50MB)")
     args = parser.parse_args()
 
-    # Load YARA rules
     try:
         rules = yara.compile(filepath=args.rule)
     except Exception as e:
-        print(Fore.RED + f"[!] Failed to compile YARA: {e}")
+        print(Fore.RED + f"[!] Failed to load YARA rule: {e}")
         sys.exit(1)
 
-    print(f"[*] Loaded YARA rules from {args.rule}")
+    print(f"[*] Using YARA rule: {args.rule}\n")
     print("[*] Scanning processes...\n")
 
     current_pid = os.getpid()
@@ -219,7 +211,7 @@ def main():
     for proc in psutil.process_iter(attrs=["pid"]):
         pid = proc.info["pid"]
 
-        # Skip own scanner and parent shell
+        # Avoid self false positives
         if pid == current_pid or pid == parent_pid:
             continue
 
@@ -231,46 +223,46 @@ def main():
         if not matches:
             continue
 
-        # Build process structure
+        # Process info
         try:
             p = psutil.Process(pid)
-        except Exception:
+        except psutil.NoSuchProcess:
             continue
 
         proc_info = get_process_info(p)
 
-        # Parent
+        # Parent info
         parent_info = None
         try:
-            parent = p.parent()
-            if parent:
-                parent_info = get_process_info(parent)
+            par = p.parent()
+            if par:
+                parent_info = get_process_info(par)
         except Exception:
             pass
 
-        # Children
-        children_info = []
+        # Children info
+        children = []
         try:
             for ch in p.children(recursive=False):
-                children_info.append(get_process_info(ch))
+                children.append(get_process_info(ch))
         except Exception:
             pass
 
-        timestamp = datetime.datetime.now().isoformat(timespec="seconds")
-        print(Fore.CYAN + f"[{timestamp}] Match in process PID {pid}")
+        # Header
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        print(Fore.CYAN + f"[{ts}] Match in process PID {pid}")
         print_process_info("Process", proc_info)
         print_process_info("Parent", parent_info)
         print()
-
-        if children_info:
+        if children:
             print("Children:")
-            for ci in children_info:
+            for ci in children:
                 print_process_info(f"  Child PID {ci['pid']}", ci, indent="  ")
             print()
         else:
             print("Children: <none>\n")
 
-        # Handle each match
+        # Each YARA rule match
         for m, pinfo, region_base, region_data in matches:
             print(Fore.MAGENTA + f"  YARA Rule Matched: {m.rule} (namespace={m.namespace})")
 
@@ -278,22 +270,25 @@ def main():
                 meta_str = ", ".join(f"{k}={v!r}" for k, v in m.meta.items())
                 print(f"    Meta: {meta_str}")
 
-            # Correct handling of StringMatch objects
+            # YARA 4.5.4 correct iteration:
             for s in m.strings:
-                off = s.offset
                 ident = s.identifier
-                data = s.data
 
-                va = region_base + off
-                print(Fore.GREEN + f"    String: {ident} Offset: 0x{va:016x} len={len(data)}")
+                for match in s.matches:
+                    off = match.offset
+                    data = match.data
+                    length = match.length
 
-                hex_dump_with_highlight(
-                    data=region_data,
-                    base_addr=region_base,
-                    match_offset=off,
-                    match_len=len(data),
-                    context_bytes=256,
-                )
+                    va = region_base + off
+                    print(Fore.GREEN + f"    String: {ident} Offset=0x{va:016x} len={length}")
+
+                    hex_dump_with_highlight(
+                        region_data,
+                        region_base,
+                        match_offset=off,
+                        match_len=length,
+                        context=256
+                    )
 
             print("-" * 80)
 
