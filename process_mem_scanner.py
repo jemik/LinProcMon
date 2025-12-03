@@ -199,7 +199,7 @@ def deep_scan_memory(pid, rules, dump_dir, max_read, json_slot):
             continue
 
         try:
-            matches = rules.match(data=region)
+            matches = rules.match(pid=pid, offset=start, length=size)
         except:
             continue
 
