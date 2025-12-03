@@ -1,21 +1,17 @@
 #!/usr/bin/env python3
 """
 process_mem_scanner.py
-
-Linux live process YARA scanner.
-Compatible with yara-python 4.5.4 (StringMatch.instances API).
+Linux live process memory scanner using YARA.
+Fully compatible with yara-python 4.5.4.
 
 Features:
-- Scans all readable memory regions from /proc/<pid>/mem
-- Skips scanning its own PID and parent PID
-- Prints PID, PPID, EXE, cmdline, SHA256
-- Prints parent + child processes
-- Prints all YARA matches including:
-    * rule name
-    * meta fields
-    * matched string identifier
-    * match offset
-    * 256-byte hex dump around match (with matched bytes in RED)
+- Scans all readable memory regions via /proc/<pid>/mem
+- Correct YARA 4.5.4 match handling (StringMatchInstance.matched_data)
+- Shows PID, PPID, EXE, CMDLINE, SHA256
+- Prints parent and children
+- Prints YARA rule metadata
+- Dumps 256 bytes around matched bytes, highlighted in RED
+- Skips scanning its own PID and its parent PID
 """
 
 import argparse
@@ -23,7 +19,6 @@ import os
 import sys
 import hashlib
 import datetime
-
 import psutil
 import yara
 from colorama import Fore, Style, init as colorama_init
@@ -51,17 +46,17 @@ def get_proc_info(proc):
     info = {
         "pid": None,
         "ppid": None,
+        "name": None,
         "exe": None,
         "cmdline": None,
-        "name": None,
-        "sha256": None
+        "sha256": None,
     }
     try:
         info["pid"] = proc.pid
         info["ppid"] = proc.ppid()
+        info["name"] = proc.name()
         info["exe"] = proc.exe()
         info["cmdline"] = " ".join(proc.cmdline())
-        info["name"] = proc.name()
         info["sha256"] = compute_sha256(info["exe"])
     except Exception:
         pass
@@ -83,7 +78,7 @@ def print_proc_info(title, info, indent=""):
 
 
 # ---------------------------------------------------------------------
-# Hex dump around match
+# Hex dump with match highlighting
 # ---------------------------------------------------------------------
 
 def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=256):
@@ -103,7 +98,7 @@ def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=25
         ascii_parts = []
 
         for j, b in enumerate(line):
-            gi = start + i + j  # global index inside region_data
+            gi = start + i + j
             in_match = match_offset <= gi < (match_offset + match_len)
 
             h = f"{b:02x}"
@@ -123,12 +118,12 @@ def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=25
 
 
 # ---------------------------------------------------------------------
-# Process memory scanning
+# Scan a process memory
 # ---------------------------------------------------------------------
 
 def scan_pid_memory(pid, rules, max_region):
     """
-    Returns list of (match_obj, process_info, region_base, region_data)
+    Returns list of (YARAMatchObject, proc_info, region_base, region_data)
     """
     results = []
 
@@ -152,7 +147,6 @@ def scan_pid_memory(pid, rules, max_region):
             if len(parts) < 2:
                 continue
 
-            # r-xp / rwxp / r--p etc
             perms = parts[1]
             if "r" not in perms:
                 continue
@@ -184,7 +178,6 @@ def scan_pid_memory(pid, rules, max_region):
                 continue
 
             pinfo = get_proc_info(proc)
-
             for m in matches:
                 results.append((m, pinfo, region_start, region_data))
 
@@ -196,10 +189,10 @@ def scan_pid_memory(pid, rules, max_region):
 # ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Live Linux YARA process memory scanner (YARA 4.5.4)")
+    parser = argparse.ArgumentParser(description="Live Linux YARA process memory scanner (yara-python 4.5.4)")
     parser.add_argument("-r", "--rule", required=True, help="Path to YARA rule file")
     parser.add_argument("--max-region-size", type=int, default=50*1024*1024,
-                        help="Limit per region read (default 50MB)")
+                        help="Max bytes read per region")
     args = parser.parse_args()
 
     try:
@@ -217,7 +210,6 @@ def main():
     for proc in psutil.process_iter(attrs=["pid"]):
         pid = proc.info["pid"]
 
-        # Avoid false positives
         if pid == own_pid or pid == parent_pid:
             continue
 
@@ -229,7 +221,6 @@ def main():
         if not results:
             continue
 
-        # Process info
         try:
             p = psutil.Process(pid)
         except psutil.NoSuchProcess:
@@ -237,16 +228,14 @@ def main():
 
         proc_info = get_proc_info(p)
 
-        # Parent info
         parent_info = None
         try:
-            par = p.parent()
-            if par:
-                parent_info = get_proc_info(par)
+            parent = p.parent()
+            if parent:
+                parent_info = get_proc_info(parent)
         except Exception:
             pass
 
-        # Children
         children = []
         try:
             for c in p.children(recursive=False):
@@ -268,23 +257,21 @@ def main():
         else:
             print("Children: <none>\n")
 
-        # YARA matches
+        # Correct YARA 4.5.4 match model
         for m, pinfo, region_base, region_data in results:
             print(Fore.MAGENTA + f"  YARA Rule Matched: {m.rule}")
 
-            # Meta
             if m.meta:
-                meta_str = ", ".join(f"{k}={v!r}" for k, v in m.meta.items())
-                print(f"    Meta: {meta_str}")
+                meta = ", ".join(f"{k}={v!r}" for k, v in m.meta.items())
+                print(f"    Meta: {meta}")
 
-            # Strings - YARA 4.5.4
             for s in m.strings:
                 ident = s.identifier
 
                 for inst in s.instances:
                     off = inst.offset
-                    data = inst.data
-                    length = len(data)      # <-- FIX FOR YARA 4.5.4
+                    data = inst.matched_data
+                    length = len(data)
 
                     va = region_base + off
                     print(Fore.GREEN + f"    String: {ident} Offset=0x{va:016x} len={length}")
