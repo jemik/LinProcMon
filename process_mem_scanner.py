@@ -306,10 +306,13 @@ def scan_fds(pid, rules, dump_dir, max_read):
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.1")
-    parser.add_argument("-r", "--rule", required=True)
-    parser.add_argument("--dump-dir")
-    parser.add_argument("--max-read", type=int, default=5*1024*1024)
+    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.3 (threaded)")
+    parser.add_argument("-r", "--rule", required=True, help="YARA rule file")
+    parser.add_argument("--dump-dir", help="Dump directory for matched regions/FDs")
+    parser.add_argument("--max-read", type=int, default=5*1024*1024, help="Max bytes to read per region/FD")
+    parser.add_argument("--threads", type=int, default=4, help="Number of threads for Phase 1 PID scan")
+    parser.add_argument("--no-fd-scan", action="store_true",
+                        help="Disable scanning /proc/<pid>/fd descriptors (faster)")
     args = parser.parse_args()
 
     print(Fore.CYAN + f"[*] Loading YARA rules: {args.rule}")
@@ -317,22 +320,51 @@ def main():
 
     print("[*] Enumerating processes...")
     pids = [p.pid for p in psutil.process_iter()]
-    print(f"[*] {len(pids)} processes found")
+    print(f"[*] {len(pids)} processes found\n")
 
-    print("\n[*] Phase 1 — YARA native PID scan")
+    # --------------------------------------------------------------
+    # PHASE 1 — threaded native PID scanning
+    # --------------------------------------------------------------
+    print(Fore.CYAN + "[*] Phase 1 — YARA native PID scan (threaded)")
+
     matched = {}
 
-    for pid in pids:
+    def scan_one(pid):
         try:
             res = rules.match(pid=pid)
+            return pid, res
         except Exception:
-            continue
-        if res:
-            matched[pid] = res
-            print(Fore.GREEN + f"[+] Match in PID {pid}: {[m.rule for m in res]}")
+            return pid, []
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=args.threads) as executor:
+        futures = {executor.submit(scan_one, pid): pid for pid in pids}
+        for fut in as_completed(futures):
+            pid, res = fut.result()
+            if res:
+                matched[pid] = res
+                try:
+                    proc = psutil.Process(pid)
+                    exe = proc.exe()
+                    cmd = " ".join(proc.cmdline())
+                    name = proc.name()
+                except Exception:
+                    exe = "<unknown>"
+                    cmd = "<unknown>"
+                    name = "<unknown>"
+
+                rule_names = [m.rule for m in res]
+                print(
+                    Fore.GREEN +
+                    f"[+] Match in PID {pid} | Name: {name} | EXE: {exe} | "
+                    f"CMD: {cmd} | Rules: {rule_names}"
+                )
 
     print(f"\n[*] Phase 1 done. Matched {len(matched)} processes.\n")
 
+    # --------------------------------------------------------------
+    # PHASE 2 — deep forensics per matched PID
+    # --------------------------------------------------------------
     for pid, yara_matches in matched.items():
         print(Fore.CYAN + f"\n==================== PID {pid} ====================")
 
@@ -349,7 +381,7 @@ def main():
             print(f"  EXE    : {exe}")
             print(f"  CMD    : {cmd}")
             print(f"  SHA256 : {sha}")
-        except:
+        except Exception:
             print("  <metadata unavailable>")
 
         # injection indicators
@@ -364,8 +396,11 @@ def main():
         # Deep memory region scanning
         deep_scan_memory(pid, rules, args.dump_dir, args.max_read)
 
-        # FD scanning
-        scan_fds(pid, rules, args.dump_dir, args.max_read)
+        # FD scanning (new condition)
+        if not args.no_fd_scan:
+            scan_fds(pid, rules, args.dump_dir, args.max_read)
+        else:
+            print(Fore.YELLOW + "Skipping FD scan (--no-fd-scan enabled)")
 
         print(Fore.CYAN + f"\n====================================================\n")
 
