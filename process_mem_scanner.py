@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-process_mem_scanner_v5.5 — Hybrid YARA Memory Scanner
+process_mem_scanner_v5.5.1 — Hybrid YARA Memory Scanner
 
-NEW IN v5.5:
+NEW:
     • Parallel Phase 2 deep scanning (ProcessPoolExecutor)
     • JSON reporting (--json-report <file>)
-    • Improved result structure
+    • Human-readable Phase 2 output using deep scan results
     • Self-exclusion (scanner PID + parent PID)
 """
 
@@ -165,7 +165,7 @@ def deep_worker(args):
     try:
         rules = yara.compile(filepath=rule_path)
     except Exception as e:
-        result["errors"].append(str(e))
+        result["errors"].append(f"rule compile: {e}")
         return result
 
     maps_path = f"/proc/{pid}/maps"
@@ -178,14 +178,6 @@ def deep_worker(args):
     # Indicators
     indicators = detect_injection_indicators(pid)
     result["injection_indicators"] = indicators
-
-    # Architecture
-    try:
-        exe = psutil.Process(pid).exe()
-        arch = detect_arch(exe)
-    except:
-        arch = "x86_64"
-    md = get_disassembler(arch)
 
     # Deep scan memory
     for line in maps:
@@ -210,7 +202,8 @@ def deep_worker(args):
 
         try:
             matches = rules.match(data=region)
-        except:
+        except Exception as e:
+            result["errors"].append(f"YARA mem region error: {e}")
             continue
 
         if not matches:
@@ -223,7 +216,6 @@ def deep_worker(args):
             "matches": []
         }
 
-        # record matches
         for m in matches:
             for s in m.strings:
                 ident = s.identifier
@@ -231,7 +223,6 @@ def deep_worker(args):
                     off = inst.offset
                     abs_off = start + off
                     mlen = len(inst.matched_data)
-
                     region_entry["matches"].append({
                         "rule": m.rule,
                         "string": ident,
@@ -239,7 +230,6 @@ def deep_worker(args):
                         "length": mlen
                     })
 
-        # dump region if requested
         if dump_dir:
             outdir = os.path.join(dump_dir, f"pid_{pid}")
             os.makedirs(outdir, exist_ok=True)
@@ -261,7 +251,7 @@ def deep_worker(args):
                 full = os.path.join(fd_path, fd)
                 try:
                     target = os.readlink(full)
-                except:
+                except Exception:
                     continue
 
                 if target.startswith("socket:") or target.startswith("pipe:"):
@@ -270,12 +260,12 @@ def deep_worker(args):
                 try:
                     with open(full, "rb") as f:
                         data = f.read(max_read)
-                except:
+                except Exception:
                     continue
 
                 try:
                     fd_matches = rules.match(data=data)
-                except:
+                except Exception:
                     continue
 
                 if fd_matches:
@@ -306,7 +296,7 @@ def deep_worker(args):
 # ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.5 (parallel deep scan)")
+    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.5.1 (parallel deep scan)")
     parser.add_argument("-r", "--rule", required=True)
     parser.add_argument("--dump-dir")
     parser.add_argument("--max-read", type=int, default=5*1024*1024)
@@ -319,7 +309,6 @@ def main():
                         help="Save full scan results to a JSON file")
     args = parser.parse_args()
 
-    # self PID exclusion
     self_pid = os.getpid()
     parent_pid = os.getppid()
 
@@ -328,11 +317,13 @@ def main():
 
     rules = yara.compile(filepath=args.rule)
 
-    # Phase 1 — Threaded YARA scan
     print("[*] Enumerating processes...")
     pids = [p.pid for p in psutil.process_iter()]
     print(f"[*] Found {len(pids)} processes.\n")
 
+    # ---------------------------
+    # Phase 1 — threaded PID scan
+    # ---------------------------
     print(Fore.CYAN + "[*] Phase 1 — threaded YARA PID scan\n")
     matched = {}
 
@@ -342,17 +333,15 @@ def main():
         try:
             res = rules.match(pid=pid)
             return pid, res
-        except:
+        except Exception:
             return pid, []
 
     with ThreadPoolExecutor(max_workers=args.threads) as exe:
         futures = {exe.submit(scan_one, pid): pid for pid in pids}
         for fut in as_completed(futures):
             pid, res = fut.result()
-
             if pid == self_pid or pid == parent_pid:
                 continue
-
             if res:
                 matched[pid] = res
                 try:
@@ -360,7 +349,7 @@ def main():
                     name = proc.name()
                     exe_path = proc.exe()
                     cmd = " ".join(proc.cmdline())
-                except:
+                except Exception:
                     name = exe_path = cmd = "<unknown>"
 
                 print(
@@ -375,7 +364,9 @@ def main():
         print(Fore.YELLOW + "[*] No matches found.")
         return
 
-    # Phase 2 — Parallel deep scan
+    # ---------------------------
+    # Phase 2 — parallel deep scan
+    # ---------------------------
     print(Fore.CYAN + "[*] Phase 2 — deep forensic scanning (parallel)\n")
 
     tasks = [
@@ -385,19 +376,100 @@ def main():
     ]
 
     results = {}
-
     with ProcessPoolExecutor(max_workers=args.deep_workers) as exe:
         futures = {exe.submit(deep_worker, t): t[0] for t in tasks}
         for fut in as_completed(futures):
             pid = futures[fut]
             try:
-                results[pid] = fut.result()
+                res = fut.result()
+                results[pid] = res
                 print(Fore.GREEN + f"[+] Deep scan complete for PID {pid}")
             except Exception as e:
                 print(Fore.RED + f"[!] Deep scan failed for PID {pid}: {e}")
-                results[pid] = {"pid": pid, "error": str(e)}
+                results[pid] = {"pid": pid, "memory_regions": [], "fd_matches": [],
+                                "injection_indicators": [], "errors": [str(e)]}
 
-    # JSON Report
+    # ---------------------------
+    # Pretty-print Phase 2 results
+    # ---------------------------
+    for pid, res in results.items():
+        print(Fore.CYAN + f"\n==================== PID {pid} ====================")
+
+        # process metadata
+        try:
+            proc = psutil.Process(pid)
+            exe = proc.exe()
+            cmd = " ".join(proc.cmdline())
+            sha = compute_sha256(exe)
+            name = proc.name()
+        except Exception:
+            exe = cmd = name = "<unknown>"
+            sha = None
+
+        print(Fore.YELLOW + "Process Info:")
+        print(f"  PID    : {pid}")
+        print(f"  Name   : {name}")
+        print(f"  EXE    : {exe}")
+        print(f"  CMD    : {cmd}")
+        print(f"  SHA256 : {sha}")
+
+        # errors if any
+        if res.get("errors"):
+            print(Fore.RED + "\n  Errors:")
+            for e in res["errors"]:
+                print(Fore.RED + f"    - {e}")
+
+        # injection indicators
+        print(Fore.YELLOW + "\nInjection Indicators:")
+        indicators = res.get("injection_indicators") or []
+        if indicators:
+            for ind in indicators:
+                print(Fore.RED + f"  [!] {ind}")
+        else:
+            print("  <none>")
+
+        # memory regions
+        mem_regions = res.get("memory_regions") or []
+        if mem_regions:
+            print(Fore.YELLOW + "\nMemory Region Matches:")
+            for region in mem_regions:
+                addr = region.get("address")
+                perms = region.get("perms")
+                entropy = region.get("entropy")
+                dump_file = region.get("dump_file")
+                print(Fore.CYAN + f"  - Region {addr} perms={perms} entropy={entropy:.3f}")
+                if dump_file:
+                    print(f"      Dump: {dump_file}")
+                matches = region.get("matches") or []
+                for m in matches:
+                    print(
+                        f"      Rule={m['rule']} String={m['string']} "
+                        f"Offset={m['absolute_offset']} Len={m['length']}"
+                    )
+        else:
+            print(Fore.YELLOW + "\nMemory Region Matches:")
+            print("  <none>")
+
+        # FD matches
+        fds = res.get("fd_matches") or []
+        if fds:
+            print(Fore.YELLOW + "\nFD Matches:")
+            for fd in fds:
+                print(
+                    Fore.CYAN +
+                    f"  - FD {fd['fd']} target={fd['target']} rules={fd['rules']}"
+                )
+                if fd.get("dump"):
+                    print(f"      Dump: {fd['dump']}")
+        else:
+            print(Fore.YELLOW + "\nFD Matches:")
+            print("  <none>")
+
+        print(Fore.CYAN + f"\n====================================================\n")
+
+    # ---------------------------
+    # JSON report
+    # ---------------------------
     if args.json_report:
         report = {
             "timestamp": now_iso(),
@@ -413,15 +485,13 @@ def main():
                 "injection_indicators": res.get("injection_indicators", []),
                 "errors": res.get("errors", [])
             }
-
-            # Add metadata from Phase 1
             try:
                 proc = psutil.Process(pid)
                 entry["name"] = proc.name()
                 entry["exe"] = proc.exe()
                 entry["cmd"] = " ".join(proc.cmdline())
                 entry["sha256"] = compute_sha256(proc.exe())
-            except:
+            except Exception:
                 entry["name"] = "<unknown>"
                 entry["exe"] = "<unknown>"
                 entry["cmd"] = "<unknown>"
