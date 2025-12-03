@@ -1,55 +1,54 @@
 #!/usr/bin/env python3
 """
-process_mem_scanner_v3.2.py
-Multithreaded Linux memory + FD scanner using YARA 4.5.4
+process_mem_scanner_v5.5 — Hybrid YARA Memory Scanner
 
-New in v3.2:
-- Per-process timeout (default 60 sec)
-- Skips zombie + kernel threads automatically
-- NEVER hangs on /proc/<pid>/mem again
-- Full v3.1 human-readable output including:
-  * PID, PPID, EXE, CMD, SHA256
-  * Parent + children
-  * Entropy of region/FD
-  * YARA rule + meta
-  * String + offset + len
-  * 256-byte hex dump with match highlighted in RED
+NEW IN v5.5:
+    • Parallel Phase 2 deep scanning (ProcessPoolExecutor)
+    • JSON reporting (--json-report <file>)
+    • Improved result structure
+    • Self-exclusion (scanner PID + parent PID)
 """
 
-import argparse
 import os
 import sys
-import time
+import yara
+import psutil
+import argparse
+import struct
+import hashlib
 import math
 import json
-import hashlib
 import datetime
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    ProcessPoolExecutor,
+    as_completed
+)
 
-import psutil
-import yara
-from concurrent.futures import ThreadPoolExecutor, as_completed, TimeoutError
 from colorama import Fore, Style, init as colorama_init
+from capstone import *
 
 colorama_init(autoreset=True)
 
-
-# =====================================================================
+# ======================================================================
 # Utility
-# =====================================================================
+# ======================================================================
 
-def shannon_entropy(data: bytes) -> float:
+def now_iso():
+    return datetime.datetime.utcnow().replace(microsecond=0).isoformat()
+
+
+def shannon_entropy(data):
     if not data:
         return 0.0
-    freq = {b: data.count(b) for b in set(data)}
-    probs = [c / len(data) for c in freq.values()]
+    freqs = {b: data.count(b) for b in set(data)}
+    probs = [c / len(data) for c in freqs.values()]
     return -sum(p * math.log2(p) for p in probs)
 
 
 def compute_sha256(path):
-    if not path or not os.path.isfile(path):
-        return None
-    h = hashlib.sha256()
     try:
+        h = hashlib.sha256()
         with open(path, "rb") as f:
             for chunk in iter(lambda: f.read(8192), b""):
                 h.update(chunk)
@@ -58,414 +57,384 @@ def compute_sha256(path):
         return None
 
 
-def get_proc_info(proc: psutil.Process):
-    info = {}
+def detect_arch(exe_path):
     try:
-        info["pid"] = proc.pid
-        info["ppid"] = proc.ppid()
-        info["name"] = proc.name()
-        info["exe"] = proc.exe()
-        info["cmdline"] = " ".join(proc.cmdline())
-        info["sha256"] = compute_sha256(info["exe"])
+        with open(exe_path, "rb") as f:
+            hdr = f.read(0x40)
+    except Exception:
+        return "x86_64"
+
+    if len(hdr) < 20:
+        return "x86_64"
+
+    ei_class = hdr[4]
+    e_machine = struct.unpack("<H", hdr[18:20])[0]
+
+    if ei_class == 2:  # 64-bit ELF
+        if e_machine == 0x3E:
+            return "x86_64"
+        if e_machine == 0xB7:
+            return "arm64"
+    else:
+        if e_machine == 0x03:
+            return "x86"
+        if e_machine == 0x28:
+            return "arm"
+    return "x86_64"
+
+
+def get_disassembler(arch):
+    if arch == "x86_64": return Cs(CS_ARCH_X86, CS_MODE_64)
+    if arch == "x86": return Cs(CS_ARCH_X86, CS_MODE_32)
+    if arch == "arm64": return Cs(CS_ARCH_ARM64, CS_MODE_ARM)
+    if arch == "arm": return Cs(CS_ARCH_ARM, CS_MODE_ARM)
+    return Cs(CS_ARCH_X86, CS_MODE_64)
+
+
+# ======================================================================
+# Indicator detection
+# ======================================================================
+
+def detect_injection_indicators(pid):
+    indicators = []
+    maps_path = f"/proc/{pid}/maps"
+    smaps_path = f"/proc/{pid}/smaps"
+
+    try:
+        with open(maps_path, "r") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) < 5:
+                    continue
+                addr, perms, _, _, inode = parts[:5]
+                path = parts[5] if len(parts) >= 6 else ""
+
+                if "r" in perms and "w" in perms and "x" in perms:
+                    indicators.append(f"RWX region: {addr} {perms}")
+                if "x" in perms and inode == "0" and path in ("", "0"):
+                    indicators.append(f"Anonymous executable region: {addr}")
+                if "x" in perms and "memfd:" in path:
+                    indicators.append(f"memfd executable region: {addr} {path}")
     except Exception:
         pass
-    return info
+
+    try:
+        current = None
+        with open(smaps_path, "r") as f:
+            for line in f:
+                if "-" in line and ":" not in line:
+                    current = line.split()[0]
+                if line.startswith("VmFlags:"):
+                    flags = line.split(":")[1].strip().split()
+                    if "ex" in flags and ("mr" in flags or "mw" in flags):
+                        indicators.append(f"VmFlags RW→RX: {current}")
+    except Exception:
+        pass
+
+    return indicators
 
 
-def print_proc_info(title, info, indent=""):
-    print(f"{indent}{title}:")
-    if not info:
-        print(f"{indent}  <unavailable>")
-        return
-    print(f"{indent}  PID   : {info.get('pid')}")
-    print(f"{indent}  Name  : {info.get('name')}")
-    print(f"{indent}  PPID  : {info.get('ppid')}")
-    print(f"{indent}  EXE   : {info.get('exe')}")
-    print(f"{indent}  CMD   : {info.get('cmdline')}")
-    print(f"{indent}  SHA256: {info.get('sha256')}")
+# ======================================================================
+# Safe memory read
+# ======================================================================
+
+def read_region(pid, start, size, max_bytes):
+    try:
+        with open(f"/proc/{pid}/mem", "rb", 0) as f:
+            f.seek(start)
+            return f.read(min(size, max_bytes))
+    except Exception:
+        return None
 
 
-def progress_bar(prefix, current, total, start_time, bar_length=50):
-    elapsed = time.time() - start_time
-    rate = current / elapsed if elapsed > 0 else 0
-    remaining = (total - current) / rate if rate > 0 else 0
-    eta = time.strftime("%H:%M:%S", time.gmtime(remaining)) if remaining > 0 else "--:--:--"
+# ======================================================================
+# Deep scan worker (for multiprocessing)
+# ======================================================================
 
-    frac = current / total
-    filled = int(bar_length * frac)
-    bar = "+" * filled + "-" * (bar_length - filled)
+def deep_worker(args):
+    pid, rule_path, dump_dir, max_read, no_fd_scan = args
 
-    print(f"\r{prefix} | {current}/{total} [{bar}] ETA {eta}", end="", flush=True)
+    result = {
+        "pid": pid,
+        "memory_regions": [],
+        "fd_matches": [],
+        "injection_indicators": [],
+        "errors": []
+    }
 
-
-# =====================================================================
-# HEX DUMP
-# =====================================================================
-
-def hex_dump_with_highlight(data: bytes, base_addr: int, match_offset: int,
-                            match_len: int, context: int = 256):
-
-    half = context // 2
-    start = max(0, match_offset - half)
-    end = min(len(data), match_offset + match_len + half)
-    snippet = data[start:end]
-    snippet_base = base_addr + start
-
-    print(f"        Hex dump (0x{snippet_base:016x} - 0x{snippet_base + len(snippet):016x}):")
-
-    for i in range(0, len(snippet), 16):
-        line = snippet[i:i+16]
-        addr = snippet_base + i
-
-        hex_parts, ascii_parts = [], []
-        for j, b in enumerate(line):
-            gi = start + i + j
-            in_match = (match_offset <= gi < match_offset + match_len)
-
-            h = f"{b:02x}"
-            c = chr(b) if 32 <= b <= 126 else '.'
-
-            if in_match:
-                h = Fore.RED + h + Style.RESET_ALL
-                c = Fore.RED + c + Style.RESET_ALL
-
-            hex_parts.append(h)
-            ascii_parts.append(c)
-
-        print(f"        0x{addr:016x}  {' '.join(hex_parts):<48}  {''.join(ascii_parts)}")
-
-
-# =====================================================================
-# MEMORY SCAN
-# =====================================================================
-
-def scan_maps(pid, rules, max_read, only_exec, only_anon):
-    results = []
+    try:
+        rules = yara.compile(filepath=rule_path)
+    except Exception as e:
+        result["errors"].append(str(e))
+        return result
 
     maps_path = f"/proc/{pid}/maps"
-    mem_path = f"/proc/{pid}/mem"
-
     try:
-        proc = psutil.Process(pid)
-        status = proc.status()
-        if status in ("zombie", "dead"):
-            return results
-    except Exception:
-        return results
+        maps = open(maps_path).read().splitlines()
+    except Exception as e:
+        result["errors"].append(f"map read: {e}")
+        return result
 
+    # Indicators
+    indicators = detect_injection_indicators(pid)
+    result["injection_indicators"] = indicators
+
+    # Architecture
     try:
-        maps_f = open(maps_path, "r")
-        mem_f = open(mem_path, "rb", 0)
-    except Exception:
-        return results
+        exe = psutil.Process(pid).exe()
+        arch = detect_arch(exe)
+    except:
+        arch = "x86_64"
+    md = get_disassembler(arch)
 
-    with maps_f, mem_f:
-        for line in maps_f:
-            parts = line.split()
-            if len(parts) < 2:
-                continue
+    # Deep scan memory
+    for line in maps:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        addr_range, perms = parts[0], parts[1]
 
-            addr_range, perms = parts[0], parts[1]
+        if "r" not in perms:
+            continue
 
-            if only_exec and "x" not in perms:
-                continue
-            if only_anon:
-                if len(parts) < 6 or parts[5] != "0":
+        start_s, end_s = addr_range.split("-")
+        start = int(start_s, 16)
+        end = int(end_s, 16)
+        size = end - start
+        if size <= 0:
+            continue
+
+        region = read_region(pid, start, size, max_read)
+        if not region:
+            continue
+
+        try:
+            matches = rules.match(data=region)
+        except:
+            continue
+
+        if not matches:
+            continue
+
+        region_entry = {
+            "address": addr_range,
+            "perms": perms,
+            "entropy": shannon_entropy(region),
+            "matches": []
+        }
+
+        # record matches
+        for m in matches:
+            for s in m.strings:
+                ident = s.identifier
+                for inst in s.instances:
+                    off = inst.offset
+                    abs_off = start + off
+                    mlen = len(inst.matched_data)
+
+                    region_entry["matches"].append({
+                        "rule": m.rule,
+                        "string": ident,
+                        "absolute_offset": hex(abs_off),
+                        "length": mlen
+                    })
+
+        # dump region if requested
+        if dump_dir:
+            outdir = os.path.join(dump_dir, f"pid_{pid}")
+            os.makedirs(outdir, exist_ok=True)
+            dump_path = os.path.join(outdir, f"region_{addr_range.replace('-', '_')}.bin")
+            try:
+                with open(dump_path, "wb") as f:
+                    f.write(region)
+                region_entry["dump_file"] = dump_path
+            except Exception as e:
+                result["errors"].append(f"Dump error: {e}")
+
+        result["memory_regions"].append(region_entry)
+
+    # FD scanning
+    if not no_fd_scan:
+        fd_path = f"/proc/{pid}/fd"
+        if os.path.isdir(fd_path):
+            for fd in os.listdir(fd_path):
+                full = os.path.join(fd_path, fd)
+                try:
+                    target = os.readlink(full)
+                except:
                     continue
-            if "r" not in perms:
-                continue
 
-            start_s, end_s = addr_range.split("-")
-            start = int(start_s, 16)
-            end = int(end_s, 16)
-            size = end - start
-            if size <= 0:
-                continue
+                if target.startswith("socket:") or target.startswith("pipe:"):
+                    continue
 
-            read_size = min(size, max_read)
+                try:
+                    with open(full, "rb") as f:
+                        data = f.read(max_read)
+                except:
+                    continue
 
-            try:
-                mem_f.seek(start)
-                region_data = mem_f.read(read_size)
-            except Exception:
-                continue
+                try:
+                    fd_matches = rules.match(data=data)
+                except:
+                    continue
 
-            if not region_data:
-                continue
+                if fd_matches:
+                    entry = {
+                        "fd": fd,
+                        "target": target,
+                        "rules": [m.rule for m in fd_matches]
+                    }
 
-            try:
-                matches = rules.match(data=region_data)
-            except Exception:
-                continue
+                    if dump_dir:
+                        outdir = os.path.join(dump_dir, f"pid_{pid}")
+                        os.makedirs(outdir, exist_ok=True)
+                        dump_path = os.path.join(outdir, f"fd_{fd}.bin")
+                        try:
+                            with open(dump_path, "wb") as f:
+                                f.write(data)
+                            entry["dump"] = dump_path
+                        except Exception as e:
+                            result["errors"].append(f"FD dump: {e}")
 
-            if matches:
-                ent = shannon_entropy(region_data)
-                results.append({
-                    "pid": pid,
-                    "type": "maps",
-                    "region_start": start,
-                    "entropy": ent,
-                    "matches": matches,
-                    "data": region_data,
-                })
+                    result["fd_matches"].append(entry)
 
-    return results
+    return result
 
 
-# =====================================================================
-# FD SCAN
-# =====================================================================
-
-def scan_fds(pid, rules, max_read, only_memfd):
-    results = []
-
-    fd_dir = f"/proc/{pid}/fd"
-    if not os.path.isdir(fd_dir):
-        return results
-
-    try:
-        fds = os.listdir(fd_dir)
-    except Exception:
-        return results
-
-    for fd in fds:
-        fd_path = os.path.join(fd_dir, fd)
-
-        try:
-            target = os.readlink(fd_path)
-        except Exception:
-            continue
-
-        if only_memfd and not target.startswith("memfd:"):
-            continue
-
-        if target.startswith("socket:") or target.startswith("pipe:"):
-            continue
-
-        try:
-            with open(fd_path, "rb", 0) as f:
-                data = f.read(max_read)
-        except Exception:
-            continue
-
-        if not data:
-            continue
-
-        try:
-            matches = rules.match(data=data)
-        except Exception:
-            continue
-
-        if matches:
-            ent = shannon_entropy(data)
-            results.append({
-                "pid": pid,
-                "type": "fd",
-                "fd_path": fd_path,
-                "fd_target": target,
-                "entropy": ent,
-                "matches": matches,
-                "data": data,
-            })
-
-    return results
-
-
-# =====================================================================
-# PER-PID WORKER
-# =====================================================================
-
-def scan_process(pid, rules, args):
-
-    # Skip kernel threads (no EXE)
-    try:
-        proc = psutil.Process(pid)
-        if not proc.exe():
-            return []
-    except Exception:
-        return []
-
-    if pid in (os.getpid(), os.getppid()):
-        return []
-
-    results = []
-    results.extend(scan_maps(pid, rules, args.max_region_size,
-                             args.only_exec, args.only_anon))
-    results.extend(scan_fds(pid, rules, args.max_region_size,
-                             args.only_memfd))
-
-    return results
-
-
-# =====================================================================
+# ======================================================================
 # MAIN
-# =====================================================================
+# ======================================================================
 
 def main():
-    parser = argparse.ArgumentParser(description="Process Memory Scanner v3.2")
+    parser = argparse.ArgumentParser(description="Hybrid YARA Memory Scanner v5.5 (parallel deep scan)")
     parser.add_argument("-r", "--rule", required=True)
-    parser.add_argument("--max-region-size", type=int, default=25*1024*1024)
-    parser.add_argument("--threads", type=int, default=8)
-    parser.add_argument("--timeout", type=int, default=60,
-                        help="Max seconds per process scan (default 60)")
-    parser.add_argument("--json", help="Write JSON summary")
-    parser.add_argument("--dump-dir", help="Dump matched region blobs")
-    parser.add_argument("--only-exec", action="store_true")
-    parser.add_argument("--only-anon", action="store_true")
-    parser.add_argument("--only-memfd", action="store_true")
+    parser.add_argument("--dump-dir")
+    parser.add_argument("--max-read", type=int, default=5*1024*1024)
+    parser.add_argument("--threads", type=int, default=4)
+    parser.add_argument("--deep-workers", type=int, default=4,
+                        help="Number of workers for Phase 2 deep scanning")
+    parser.add_argument("--no-fd-scan", action="store_true",
+                        help="Disable FD scanning")
+    parser.add_argument("--json-report",
+                        help="Save full scan results to a JSON file")
     args = parser.parse_args()
 
-    # Compile YARA rules
-    try:
-        rules = yara.compile(filepath=args.rule)
-    except Exception as e:
-        print(Fore.RED + f"[!] YARA compile error: {e}")
-        sys.exit(1)
+    # self PID exclusion
+    self_pid = os.getpid()
+    parent_pid = os.getppid()
 
-    print(Fore.CYAN + f"[*] Loaded rule: {args.rule}")
+    print(Fore.CYAN + f"[*] Scanner PID={self_pid}, Parent PID={parent_pid}")
+    print(Fore.CYAN + f"[*] Loading YARA rule: {args.rule}")
 
-    procs = [p.pid for p in psutil.process_iter()]
-    total = len(procs)
-    print(f"[*] Found {total} processes")
+    rules = yara.compile(filepath=args.rule)
 
-    start_time = time.time()
-    results = []
-    timeouts = []
+    # Phase 1 — Threaded YARA scan
+    print("[*] Enumerating processes...")
+    pids = [p.pid for p in psutil.process_iter()]
+    print(f"[*] Found {len(pids)} processes.\n")
 
-    with ThreadPoolExecutor(max_workers=args.threads) as pool:
-        futures = {pool.submit(scan_process, pid, rules, args): pid for pid in procs}
+    print(Fore.CYAN + "[*] Phase 1 — threaded YARA PID scan\n")
+    matched = {}
 
-        for idx, fut in enumerate(as_completed(futures), start=1):
-            progress_bar("Scanning processes", idx, total, start_time)
+    def scan_one(pid):
+        if pid == self_pid or pid == parent_pid:
+            return pid, []
+        try:
+            res = rules.match(pid=pid)
+            return pid, res
+        except:
+            return pid, []
 
-            pid = futures[fut]
+    with ThreadPoolExecutor(max_workers=args.threads) as exe:
+        futures = {exe.submit(scan_one, pid): pid for pid in pids}
+        for fut in as_completed(futures):
+            pid, res = fut.result()
 
-            try:
-                res = fut.result(timeout=args.timeout)
-            except TimeoutError:
-                timeouts.append(pid)
-                print(Fore.RED + f"\n[!] Timeout scanning PID {pid} — skipped.")
-                continue
-            except Exception:
+            if pid == self_pid or pid == parent_pid:
                 continue
 
             if res:
-                results.extend(res)
+                matched[pid] = res
+                try:
+                    proc = psutil.Process(pid)
+                    name = proc.name()
+                    exe_path = proc.exe()
+                    cmd = " ".join(proc.cmdline())
+                except:
+                    name = exe_path = cmd = "<unknown>"
 
-    print("\n\n[+] Scan complete.")
-    print(f"[+] Matches: {len(results)}")
-    print(f"[+] Timeouts: {len(timeouts)} → {timeouts}\n")
+                print(
+                    Fore.GREEN +
+                    f"[+] Match in PID {pid} | {name} | {exe_path} | {cmd} "
+                    f"| Rules: {[m.rule for m in res]}"
+                )
 
-    # Dump matched blobs
-    if args.dump_dir:
-        os.makedirs(args.dump_dir, exist_ok=True)
-        for i, entry in enumerate(results):
-            dump_name = f"{entry['pid']}_{entry['type']}_{i}.bin"
-            entry["dump_path"] = os.path.join(args.dump_dir, dump_name)
-            with open(entry["dump_path"], "wb") as f:
-                f.write(entry["data"])
+    print(f"\n[*] Phase 1 complete. {len(matched)} matched processes.\n")
 
-    # JSON output
-    if args.json:
-        summary = []
-        for r in results:
-            summary.append({
-                "pid": r["pid"],
-                "type": r["type"],
-                "entropy": r["entropy"],
-                "region_start": r.get("region_start"),
-                "fd_path": r.get("fd_path"),
-                "fd_target": r.get("fd_target"),
-                "matches": [m.rule for m in r["matches"]],
-                "dump_path": r.get("dump_path"),
-            })
-        with open(args.json, "w") as f:
-            json.dump(summary, f, indent=2)
-        print(f"[+] JSON summary written to {args.json}\n")
-
-    # HUMAN-READABLE DETAILED OUTPUT
-    if not results:
-        print("[*] No YARA matches found.")
+    if not matched:
+        print(Fore.YELLOW + "[*] No matches found.")
         return
 
-    results.sort(key=lambda r: (r["pid"], r["type"], r.get("region_start", 0)))
+    # Phase 2 — Parallel deep scan
+    print(Fore.CYAN + "[*] Phase 2 — deep forensic scanning (parallel)\n")
 
-    current_pid = None
+    tasks = [
+        (pid, args.rule, args.dump_dir, args.max_read, args.no_fd_scan)
+        for pid in matched
+        if pid not in (self_pid, parent_pid)
+    ]
 
-    for entry in results:
-        pid = entry["pid"]
+    results = {}
 
-        if pid != current_pid:
-            current_pid = pid
-            ts = datetime.datetime.now().isoformat(timespec="seconds")
-            print(Fore.CYAN + f"[{ts}] MATCH in PID {pid}")
+    with ProcessPoolExecutor(max_workers=args.deep_workers) as exe:
+        futures = {exe.submit(deep_worker, t): t[0] for t in tasks}
+        for fut in as_completed(futures):
+            pid = futures[fut]
+            try:
+                results[pid] = fut.result()
+                print(Fore.GREEN + f"[+] Deep scan complete for PID {pid}")
+            except Exception as e:
+                print(Fore.RED + f"[!] Deep scan failed for PID {pid}: {e}")
+                results[pid] = {"pid": pid, "error": str(e)}
 
-            # Process info
+    # JSON Report
+    if args.json_report:
+        report = {
+            "timestamp": now_iso(),
+            "scanner_pid": self_pid,
+            "matches": []
+        }
+
+        for pid, res in results.items():
+            entry = {
+                "pid": pid,
+                "memory_regions": res.get("memory_regions", []),
+                "fd_matches": res.get("fd_matches", []),
+                "injection_indicators": res.get("injection_indicators", []),
+                "errors": res.get("errors", [])
+            }
+
+            # Add metadata from Phase 1
             try:
                 proc = psutil.Process(pid)
-                pinfo = get_proc_info(proc)
+                entry["name"] = proc.name()
+                entry["exe"] = proc.exe()
+                entry["cmd"] = " ".join(proc.cmdline())
+                entry["sha256"] = compute_sha256(proc.exe())
             except:
-                pinfo = None
-            print_proc_info("Process", pinfo)
+                entry["name"] = "<unknown>"
+                entry["exe"] = "<unknown>"
+                entry["cmd"] = "<unknown>"
+                entry["sha256"] = None
 
-            # Parent
-            try:
-                parent = proc.parent()
-                ppar = get_proc_info(parent) if parent else None
-            except:
-                ppar = None
-            print_proc_info("Parent", ppar)
+            report["matches"].append(entry)
 
-            # Children
-            try:
-                children = proc.children()
-            except:
-                children = []
-            if children:
-                print("Children:")
-                for ch in children:
-                    cinfo = get_proc_info(ch)
-                    print_proc_info(f"  Child PID {cinfo.get('pid')}", cinfo, indent="  ")
-            else:
-                print("Children: <none>")
-            print()
-
-        # Region header
-        if entry["type"] == "maps":
-            print(Fore.YELLOW + f"  [MEMORY] start=0x{entry['region_start']:016x} entropy={entry['entropy']:.3f}")
-            base_addr = entry["region_start"]
-        else:
-            print(Fore.YELLOW + f"  [FD] {entry.get('fd_path')} -> {entry.get('fd_target')} entropy={entry['entropy']:.3f}")
-            base_addr = 0
-
-        # Detailed YARA matches
-        for m in entry["matches"]:
-            print(Fore.MAGENTA + f"    YARA Match: {m.rule}")
-
-            if m.meta:
-                meta_str = ", ".join(f"{k}={v!r}" for k, v in m.meta.items())
-                print(f"      Meta: {meta_str}")
-
-            for s in m.strings:
-                for inst in s.instances:
-                    off = inst.offset
-                    matched = inst.matched_data
-                    length = len(matched)
-                    va = base_addr + off
-
-                    if entry["type"] == "maps":
-                        print(Fore.GREEN + f"      String {s.identifier} Offset=0x{va:016x} len={length}")
-                    else:
-                        print(Fore.GREEN + f"      String {s.identifier} Offset={off} len={length}")
-
-                    hex_dump_with_highlight(entry["data"], base_addr, off, length)
-
-        if entry.get("dump_path"):
-            print(Fore.CYAN + f"      Blob dumped to: {entry['dump_path']}")
-
-        print("-" * 80)
-
-    print("\n[✓] Done.\n")
+        try:
+            with open(args.json_report, "w") as f:
+                json.dump(report, f, indent=2)
+            print(Fore.GREEN + f"\n[*] JSON report saved → {args.json_report}")
+        except Exception as e:
+            print(Fore.RED + f"[!] Failed to write JSON report: {e}")
 
 
 if __name__ == "__main__":
