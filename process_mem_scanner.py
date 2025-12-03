@@ -283,8 +283,8 @@ def main():
 
                 for inst in s.instances:
                     off = inst.offset
-                    length = inst.length
                     data = inst.data
+                    length = len(data)      # <-- FIX FOR YARA 4.5.4
 
                     va = region_base + off
                     print(Fore.GREEN + f"    String: {ident} Offset=0x{va:016x} len={length}")
