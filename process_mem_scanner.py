@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-process_mem_scanner.py
-Linux live process memory scanner using YARA.
-Fully compatible with yara-python 4.5.4.
+process_mem_scanner_v2.py
+Advanced Linux live process memory + FD scanner using YARA.
+
+Fully compatible with yara-python 4.5.4:
+- Uses StringMatchInstance.offset + matched_data
+- No deprecated attributes
 
 Features:
-- Scans all readable memory regions via /proc/<pid>/mem
-- Correct YARA 4.5.4 match handling (StringMatchInstance.matched_data)
-- Shows PID, PPID, EXE, CMDLINE, SHA256
-- Prints parent and children
-- Prints YARA rule metadata
-- Dumps 256 bytes around matched bytes, highlighted in RED
-- Skips scanning its own PID and its parent PID
+- Scan all readable /proc/<pid>/maps regions
+- Scan all readable file descriptors under /proc/<pid>/fd/*
+- Detect memfd-backed payloads, deleted ELF files, fexecve stagers
+- Hex dump with red highlighting
+- Full process tree info
+- Skip own process + parent
+- Color-coded output
 """
 
 import argparse
@@ -26,7 +29,7 @@ from colorama import Fore, Style, init as colorama_init
 colorama_init(autoreset=True)
 
 # ---------------------------------------------------------------------
-# Utility
+# Utils
 # ---------------------------------------------------------------------
 
 def compute_sha256(path):
@@ -46,20 +49,21 @@ def get_proc_info(proc):
     info = {
         "pid": None,
         "ppid": None,
-        "name": None,
         "exe": None,
         "cmdline": None,
+        "name": None,
         "sha256": None,
     }
     try:
         info["pid"] = proc.pid
         info["ppid"] = proc.ppid()
-        info["name"] = proc.name()
         info["exe"] = proc.exe()
         info["cmdline"] = " ".join(proc.cmdline())
+        info["name"] = proc.name()
         info["sha256"] = compute_sha256(info["exe"])
     except Exception:
         pass
+
     return info
 
 
@@ -78,7 +82,7 @@ def print_proc_info(title, info, indent=""):
 
 
 # ---------------------------------------------------------------------
-# Hex dump with match highlighting
+# Hex dump around match
 # ---------------------------------------------------------------------
 
 def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=256):
@@ -88,7 +92,7 @@ def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=25
     snippet = data[start:end]
     snippet_base = base_addr + start
 
-    print(f"      Hex dump (0x{snippet_base:016x} - 0x{snippet_base + len(snippet):016x}):")
+    print(f"        Hex dump (0x{snippet_base:016x} - 0x{snippet_base + len(snippet):016x}):")
 
     for i in range(0, len(snippet), 16):
         line = snippet[i:i+16]
@@ -99,10 +103,10 @@ def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=25
 
         for j, b in enumerate(line):
             gi = start + i + j
-            in_match = match_offset <= gi < (match_offset + match_len)
+            in_match = (match_offset <= gi < match_offset + match_len)
 
             h = f"{b:02x}"
-            c = chr(b) if 32 <= b <= 126 else "."
+            c = chr(b) if 32 <= b <= 126 else '.'
 
             if in_match:
                 h = Fore.RED + h + Style.RESET_ALL
@@ -111,20 +115,14 @@ def hex_dump_with_highlight(data, base_addr, match_offset, match_len, context=25
             hex_parts.append(h)
             ascii_parts.append(c)
 
-        hex_str = " ".join(hex_parts)
-        ascii_str = "".join(ascii_parts)
-
-        print(f"        0x{addr:016x}  {hex_str:<48}  {ascii_str}")
+        print(f"        0x{addr:016x}  {' '.join(hex_parts):<48}  {''.join(ascii_parts)}")
 
 
 # ---------------------------------------------------------------------
-# Scan a process memory
+# Scan process memory
 # ---------------------------------------------------------------------
 
-def scan_pid_memory(pid, rules, max_region):
-    """
-    Returns list of (YARAMatchObject, proc_info, region_base, region_data)
-    """
+def scan_pid_maps(pid, rules, max_region):
     results = []
 
     maps_path = f"/proc/{pid}/maps"
@@ -132,14 +130,10 @@ def scan_pid_memory(pid, rules, max_region):
 
     try:
         proc = psutil.Process(pid)
-    except psutil.NoSuchProcess:
-        return []
-
-    try:
         maps_f = open(maps_path, "r")
         mem_f = open(mem_path, "rb", 0)
     except Exception:
-        return []
+        return results
 
     with maps_f, mem_f:
         for line in maps_f:
@@ -155,6 +149,7 @@ def scan_pid_memory(pid, rules, max_region):
             region_start = int(start_s, 16)
             region_end = int(end_s, 16)
             region_size = region_end - region_start
+
             if region_size <= 0:
                 continue
 
@@ -174,12 +169,55 @@ def scan_pid_memory(pid, rules, max_region):
             except Exception:
                 continue
 
-            if not matches:
-                continue
+            if matches:
+                results.append((matches, region_start, region_data, get_proc_info(proc)))
 
-            pinfo = get_proc_info(proc)
-            for m in matches:
-                results.append((m, pinfo, region_start, region_data))
+    return results
+
+
+# ---------------------------------------------------------------------
+# Scan FD-backed objects
+# ---------------------------------------------------------------------
+
+def scan_pid_fds(pid, rules, max_size):
+    results = []
+
+    fd_dir = f"/proc/{pid}/fd"
+    if not os.path.isdir(fd_dir):
+        return results
+
+    try:
+        fds = os.listdir(fd_dir)
+    except Exception:
+        return results
+
+    for fd in fds:
+        fd_path = os.path.join(fd_dir, fd)
+
+        try:
+            target = os.readlink(fd_path)
+        except Exception:
+            continue
+
+        if target.startswith("socket:") or target.startswith("pipe:"):
+            continue
+
+        try:
+            with open(fd_path, "rb", 0) as f:
+                data = f.read(max_size)
+        except Exception:
+            continue
+
+        if not data:
+            continue
+
+        try:
+            matches = rules.match(data=data)
+        except Exception:
+            continue
+
+        if matches:
+            results.append((matches, fd_path, target, data))
 
     return results
 
@@ -189,20 +227,20 @@ def scan_pid_memory(pid, rules, max_region):
 # ---------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="Live Linux YARA process memory scanner (yara-python 4.5.4)")
+    parser = argparse.ArgumentParser(description="Advanced Linux YARA Memory + FD Scanner v2")
     parser.add_argument("-r", "--rule", required=True, help="Path to YARA rule file")
     parser.add_argument("--max-region-size", type=int, default=50*1024*1024,
-                        help="Max bytes read per region")
+                        help="Max bytes per region")
     args = parser.parse_args()
 
     try:
         rules = yara.compile(filepath=args.rule)
     except Exception as e:
-        print(Fore.RED + f"[!] Failed to compile YARA rule: {e}")
+        print(Fore.RED + f"[!] Could not compile YARA rule: {e}")
         sys.exit(1)
 
     print(f"[*] Loaded YARA rule: {args.rule}")
-    print("[*] Scanning processes...\n")
+    print("[*] Starting scan...\n")
 
     own_pid = os.getpid()
     parent_pid = os.getppid()
@@ -213,78 +251,107 @@ def main():
         if pid == own_pid or pid == parent_pid:
             continue
 
+        # --------------------
+        # SCAN MEMORY MAPS
+        # --------------------
+        map_results = scan_pid_maps(pid, rules, args.max_region_size)
+
+        # --------------------
+        # SCAN FILE DESCRIPTORS
+        # --------------------
+        fd_results = scan_pid_fds(pid, rules, args.max_region_size)
+
+        if not map_results and not fd_results:
+            continue
+
+        # Print process header
         try:
-            results = scan_pid_memory(pid, rules, args.max_region_size)
+            p = psutil.Process(pid)
+            info = get_proc_info(p)
         except Exception:
             continue
 
-        if not results:
-            continue
+        ts = datetime.datetime.now().isoformat(timespec="seconds")
+        print(Fore.CYAN + f"[{ts}] MATCHES FOUND in PID {pid}")
+        print_proc_info("Process", info)
 
-        try:
-            p = psutil.Process(pid)
-        except psutil.NoSuchProcess:
-            continue
-
-        proc_info = get_proc_info(p)
-
-        parent_info = None
+        # Parent
         try:
             parent = p.parent()
             if parent:
-                parent_info = get_proc_info(parent)
+                print_proc_info("Parent", get_proc_info(parent))
         except Exception:
-            pass
+            print("Parent: <unknown>")
 
-        children = []
+        # Children
         try:
-            for c in p.children(recursive=False):
-                children.append(get_proc_info(c))
+            children = p.children()
+            if children:
+                print("\nChildren:")
+                for ch in children:
+                    print_proc_info(f"  Child PID {ch.pid}", get_proc_info(ch), indent="  ")
         except Exception:
             pass
 
-        ts = datetime.datetime.now().isoformat(timespec="seconds")
-        print(Fore.CYAN + f"[{ts}] Match in process PID {pid}")
-        print_proc_info("Process", proc_info)
-        print_proc_info("Parent", parent_info)
         print()
 
-        if children:
-            print("Children:")
-            for ci in children:
-                print_proc_info(f"  Child PID {ci['pid']}", ci, indent="  ")
-            print()
-        else:
-            print("Children: <none>\n")
+        # ------------------------
+        # PROCESS MEMORY MATCHES
+        # ------------------------
+        for matches, region_base, region_data, pinfo in map_results:
+            for m in matches:
+                print(Fore.MAGENTA + f"  YARA Rule Match (Memory): {m.rule}")
 
-        # Correct YARA 4.5.4 match model
-        for m, pinfo, region_base, region_data in results:
-            print(Fore.MAGENTA + f"  YARA Rule Matched: {m.rule}")
+                if m.meta:
+                    print("    Meta: " + ", ".join(f"{k}={v!r}" for k, v in m.meta.items()))
 
-            if m.meta:
-                meta = ", ".join(f"{k}={v!r}" for k, v in m.meta.items())
-                print(f"    Meta: {meta}")
+                for s in m.strings:
+                    ident = s.identifier
+                    for inst in s.instances:
+                        off = inst.offset
+                        data = inst.matched_data
+                        length = len(data)
 
-            for s in m.strings:
-                ident = s.identifier
+                        va = region_base + off
 
-                for inst in s.instances:
-                    off = inst.offset
-                    data = inst.matched_data
-                    length = len(data)
+                        print(Fore.GREEN +
+                              f"    String: {ident} Offset=0x{va:016x} len={length}")
 
-                    va = region_base + off
-                    print(Fore.GREEN + f"    String: {ident} Offset=0x{va:016x} len={length}")
+                        hex_dump_with_highlight(
+                            region_data, region_base, off, length, 256
+                        )
 
-                    hex_dump_with_highlight(
-                        region_data,
-                        region_base,
-                        match_offset=off,
-                        match_len=length,
-                        context=256
-                    )
+                print("-" * 80)
 
-            print("-" * 80)
+        # ------------------------
+        # FD-BASED MATCHES
+        # ------------------------
+        if fd_results:
+            print(Fore.YELLOW + f"\n[*] FD-based Matches for PID {pid}")
+            for matches, fd_path, target, data in fd_results:
+                print(Fore.YELLOW + f"  FD: {fd_path} -> {target}")
+
+                for m in matches:
+                    print(Fore.MAGENTA + f"    YARA Match (FD): {m.rule}")
+                    if m.meta:
+                        print("      Meta: " +
+                              ", ".join(f"{k}={v!r}" for k, v in m.meta.items()))
+
+                    for s in m.strings:
+                        ident = s.identifier
+                        for inst in s.instances:
+                            off = inst.offset
+                            mdata = inst.matched_data
+                            length = len(mdata)
+
+                            print(Fore.GREEN +
+                                  f"      String: {ident} Offset={off} len={length}")
+
+                            hex_dump_with_highlight(
+                                data, 0, off, length, 256
+                            )
+
+                    print("-" * 80)
 
 
 if __name__ == "__main__":
