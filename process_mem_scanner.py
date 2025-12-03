@@ -556,8 +556,7 @@ def main():
     parser.add_argument("--max-read", type=int, default=5 * 1024 * 1024)
     parser.add_argument("--threads", type=int, default=6)
     parser.add_argument("--deep-workers", type=int, default=4)
-    parser.add_argument("--no-fd-scan", action="true_false",
-                        help="Disable scanning /proc/PID/fd/*")
+    parser.add_argument("--no-fd-scan", action="true_false",help="Disable scanning /proc/PID/fd/*")
     parser.add_argument("--json-report", help="Write full forensic JSON output")
 
     args = parser.parse_args()
