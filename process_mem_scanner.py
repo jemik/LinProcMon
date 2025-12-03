@@ -278,11 +278,16 @@ def scan_pid_worker(args):
                 if size <= 0:
                     continue
 
-                read_size = min(size, max_region)
                 try:
                     mem_f.seek(start)
-                    region = mem_f.read(read_size)
-                except Exception:
+                    if size <= max_region:
+                        region = mem_f.read(size)
+                    else:
+                        # Read the end, which often contains unpacked payloads
+                        mem_f.seek(end - max_region)
+                        region = mem_f.read(max_region)
+                except Exception as e:
+                    print(Fore.RED + f"[!] Failed to read memory for PID {pid}: {e}")
                     continue
 
                 if not region:
@@ -290,7 +295,8 @@ def scan_pid_worker(args):
 
                 try:
                     matches = rules.match(data=region)
-                except Exception:
+                except Exception as e:
+                    print(Fore.RED + f"[!] YARA scan error in PID {pid}: {e}")
                     continue
 
                 if matches:
@@ -321,7 +327,7 @@ def scan_pid_worker(args):
 
                 try:
                     with open(path, "rb", 0) as f:
-                        data = f.read(max_region)
+                        data = f.read()
                 except Exception:
                     continue
 
