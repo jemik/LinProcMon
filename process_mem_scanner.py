@@ -279,15 +279,17 @@ def scan_pid_worker(args):
                     continue
 
                 try:
-                    mem_f.seek(start)
                     if size <= max_region:
+                        # Read the whole region (safe)
+                        mem_f.seek(start)
                         region = mem_f.read(size)
                     else:
-                        # Read the end, which often contains unpacked payloads
-                        mem_f.seek(end - max_region)
+                        # Read the last max_region bytes of the region
+                        region_start = start + (size - max_region)
+                        mem_f.seek(region_start)
                         region = mem_f.read(max_region)
-                except Exception as e:
-                    print(Fore.RED + f"[!] Failed to read memory for PID {pid}: {e}")
+                except OSError as e:
+                    # EIO means unreadable region
                     continue
 
                 if not region:
