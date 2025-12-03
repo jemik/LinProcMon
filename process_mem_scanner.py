@@ -351,13 +351,12 @@ def main():
 
                 # MATCHED line with red background; rest default color
                 rules_str = [m.rule for m in res]
-                print(
-                    f"[+] {Back.RED}MATCHED{Style.RESET_ALL} "
-                    f"PID {pid} | Name: {name} | EXE: {exe}"
-                )
-                print(f"    CMD: {cmd}")
-                print(f"    SHA256: {sha}")
-                print(f"    Rules: {rules_str}\n")
+
+                # FULL MATCH BLOCK IN RED (no background color)
+                print(Fore.RED + f"[+] MATCHED PID {pid} | Name: {name} | EXE: {exe}")
+                print(Fore.RED + f"    CMD: {cmd}")
+                print(Fore.RED + f"    SHA256: {sha}")
+                print(Fore.RED + f"    Rules: {rules_str}\n")
 
                 # Re-print progress bar (optional; comment out if noisy)
                 if done < total:
