@@ -2,7 +2,7 @@
 
 CC = gcc
 CFLAGS = -Wall -O2 -g
-LIBS = -lm -lcrypto
+LIBS = -lm -lcrypto -lpthread
 
 # Build mode: dynamic (default) or static
 BUILD_MODE ?= dynamic
