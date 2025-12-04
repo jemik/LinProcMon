@@ -13,7 +13,11 @@ ifeq ($(BUILD_MODE),static)
     LIBS += -lyara -lcrypto -lssl -lmagic -lz -lpthread
     
     # Check if capstone is available for static linking
-    HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+    # Try pkg-config first, fall back to checking for library file
+    HAS_CAPSTONE := $(shell pkg-config --exists capstone 2>/dev/null && echo yes || \
+                            (test -f /usr/lib/x86_64-linux-gnu/libcapstone.a || \
+                             test -f /usr/lib/libcapstone.a || \
+                             test -f /usr/local/lib/libcapstone.a) && echo yes)
     ifeq ($(HAS_CAPSTONE),yes)
         CFLAGS += -DHAVE_CAPSTONE
         LIBS += -lcapstone
@@ -26,10 +30,18 @@ else
     LIBS += -lyara
     
     # Check if capstone is available
-    HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+    # Try pkg-config first, fall back to checking for library file
+    HAS_CAPSTONE := $(shell pkg-config --exists capstone 2>/dev/null && echo yes || \
+                            (test -f /usr/lib/x86_64-linux-gnu/libcapstone.so || \
+                             test -f /usr/lib/libcapstone.so || \
+                             test -f /usr/local/lib/libcapstone.so) && echo yes)
     ifeq ($(HAS_CAPSTONE),yes)
-        CFLAGS += -DHAVE_CAPSTONE $(shell pkg-config --cflags capstone)
-        LIBS += $(shell pkg-config --libs capstone)
+        CFLAGS += -DHAVE_CAPSTONE
+        # Try to get flags from pkg-config, but don't fail if it's not available
+        CAPSTONE_CFLAGS := $(shell pkg-config --cflags capstone 2>/dev/null)
+        CAPSTONE_LIBS := $(shell pkg-config --libs capstone 2>/dev/null || echo "-lcapstone")
+        CFLAGS += $(CAPSTONE_CFLAGS)
+        LIBS += $(CAPSTONE_LIBS)
         $(info Building with dynamic Capstone support)
     else
         $(info Building without Capstone - disassembly disabled)
