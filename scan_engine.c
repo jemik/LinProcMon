@@ -9,8 +9,6 @@
 #include <time.h>
 #include <yara.h>
 #include <openssl/sha.h>
-#include <yara.h>
-#include <openssl/sha.h>
 
 #ifdef HAVE_CAPSTONE
 #include <capstone/capstone.h>
