@@ -1,0 +1,21 @@
+# Makefile for scan_engine - Standalone YARA scanner
+
+CC = gcc
+CFLAGS = -Wall -O2 -g
+LIBS = -lyara -lcapstone -lm
+
+TARGET = scan_engine
+SOURCE = scan_engine.c
+
+all: $(TARGET)
+
+$(TARGET): $(SOURCE)
+	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
+
+clean:
+	rm -f $(TARGET)
+
+install: $(TARGET)
+	install -m 755 $(TARGET) /usr/local/bin/
+
+.PHONY: all clean install
