@@ -187,6 +187,15 @@ int enumerate_processes(ProcessInfo **processes, int *count) {
     pid_t scanner_pid = getpid();
     pid_t parent_pid = getppid();
     
+    // Get scanner exe path to exclude all instances
+    char scanner_exe[MAX_PATH];
+    ssize_t len = readlink("/proc/self/exe", scanner_exe, sizeof(scanner_exe) - 1);
+    if (len != -1) {
+        scanner_exe[len] = '\0';
+    } else {
+        scanner_exe[0] = '\0';
+    }
+    
     // Count processes first
     int max_count = 0;
     struct dirent *entry;
@@ -212,7 +221,13 @@ int enumerate_processes(ProcessInfo **processes, int *count) {
         if (entry->d_type == DT_DIR) {
             int pid = atoi(entry->d_name);
             if (pid > 0 && pid != scanner_pid && pid != parent_pid) {
-                if (read_process_info(pid, &(*processes)[*count]) == 0) {
+                ProcessInfo temp_info;
+                if (read_process_info(pid, &temp_info) == 0) {
+                    // Skip if exe matches scanner
+                    if (scanner_exe[0] != '\0' && strcmp(temp_info.exe, scanner_exe) == 0) {
+                        continue;
+                    }
+                    (*processes)[*count] = temp_info;
                     (*count)++;
                 }
             }
@@ -849,7 +864,7 @@ void scan_process_memory(ProcessInfo *info) {
             .entropy = calculate_entropy(data, bytes_read),
             .has_match = 0
         };
-        strncpy(mem_ctx.perms, region->perms, sizeof(mem_ctx.perms));
+        snprintf(mem_ctx.perms, sizeof(mem_ctx.perms), "%s", region->perms);
         
         // Scan with YARA using our custom callback
         yr_rules_scan_mem(g_yara_rules, data, bytes_read, 0, 
@@ -1130,7 +1145,7 @@ int main(int argc, char** argv) {
             if (g_processes[i].matched) {
                 matched_count++;
                 
-                printf("[" COLOR_RED "+" COLOR_RESET "] MATCHED PID %d | Name: %s | EXE: %s\n",
+                printf(COLOR_RED "[+] MATCHED PID %d | Name: %s | EXE: %s" COLOR_RESET "\n",
                        g_processes[i].pid, g_processes[i].name, g_processes[i].exe);
                 printf("    CMD: %s\n", g_processes[i].cmdline);
                 printf("    SHA256: %s\n", g_processes[i].sha256);
