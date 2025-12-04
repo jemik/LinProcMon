@@ -545,10 +545,29 @@ int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, voi
                             }
                             
                             // Try to disassemble if it looks like code
-                            // Simple heuristic: if string name contains "opcode" or "shellcode"
+                            // Check string name or if data contains common shellcode patterns
+                            int looks_like_code = 0;
                             if (strstr(string->identifier, "opcode") != NULL ||
                                 strstr(string->identifier, "shellcode") != NULL ||
                                 strstr(string->identifier, "code") != NULL) {
+                                looks_like_code = 1;
+                            } else {
+                                // Check if matched data contains common shellcode indicators
+                                for (size_t k = 0; k < match->match_length && k < 32; k++) {
+                                    uint8_t b = file_data[match->offset + k];
+                                    // Look for syscall (0x0f 0x05), int 0x80 (0xcd 0x80), or /bin/sh pattern
+                                    if (k + 1 < match->match_length) {
+                                        if ((b == 0x0f && file_data[match->offset + k + 1] == 0x05) ||  // syscall
+                                            (b == 0xcd && file_data[match->offset + k + 1] == 0x80) ||  // int 0x80
+                                            (b == 0x6a && file_data[match->offset + k + 1] == 0x3b)) {  // push 0x3b
+                                            looks_like_code = 1;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            if (looks_like_code) {
                                 print_disassembly(file_data, st.st_size,
                                                 match->offset, match->match_length);
                             }
@@ -690,6 +709,19 @@ int yara_callback_json(YR_SCAN_CONTEXT* context, int message, void* message_data
                     strstr(string->identifier, "shellcode") != NULL ||
                     strstr(string->identifier, "code") != NULL) {
                     json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                } else {
+                    // Check if matched data contains shellcode indicators
+                    for (int k = 0; k < match->match_length && k < 32; k++) {
+                        uint8_t b = file_data[match->offset + k];
+                        if (k + 1 < match->match_length) {
+                            if ((b == 0x0f && file_data[match->offset + k + 1] == 0x05) ||
+                                (b == 0xcd && file_data[match->offset + k + 1] == 0x80) ||
+                                (b == 0x6a && file_data[match->offset + k + 1] == 0x3b)) {
+                                json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                                break;
+                            }
+                        }
+                    }
                 }
                 
                 fprintf(g_json_report, "\n                }");
@@ -766,6 +798,7 @@ typedef struct {
     char perms[5];
     double entropy;
     int has_match;
+    int first_region;  // For JSON formatting
 } MemoryScanContext;
 
 // YARA callback for memory region scanning
@@ -775,35 +808,145 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
         MemoryScanContext *mem_ctx = (MemoryScanContext*)user_data;
         
         if (!mem_ctx->has_match) {
-            printf("\n  " COLOR_RED "[+] Region match at %lx-%lx perms=%s" COLOR_RESET "\n",
-                   mem_ctx->base_address, mem_ctx->base_address + mem_ctx->data_size, mem_ctx->perms);
-            printf("      Entropy: %.3f\n", mem_ctx->entropy);
+            if (g_json_report) {
+                // JSON output
+                if (!mem_ctx->first_region) {
+                    fprintf(g_json_report, ",\n");
+                }
+                mem_ctx->first_region = 0;
+                
+                fprintf(g_json_report, "        {\n");
+                fprintf(g_json_report, "          \"address\": \"0x%lx-0x%lx\",\n",
+                       mem_ctx->base_address, mem_ctx->base_address + mem_ctx->data_size);
+                fprintf(g_json_report, "          \"perms\": \"%s\",\n", mem_ctx->perms);
+                fprintf(g_json_report, "          \"entropy\": %.14f,\n", mem_ctx->entropy);
+                fprintf(g_json_report, "          \"matches\": [\n");
+            } else {
+                // Terminal output
+                printf("\n  " COLOR_RED "[+] Region match at %lx-%lx perms=%s" COLOR_RESET "\n",
+                       mem_ctx->base_address, mem_ctx->base_address + mem_ctx->data_size, mem_ctx->perms);
+                printf("      Entropy: %.3f\n", mem_ctx->entropy);
+            }
             mem_ctx->has_match = 1;
         }
         
-        printf("    Rule: " COLOR_PURPLE "%s" COLOR_RESET "\n", rule->identifier);
-        
-        YR_STRING* string;
-        yr_rule_strings_foreach(rule, string) {
-            YR_MATCH* match;
-            yr_string_matches_foreach(context, string, match) {
-                printf("\n    String %s: offset=0x%lx len=%d\n",
-                       string->identifier,
-                       mem_ctx->base_address + (unsigned long)match->offset,
-                       (int)match->match_length);
-                
-                // Print hex dump around the match
-                if (match->offset < mem_ctx->data_size) {
-                    print_hex_dump(mem_ctx->data, mem_ctx->data_size, 
+        if (g_json_report) {
+            // JSON: Write rule info
+            static int first_rule = 1;
+            if (!first_rule) fprintf(g_json_report, ",\n");
+            first_rule = 0;
+            
+            char escaped_rule[512];
+            json_escape_string(rule->identifier, escaped_rule, sizeof(escaped_rule));
+            
+            fprintf(g_json_report, "            {\n");
+            fprintf(g_json_report, "              \"rule\": \"%s\",\n", escaped_rule);
+            fprintf(g_json_report, "              \"strings\": [\n");
+            
+            int first_string = 1;
+            YR_STRING* string;
+            yr_rule_strings_foreach(rule, string) {
+                YR_MATCH* match;
+                yr_string_matches_foreach(context, string, match) {
+                    if (!first_string) fprintf(g_json_report, ",\n");
+                    first_string = 0;
+                    
+                    char escaped_str_id[512];
+                    json_escape_string(string->identifier, escaped_str_id, sizeof(escaped_str_id));
+                    
+                    fprintf(g_json_report, "                {\n");
+                    fprintf(g_json_report, "                  \"identifier\": \"%s\",\n", escaped_str_id);
+                    fprintf(g_json_report, "                  \"offset\": %lu,\n", 
+                           mem_ctx->base_address + (unsigned long)match->offset);
+                    fprintf(g_json_report, "                  \"length\": %d,\n", match->match_length);
+                    
+                    // Hex representation
+                    fprintf(g_json_report, "                  \"hex\": \"");
+                    for (int i = 0; i < match->match_length && i < 256; i++) {
+                        fprintf(g_json_report, "%02x", mem_ctx->data[match->offset + i]);
+                    }
+                    fprintf(g_json_report, "\",\n");
+                    
+                    // Hex dump
+                    json_hex_dump(g_json_report, mem_ctx->data, mem_ctx->data_size, 
                                  match->offset, match->match_length);
+                    
+                    // Disassembly if looks like code
+                    int looks_like_code = 0;
+                    if (strstr(string->identifier, "opcode") != NULL ||
+                        strstr(string->identifier, "shellcode") != NULL ||
+                        strstr(string->identifier, "code") != NULL) {
+                        looks_like_code = 1;
+                    } else {
+                        // Check if matched data contains shellcode indicators
+                        for (int k = 0; k < match->match_length && k < 32; k++) {
+                            uint8_t b = mem_ctx->data[match->offset + k];
+                            if (k + 1 < match->match_length) {
+                                if ((b == 0x0f && mem_ctx->data[match->offset + k + 1] == 0x05) ||
+                                    (b == 0xcd && mem_ctx->data[match->offset + k + 1] == 0x80) ||
+                                    (b == 0x6a && mem_ctx->data[match->offset + k + 1] == 0x3b)) {
+                                    looks_like_code = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (looks_like_code) {
+                        json_disassembly(g_json_report, mem_ctx->data, mem_ctx->data_size,
+                                        match->offset, match->match_length);
+                    }
+                    
+                    fprintf(g_json_report, "\n                }");
                 }
-                
-                // Try to disassemble if it looks like code
-                if (strstr(string->identifier, "opcode") != NULL ||
-                    strstr(string->identifier, "shellcode") != NULL ||
-                    strstr(string->identifier, "code") != NULL) {
-                    print_disassembly(mem_ctx->data, mem_ctx->data_size,
-                                    match->offset, match->match_length);
+            }
+            
+            fprintf(g_json_report, "\n              ]\n");
+            fprintf(g_json_report, "            }");
+        } else {
+            // Terminal: Write rule info
+            printf("    Rule: " COLOR_PURPLE "%s" COLOR_RESET "\n", rule->identifier);
+            
+            YR_STRING* string;
+            yr_rule_strings_foreach(rule, string) {
+                YR_MATCH* match;
+                yr_string_matches_foreach(context, string, match) {
+                    printf("\n    String %s: offset=0x%lx len=%d\n",
+                           string->identifier,
+                           mem_ctx->base_address + (unsigned long)match->offset,
+                           (int)match->match_length);
+                    
+                    // Print hex dump around the match
+                    if (match->offset < mem_ctx->data_size) {
+                        print_hex_dump(mem_ctx->data, mem_ctx->data_size, 
+                                     match->offset, match->match_length);
+                    }
+                    
+                    // Try to disassemble if it looks like code
+                    int looks_like_code = 0;
+                    if (strstr(string->identifier, "opcode") != NULL ||
+                        strstr(string->identifier, "shellcode") != NULL ||
+                        strstr(string->identifier, "code") != NULL) {
+                        looks_like_code = 1;
+                    } else {
+                        // Check if matched data contains shellcode indicators
+                        for (int k = 0; k < match->match_length && k < 32; k++) {
+                            uint8_t b = mem_ctx->data[match->offset + k];
+                            if (k + 1 < match->match_length) {
+                                if ((b == 0x0f && mem_ctx->data[match->offset + k + 1] == 0x05) ||
+                                    (b == 0xcd && mem_ctx->data[match->offset + k + 1] == 0x80) ||
+                                    (b == 0x6a && mem_ctx->data[match->offset + k + 1] == 0x3b)) {
+                                    looks_like_code = 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (looks_like_code) {
+                        print_disassembly(mem_ctx->data, mem_ctx->data_size,
+                                        match->offset, match->match_length);
+                    }
                 }
             }
         }
@@ -817,10 +960,14 @@ void scan_process_memory(ProcessInfo *info) {
     MemoryRegion *regions = NULL;
     int region_count = 0;
     
-    printf("\n[*] Deep scanning memory maps...\n");
+    if (!g_json_report) {
+        printf("\n[*] Deep scanning memory maps...\n");
+    }
     
     if (read_memory_regions(info->pid, &regions, &region_count) != 0) {
-        printf("  [!] Cannot read memory maps\n");
+        if (!g_json_report) {
+            printf("  [!] Cannot read memory maps\n");
+        }
         return;
     }
     
@@ -833,6 +980,8 @@ void scan_process_memory(ProcessInfo *info) {
         free(regions);
         return;
     }
+    
+    int first_region = 1;
     
     for (int i = 0; i < region_count; i++) {
         MemoryRegion *region = &regions[i];
@@ -864,13 +1013,21 @@ void scan_process_memory(ProcessInfo *info) {
             .data = data,
             .data_size = bytes_read,
             .entropy = calculate_entropy(data, bytes_read),
-            .has_match = 0
+            .has_match = 0,
+            .first_region = first_region
         };
         snprintf(mem_ctx.perms, sizeof(mem_ctx.perms), "%s", region->perms);
         
         // Scan with YARA using our custom callback
         yr_rules_scan_mem(g_yara_rules, data, bytes_read, 0, 
                          yara_callback_memory, &mem_ctx, 0);
+        
+        // Close JSON region if match was found
+        if (g_json_report && mem_ctx.has_match) {
+            fprintf(g_json_report, "\n          ]\n");
+            fprintf(g_json_report, "        }");
+            first_region = 0;
+        }
         
         free(data);
     }
@@ -922,7 +1079,13 @@ void write_process_to_json(ProcessInfo *info) {
         fprintf(g_json_report, "\"%s\"%s", escaped_rule,
                 i < info->matched_rules_count - 1 ? ", " : "");
     }
-    fprintf(g_json_report, "]\n");
+    fprintf(g_json_report, "],\n");
+    fprintf(g_json_report, "      \"regions\": [\n");
+    
+    // Scan memory regions to populate the regions array
+    scan_process_memory(info);
+    
+    fprintf(g_json_report, "\n      ]\n");
     fprintf(g_json_report, "    }");
 }
 
