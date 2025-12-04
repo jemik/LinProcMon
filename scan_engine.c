@@ -202,6 +202,7 @@ int enumerate_processes(ProcessInfo **processes, int *count) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
             int pid = atoi(entry->d_name);
+            // Exclude scanner, parent (sudo), and any process with our exe
             if (pid > 0 && pid != scanner_pid && pid != parent_pid) {
                 max_count++;
             }
@@ -220,10 +221,11 @@ int enumerate_processes(ProcessInfo **processes, int *count) {
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
             int pid = atoi(entry->d_name);
+            // Exclude scanner, parent (sudo), and any process with our exe
             if (pid > 0 && pid != scanner_pid && pid != parent_pid) {
                 ProcessInfo temp_info;
                 if (read_process_info(pid, &temp_info) == 0) {
-                    // Skip if exe matches scanner
+                    // Skip if exe matches scanner (in case of multiple instances)
                     if (scanner_exe[0] != '\0' && strcmp(temp_info.exe, scanner_exe) == 0) {
                         continue;
                     }
@@ -1104,6 +1106,13 @@ int main(int argc, char** argv) {
         }
         
         printf("\n[*] Enumerating processes...\n");
+        
+        pid_t my_pid = getpid();
+        pid_t my_parent = getppid();
+        
+        if (!generate_report) {
+            printf("[*] Excluding scanner PID %d and parent PID %d\n", my_pid, my_parent);
+        }
         
         if (enumerate_processes(&g_processes, &g_process_count) != 0) {
             fprintf(stderr, "[!] Failed to enumerate processes\n");
