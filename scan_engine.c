@@ -675,11 +675,29 @@ int main(int argc, char** argv) {
     // Setup JSON report if requested
     char report_filename[MAX_PATH];
     if (generate_report) {
-        // Extract base name from scan target
-        const char* base = strrchr(scan_target, '/');
-        base = base ? base + 1 : scan_target;
+        // Calculate SHA256 of the scan target for report filename
+        struct stat st_temp;
+        char target_sha256[65] = {0};
         
-        snprintf(report_filename, sizeof(report_filename), "report_%s.json", base);
+        if (stat(scan_target, &st_temp) == 0 && S_ISREG(st_temp.st_mode)) {
+            // For single file, use its SHA256
+            FILE* f_temp = fopen(scan_target, "rb");
+            if (f_temp) {
+                uint8_t* data_temp = malloc(st_temp.st_size);
+                if (data_temp) {
+                    if (fread(data_temp, 1, st_temp.st_size, f_temp) == st_temp.st_size) {
+                        calculate_sha256(data_temp, st_temp.st_size, target_sha256);
+                    }
+                    free(data_temp);
+                }
+                fclose(f_temp);
+            }
+        } else {
+            // For directory, use directory name hash
+            calculate_sha256((const uint8_t*)scan_target, strlen(scan_target), target_sha256);
+        }
+        
+        snprintf(report_filename, sizeof(report_filename), "scan_report_%s.json", target_sha256);
         
         g_json_report = fopen(report_filename, "w");
         if (!g_json_report) {
