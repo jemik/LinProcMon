@@ -1,23 +1,36 @@
 #!/usr/bin/env python3
 """
-process_mem_scanner_v5.6 — FIXED VERSION + UX TWEAKS
+process_mem_scanner_v5.6 — FIXED + FILE SCAN
 
-- Phase 1:
-    * YARA native PID scan (rules.match(pid=pid)) using threads
-    * Progress bar: "Scanning processes | N/Total [++++-----]"
-    * MATCHED lines printed on their own line (no overlap with progress bar)
-    * MATCHED highlighted with red background
+Modes:
 
-- Phase 2:
-    * Enumerate readable regions from /proc/<pid>/maps
-    * Re-scan each region with YARA to get offsets
-    * Hex dump around matched bytes
-    * Capstone disassembly
-    * Full console output like v5.1
-    * JSON report with full match data (regions, strings, disasm)
+1) Process mode (default)
+   - Phase 1: YARA native PID scan (rules.match(pid=pid)), threaded
+   - Phase 2: For each matched PID:
+       * Enumerate /proc/<pid>/maps
+       * Read memory regions
+       * Run YARA on each region
+       * Print:
+           - Region match line
+           - Entropy
+           - Hex dump with highlighted match
+           - Capstone disassembly with highlighted instructions
+       * Save full details into JSON (regions[*].matches[*].strings[*])
 
-NOTE:
-This is Linux-only (uses /proc, YARA pid=, etc.)
+2) File/dir mode (enabled with --scan-path PATH)
+   - If PATH is a file: scan that file
+   - If PATH is a directory: recursively scan all files
+   - For each file with a match:
+       * Treat whole file like a single region
+       * Output format mirrors Phase-2 region output:
+           - "File match at <path>"
+           - Entropy, hex dump, disasm, etc.
+       * Stored in JSON under report["matches"] with type="file"
+
+Common:
+   - YARA meta is included in JSON for every rule match ("meta" field).
+   - Progress bar for Phase 1 process scan.
+   - Scanner avoids scanning itself.
 """
 
 import os
@@ -31,7 +44,9 @@ import json
 import math
 import datetime
 
-from colorama import Fore, Back, Style, init as colorama_init
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from colorama import Fore, Style, Back, init as colorama_init
 from capstone import *
 
 colorama_init(autoreset=True)
@@ -40,14 +55,14 @@ colorama_init(autoreset=True)
 # Utility
 # ======================================================================
 
-def shannon_entropy(data):
+def shannon_entropy(data: bytes) -> float:
     if not data:
         return 0.0
     freq = {b: data.count(b) for b in set(data)}
     probs = [c / len(data) for c in freq.values()]
     return -sum(p * math.log2(p) for p in probs)
 
-def compute_sha256(path):
+def compute_sha256(path: str):
     try:
         h = hashlib.sha256()
         with open(path, "rb") as f:
@@ -57,7 +72,11 @@ def compute_sha256(path):
     except Exception:
         return None
 
-def detect_arch(exe):
+def detect_arch(exe: str) -> str:
+    """
+    Very small ELF-based arch detector.
+    Falls back to x86_64 if anything fails.
+    """
     try:
         with open(exe, "rb") as f:
             hdr = f.read(0x40)
@@ -70,12 +89,12 @@ def detect_arch(exe):
     ei_class = hdr[4]
     e_machine = struct.unpack("<H", hdr[18:20])[0]
 
-    if ei_class == 2:
+    if ei_class == 2:  # 64-bit
         if e_machine == 0x3E:
             return "x86_64"
         if e_machine == 0xB7:
             return "arm64"
-    elif ei_class == 1:
+    elif ei_class == 1:  # 32-bit
         if e_machine == 0x03:
             return "x86"
         if e_machine == 0x28:
@@ -83,7 +102,7 @@ def detect_arch(exe):
 
     return "x86_64"
 
-def get_disassembler(arch):
+def get_disassembler(arch: str):
     if arch == "x86_64":
         return Cs(CS_ARCH_X86, CS_MODE_64)
     if arch == "x86":
@@ -94,9 +113,13 @@ def get_disassembler(arch):
         return Cs(CS_ARCH_ARM, CS_MODE_ARM)
     return Cs(CS_ARCH_X86, CS_MODE_64)
 
-def hex_dump_highlight(data, base, off, length, ctx=256):
+def hex_dump_highlight(data: bytes, base: int, off: int, length: int, ctx: int = 256):
     """
-    Print a contextual hex dump with the matched bytes highlighted in red.
+    Print a hex dump with the matched range highlighted in red.
+    base  = virtual base address
+    off   = match offset inside data
+    length= match length
+    ctx   = total context bytes (around match)
     """
     half = ctx // 2
     start = max(0, off - half)
@@ -123,29 +146,49 @@ def hex_dump_highlight(data, base, off, length, ctx=256):
 
         print(f"        0x{virt+i:016x}  {' '.join(hexp):<48}  {''.join(ascp)}")
 
-
-# ======================================================================
-# Deep scan memory maps
-# ======================================================================
-
-def deep_scan_memory(pid, rules, max_read, dump_dir, json_proc):
+def print_progress(current: int, total: int, width: int = 70):
     """
-    Full Phase-2 deep scan:
-      - /proc/<pid>/maps
-      - Read memory from /proc/<pid>/mem
-      - YARA match per region
-      - Print region + entropy + hex dump + disasm
-      - Append full info into json_proc["regions"]
+    Simple text progress bar for Phase 1 PID scan.
+    """
+    if total <= 0:
+        total = 1
+    ratio = current / total
+    filled = int(ratio * width)
+    bar = "+" * filled + "-" * (width - filled)
+    msg = f"\rScanning processes | {current}/{total} [{bar}]"
+    print(msg, end="", flush=True)
+
+# ======================================================================
+# Deep scan memory maps (Phase 2)
+# ======================================================================
+
+def deep_scan_memory(pid: int, rules, max_read: int, dump_dir: str, json_proc: dict):
+    """
+    For a matched PID:
+      - Walk /proc/<pid>/maps
+      - Read each readable region (up to max_read)
+      - Run YARA on the region
+      - Print region/entropy/hex dump/disasm exactly as in v5.1
+      - Append full details into json_proc["regions"]
     """
 
     print(Fore.YELLOW + "\n[*] Deep scanning memory maps...")
 
     maps_path = f"/proc/{pid}/maps"
     try:
-        maps = open(maps_path).read().splitlines()
+        with open(maps_path, "r") as f:
+            maps = f.read().splitlines()
     except Exception:
         print(Fore.RED + "Could not read maps")
         return
+
+    # Try to figure out arch once per PID
+    try:
+        exe = psutil.Process(pid).exe()
+        arch = detect_arch(exe)
+    except Exception:
+        arch = "x86_64"
+    md = get_disassembler(arch)
 
     for line in maps:
         parts = line.split()
@@ -163,12 +206,15 @@ def deep_scan_memory(pid, rules, max_read, dump_dir, json_proc):
         if size <= 0:
             continue
 
-        # Read full region or up to max_read
+        # Read full region (or up to max_read)
         try:
             with open(f"/proc/{pid}/mem", "rb", 0) as f:
                 f.seek(start)
                 region = f.read(min(size, max_read))
         except Exception:
+            continue
+
+        if not region:
             continue
 
         # YARA deep match
@@ -181,17 +227,11 @@ def deep_scan_memory(pid, rules, max_read, dump_dir, json_proc):
         if not mres:
             continue
 
-        # Terminal output (same style as your original v5.1)
-        print(Fore.GREEN + f"\n  [+] Region match at {addr} perms={perms}")
         ent = shannon_entropy(region)
-        print(f"      Entropy: {ent:.3f}")
 
-        # Disassembler for this PID
-        try:
-            arch = detect_arch(psutil.Process(pid).exe())
-        except Exception:
-            arch = "x86_64"
-        md = get_disassembler(arch)
+        # Terminal output
+        print(Fore.GREEN + f"\n  [+] Region match at {addr} perms={perms}")
+        print(f"      Entropy: {ent:.3f}")
 
         region_out = {
             "address": addr,
@@ -205,23 +245,26 @@ def deep_scan_memory(pid, rules, max_read, dump_dir, json_proc):
             print(Fore.MAGENTA + f"    Rule: {m.rule}")
             mjson = {
                 "rule": m.rule,
-                "meta": dict(getattr(m, "meta", {})),
+                "meta": getattr(m, "meta", {}),
                 "strings": []
             }
 
             for st in m.strings:
-                ident = st.identifier
                 for inst in st.instances:
                     off  = inst.offset
                     mdat = inst.matched_data
                     mlen = len(mdat)
                     abs_addr = start + off
 
-                    print(Fore.CYAN + f"\n    String {ident}: offset=0x{abs_addr:x} len={mlen}")
+                    print(
+                        Fore.CYAN +
+                        f"\n    String {st.identifier}: offset=0x{abs_addr:x} len={mlen}"
+                    )
                     hex_dump_highlight(region, start, off, mlen)
 
+                    # Collect JSON hex + disasm
                     snippet_info = {
-                        "identifier": ident,
+                        "identifier": st.identifier,
                         "offset": abs_addr,
                         "length": mlen,
                         "hex": mdat.hex(),
@@ -260,62 +303,212 @@ def deep_scan_memory(pid, rules, max_read, dump_dir, json_proc):
                 with open(p, "wb") as f:
                     f.write(region)
                 print(Fore.GREEN + f"    Dumped region to: {p}")
-            except Exception as e:
-                print(Fore.RED + f"    Failed dumping region: {e}")
-
+            except Exception as ex:
+                print(Fore.RED + f"    Failed to dump region: {ex}")
 
 # ======================================================================
-# Simple progress bar for Phase 1
+# File / directory scan mode
 # ======================================================================
 
-def print_progress(done, total, width=70):
-    if total <= 0:
+def walk_files(root_path: str):
+    """
+    Yield full file paths.
+    - If root_path is a file: yield it once.
+    - If it's a directory: recursively yield all files.
+    """
+    if os.path.isfile(root_path):
+        yield root_path
+    elif os.path.isdir(root_path):
+        for dirpath, _, filenames in os.walk(root_path):
+            for fn in filenames:
+                full = os.path.join(dirpath, fn)
+                yield full
+    else:
         return
-    ratio = done / total
-    filled = int(width * ratio)
-    bar = "[" + "+" * filled + "-" * (width - filled) + "]"
-    # Carriage-return style progress (no newline)
-    print(f"\rScanning processes | {done}/{total} {bar}", end="", flush=True)
 
+def scan_files_mode(scan_path: str, rules, max_read: int, dump_dir: str, report: dict):
+    """
+    File/dir scan mode:
+      - No process scanning
+      - For each file:
+          * Read up to max_read
+          * Run YARA
+          * If matches:
+              - Print "File match" block with entropy/hex/disasm
+              - Append into report["matches"] as type="file"
+    """
+    files = list(walk_files(scan_path))
+    if not files:
+        print(Fore.RED + f"[!] No files found for path: {scan_path}")
+        return
+
+    print(Fore.CYAN + f"[*] File/dir scan mode enabled. Files to scan: {len(files)}")
+
+    for path in files:
+        try:
+            size = os.path.getsize(path)
+            with open(path, "rb") as f:
+                data = f.read(min(size, max_read))
+        except Exception as e:
+            print(Fore.RED + f"[!] Failed to read {path}: {e}")
+            continue
+
+        if not data:
+            continue
+
+        try:
+            mres = rules.match(data=data)
+        except Exception as e:
+            print(Fore.RED + f"[!] YARA error on {path}: {e}")
+            continue
+
+        if not mres:
+            continue
+
+        ent = shannon_entropy(data)
+
+        print(Fore.YELLOW + f"\n[*] Scanning file: {path}")
+        print(Fore.GREEN + f"  [+] File match at {path}")
+        print(f"      Size: {len(data)} bytes")
+        print(f"      Entropy: {ent:.3f}")
+
+        arch = detect_arch(path)
+        md = get_disassembler(arch)
+
+        file_json = {
+            "type": "file",
+            "file": path,
+            "sha256": compute_sha256(path),
+            "size": len(data),
+            "entropy": ent,
+            "regions": []
+        }
+
+        # Treat whole file as a single "region" from 0..len(data)
+        region_out = {
+            "address": f"0x0-0x{len(data):x}",
+            "perms": "r--",
+            "entropy": ent,
+            "matches": []
+        }
+
+        for m in mres:
+            print(Fore.MAGENTA + f"    Rule: {m.rule}")
+            mjson = {
+                "rule": m.rule,
+                "meta": getattr(m, "meta", {}),
+                "strings": []
+            }
+
+            for st in m.strings:
+                for inst in st.instances:
+                    off  = inst.offset
+                    mdat = inst.matched_data
+                    mlen = len(mdat)
+                    abs_off = off
+
+                    print(
+                        Fore.CYAN +
+                        f"\n    String {st.identifier}: offset=0x{abs_off:x} len={mlen}"
+                    )
+                    hex_dump_highlight(data, 0, off, mlen)
+
+                    snippet_info = {
+                        "identifier": st.identifier,
+                        "offset": abs_off,
+                        "length": mlen,
+                        "hex": mdat.hex(),
+                        "disasm": []
+                    }
+
+                    cstart = max(0, off - 64)
+                    cend   = min(len(data), off + mlen + 64)
+                    code   = data[cstart:cend]
+
+                    print("\n    Disassembly:")
+                    try:
+                        for ins in md.disasm(code, cstart):
+                            highlighted = (off <= ins.address < off + mlen)
+                            prefix = ">>" if highlighted else "  "
+                            col = Fore.RED if highlighted else ""
+                            line = f"{prefix} 0x{ins.address:x}: {ins.mnemonic} {ins.op_str}"
+                            print(col + "      " + line)
+                            snippet_info["disasm"].append(line)
+                    except Exception:
+                        print("      <failed disassembly>")
+
+                    mjson["strings"].append(snippet_info)
+
+            region_out["matches"].append(mjson)
+
+        file_json["regions"].append(region_out)
+
+        if dump_dir:
+            try:
+                os.makedirs(dump_dir, exist_ok=True)
+                base_name = os.path.basename(path)
+                out_path = os.path.join(dump_dir, f"{base_name}.bin")
+                with open(out_path, "wb") as f:
+                    f.write(data)
+                print(Fore.GREEN + f"    Dumped file bytes to: {out_path}")
+            except Exception as e:
+                print(Fore.RED + f"    Failed to dump file: {e}")
+
+        report["matches"].append(file_json)
 
 # ======================================================================
 # Main
 # ======================================================================
 
 def main():
+    parser = argparse.ArgumentParser(description="YARA Memory Scanner v5.6 FIXED + FILE SCAN")
 
-    parser = argparse.ArgumentParser(description="YARA Memory Scanner v5.6 FIXED + UX")
     parser.add_argument("-r", "--rule", required=True, help="YARA rule file")
-    parser.add_argument("--threads", type=int, default=4, help="Phase 1 thread count")
+    parser.add_argument("--threads", type=int, default=4, help="Threads for PID scan")
     parser.add_argument("--max-read", type=int, default=256*1024*1024,
-                        help="Max bytes to read per region")
-    parser.add_argument("--dump-dir", help="Directory for region dumps")
-    parser.add_argument("--no-fd-scan", action="store_true",  # kept for CLI compatibility
-                        help="(placeholder, FD scan not implemented in this v5.6)")
+                        help="Max bytes to read per region/file")
+    parser.add_argument("--dump-dir", help="Dump matched regions/files to this directory")
     parser.add_argument("--json-report", default="report.json",
-                        help="Path to JSON report output")
+                        help="JSON report output path")
+    parser.add_argument("--scan-path",
+                        help="If set, scan this file or directory (recursive) instead of processes")
 
     args = parser.parse_args()
 
     print(Fore.CYAN + f"[*] Loading YARA: {args.rule}")
     rules = yara.compile(filepath=args.rule)
 
-    # Do not scan our own PID
+    # JSON report skeleton
+    report = {
+        "generated": str(datetime.datetime.now()),
+        "matches": []
+    }
+
+    # ------------------------------------------------------------------
+    # MODE 1: File/Dir scan (disables process scanning)
+    # ------------------------------------------------------------------
+    if args.scan_path:
+        scan_files_mode(args.scan_path, rules, args.max_read, args.dump_dir, report)
+        with open(args.json_report, "w") as f:
+            json.dump(report, f, indent=2)
+        print(Fore.GREEN + f"\n[*] JSON report written → {args.json_report}")
+        print(Fore.GREEN + "\n[*] DONE.\n")
+        return
+
+    # ------------------------------------------------------------------
+    # MODE 2: Process scan (original behavior)
+    # ------------------------------------------------------------------
+
     selfpid = os.getpid()
+    parentpid = os.getppid()
 
     print(Fore.CYAN + "\n[*] Enumerating processes...")
-    all_procs = [p.pid for p in psutil.process_iter() if p.pid != selfpid]
-    total = len(all_procs)
-    print(f"[*] {total} processes found (excluding scanner)\n")
+    pids = [p.pid for p in psutil.process_iter() if p.pid not in (selfpid, parentpid)]
+    print(f"[*] {len(pids)} processes found (excluding scanner + parent)\n")
 
-    # --------------------------------------------------------------
-    # PHASE 1 — threaded native PID scanning + progress bar
-    # --------------------------------------------------------------
     print(Fore.CYAN + "[*] Phase 1 — YARA native PID scan (threaded)")
 
     matched = {}
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
 
     def scan_one(pid):
         try:
@@ -324,14 +517,13 @@ def main():
         except Exception:
             return pid, []
 
+    total = len(pids)
     done = 0
-    if total > 0:
-        print_progress(done, total)
 
     with ThreadPoolExecutor(max_workers=args.threads) as ex:
-        futs = {ex.submit(scan_one, pid): pid for pid in all_procs}
-        for f in as_completed(futs):
-            pid, res = f.result()
+        futures = {ex.submit(scan_one, pid): pid for pid in pids}
+        for fut in as_completed(futures):
+            pid, res = fut.result()
             done += 1
             print_progress(done, total)
 
@@ -344,42 +536,29 @@ def main():
                     name = proc.name()
                     sha = compute_sha256(exe)
                 except Exception:
-                    exe = cmd = name = sha = "<unknown>"
+                    exe = cmd = name = "<unknown>"
+                    sha = "<unknown>"
 
-                # Finish the progress bar line before printing match
-                print()  # newline after progress bar
-
-                # MATCHED line with red background; rest default color
                 rules_str = [m.rule for m in res]
 
-                # FULL MATCH BLOCK IN RED (no background color)
-                print(Fore.RED + f"[+] MATCHED PID {pid} | Name: {name} | EXE: {exe}")
-                print(Fore.RED + f"    CMD: {cmd}")
-                print(Fore.RED + f"    SHA256: {sha}")
-                print(Fore.RED + f"    Rules: {rules_str}\n")
+                # End progress line before printing match
+                print()
+                # MATCHED line colored red (full header line)
+                print(
+                    Fore.RED +
+                    f"[+] MATCHED PID {pid} | Name: {name} | EXE: {exe}" +
+                    Style.RESET_ALL
+                )
+                print(f"    CMD: {cmd}")
+                print(f"    SHA256: {sha}")
+                print(f"    Rules: {rules_str}\n")
 
-                # Re-print progress bar (optional; comment out if noisy)
-                if done < total:
-                    print_progress(done, total)
-
-    # Make sure the progress bar line ends cleanly
-    if total > 0:
+        # Finish progress bar line
         print()
 
     print(f"[*] Phase 1 done. Matched {len(matched)} processes.\n")
 
-    # -----------------------------------------------------------------
-    # JSON structure for report
-    # -----------------------------------------------------------------
-    report = {
-        "generated": str(datetime.datetime.now()),
-        "rule_file": args.rule,
-        "matches": []
-    }
-
-    # -----------------------------------------------------------------
-    # PHASE 2 — deep forensics per matched PID
-    # -----------------------------------------------------------------
+    # Phase 2 — deep memory scan per matched PID
     for pid in matched:
         print(Fore.CYAN + f"\n==================== PID {pid} ====================")
 
@@ -400,8 +579,8 @@ def main():
         print(f"  SHA256 : {sha}")
 
         json_proc = {
+            "type": "process",
             "pid": pid,
-            "name": name,
             "exe": exe,
             "cmd": cmd,
             "sha256": sha,
@@ -414,16 +593,10 @@ def main():
 
         print(Fore.CYAN + "\n====================================================\n")
 
-    # -----------------------------------------------------------------
-    # Write JSON report
-    # -----------------------------------------------------------------
-    try:
-        with open(args.json_report, "w") as f:
-            json.dump(report, f, indent=2)
-        print(Fore.GREEN + f"[*] JSON report written → {args.json_report}")
-    except Exception as e:
-        print(Fore.RED + f"[*] Failed to write JSON report: {e}")
+    with open(args.json_report, "w") as f:
+        json.dump(report, f, indent=2)
 
+    print(Fore.GREEN + f"[*] JSON report written → {args.json_report}")
     print(Fore.GREEN + "\n[*] DONE.\n")
 
 
