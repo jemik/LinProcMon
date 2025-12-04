@@ -8,9 +8,9 @@
 #include <math.h>
 #include <yara.h>
 
-#ifdef HAVE_CAPSTONE
+
 #include <capstone/capstone.h>
-#endif
+
 
 // Don't redefine MAX_PATH if YARA already defined it
 #ifndef MAX_PATH
