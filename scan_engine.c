@@ -6,7 +6,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #include <math.h>
+#include <time.h>
 #include <yara.h>
+#include <openssl/sha.h>
+#include <yara.h>
+#include <openssl/sha.h>
 
 #ifdef HAVE_CAPSTONE
 #include <capstone/capstone.h>
@@ -24,6 +28,46 @@
 #define COLOR_RED     "\033[31m"
 #define COLOR_YELLOW  "\033[33m"
 #define COLOR_PURPLE  "\033[35m"
+
+// Global state for JSON report generation
+static FILE* g_json_report = NULL;
+static int g_first_match = 1;
+
+// Calculate SHA256 hash of data
+void calculate_sha256(const uint8_t *data, size_t len, char *output) {
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(data, len, hash);
+    
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
+        sprintf(output + (i * 2), "%02x", hash[i]);
+    }
+    output[64] = '\0';
+}
+
+// Escape string for JSON output
+void json_escape_string(const char *input, char *output, size_t output_size) {
+    size_t j = 0;
+    for (size_t i = 0; input[i] && j < output_size - 2; i++) {
+        switch (input[i]) {
+            case '"': case '\\': case '/': 
+                output[j++] = '\\';
+                output[j++] = input[i];
+                break;
+            case '\b': output[j++] = '\\'; output[j++] = 'b'; break;
+            case '\f': output[j++] = '\\'; output[j++] = 'f'; break;
+            case '\n': output[j++] = '\\'; output[j++] = 'n'; break;
+            case '\r': output[j++] = '\\'; output[j++] = 'r'; break;
+            case '\t': output[j++] = '\\'; output[j++] = 't'; break;
+            default:
+                if (input[i] < 32) {
+                    j += snprintf(output + j, output_size - j, "\\u%04x", (unsigned char)input[i]);
+                } else {
+                    output[j++] = input[i];
+                }
+        }
+    }
+    output[j] = '\0';
+}
 
 // Calculate Shannon entropy of data
 double calculate_entropy(const uint8_t *data, size_t len) {
@@ -43,6 +87,31 @@ double calculate_entropy(const uint8_t *data, size_t len) {
     }
     
     return entropy;
+}
+
+// Escape string for JSON output
+void json_escape_string(const char *input, char *output, size_t output_size) {
+    size_t j = 0;
+    for (size_t i = 0; input[i] && j < output_size - 2; i++) {
+        switch (input[i]) {
+            case '"': case '\\': case '/': 
+                output[j++] = '\\';
+                output[j++] = input[i];
+                break;
+            case '\b': output[j++] = '\\'; output[j++] = 'b'; break;
+            case '\f': output[j++] = '\\'; output[j++] = 'f'; break;
+            case '\n': output[j++] = '\\'; output[j++] = 'n'; break;
+            case '\r': output[j++] = '\\'; output[j++] = 'r'; break;
+            case '\t': output[j++] = '\\'; output[j++] = 't'; break;
+            default:
+                if (input[i] < 32) {
+                    j += snprintf(output + j, output_size - j, "\\u%04x", (unsigned char)input[i]);
+                } else {
+                    output[j++] = input[i];
+                }
+        }
+    }
+    output[j] = '\0';
 }
 
 // Print hex dump with context around a specific offset
@@ -157,6 +226,94 @@ void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset
 #endif
 }
 
+// Generate hex dump lines for JSON
+void json_hex_dump(FILE *fp, const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
+    size_t start = (match_offset >= 0x10) ? (match_offset - 0x10) : 0;
+    size_t end = match_offset + match_len + 0x10;
+    if (end > data_len) end = data_len;
+    start = (start / 16) * 16;
+    
+    fprintf(fp, "          \"hexdump\": [\n");
+    int first_line = 1;
+    
+    for (size_t offset = start; offset < end; offset += 16) {
+        if (!first_line) fprintf(fp, ",\n");
+        first_line = 0;
+        
+        fprintf(fp, "            \"        0x%016lx  ", offset);
+        
+        // Hex bytes
+        for (size_t i = 0; i < 16; i++) {
+            if (offset + i < end) {
+                fprintf(fp, "%02x ", data[offset + i]);
+            } else {
+                fprintf(fp, "   ");
+            }
+        }
+        
+        fprintf(fp, "  ");
+        
+        // ASCII
+        for (size_t i = 0; i < 16; i++) {
+            if (offset + i < end) {
+                uint8_t c = data[offset + i];
+                char display = (c >= 32 && c < 127) ? c : '.';
+                fprintf(fp, "%c", display);
+            }
+        }
+        
+        fprintf(fp, "\"");
+    }
+    
+    fprintf(fp, "\n          ]");
+}
+
+// Generate disassembly for JSON
+void json_disassembly(FILE *fp, const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
+#ifdef HAVE_CAPSTONE
+    csh handle;
+    cs_insn *insn;
+    
+    if (cs_open(CS_ARCH_X86, CS_MODE_64, &handle) != CS_ERR_OK) {
+        fprintf(fp, ",\n          \"disasm\": []");
+        return;
+    }
+    
+    size_t dis_start = (match_offset >= 0x20) ? (match_offset - 0x20) : 0;
+    size_t dis_len = match_len + 0x40;
+    if (dis_start + dis_len > data_len) {
+        dis_len = data_len - dis_start;
+    }
+    
+    size_t count = cs_disasm(handle, data + dis_start, dis_len, dis_start, 0, &insn);
+    
+    fprintf(fp, ",\n          \"disasm\": [\n");
+    
+    if (count > 0) {
+        for (size_t i = 0; i < count; i++) {
+            if (i > 0) fprintf(fp, ",\n");
+            
+            int is_match = (insn[i].address >= match_offset && 
+                          insn[i].address < match_offset + match_len);
+            
+            if (is_match) {
+                fprintf(fp, "            \">> 0x%lx: %s %s\"",
+                       insn[i].address, insn[i].mnemonic, insn[i].op_str);
+            } else {
+                fprintf(fp, "            \"   0x%lx: %s %s\"",
+                       insn[i].address, insn[i].mnemonic, insn[i].op_str);
+            }
+        }
+        cs_free(insn, count);
+    }
+    
+    fprintf(fp, "\n          ]");
+    cs_close(&handle);
+#else
+    fprintf(fp, ",\n          \"disasm\": []");
+#endif
+}
+
 // YARA callback for each match
 int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data) {
     if (message == CALLBACK_MSG_RULE_MATCHING) {
@@ -221,15 +378,163 @@ int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, voi
     return CALLBACK_CONTINUE;
 }
 
+// YARA callback for JSON report mode
+int yara_callback_json(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data) {
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        YR_RULE* rule = (YR_RULE*)message_data;
+        const char* filepath = (const char*)user_data;
+        
+        // Get file size and calculate entropy + SHA256
+        struct stat st;
+        if (stat(filepath, &st) != 0) return CALLBACK_CONTINUE;
+        
+        FILE* f = fopen(filepath, "rb");
+        if (!f) return CALLBACK_CONTINUE;
+        
+        uint8_t* file_data = malloc(st.st_size);
+        if (!file_data) {
+            fclose(f);
+            return CALLBACK_CONTINUE;
+        }
+        
+        size_t read_bytes = fread(file_data, 1, st.st_size, f);
+        fclose(f);
+        
+        if (read_bytes != st.st_size) {
+            free(file_data);
+            return CALLBACK_CONTINUE;
+        }
+        
+        double entropy = calculate_entropy(file_data, st.st_size);
+        
+        char sha256[65];
+        calculate_sha256(file_data, st.st_size, sha256);
+        
+        char escaped_path[MAX_PATH * 2];
+        json_escape_string(filepath, escaped_path, sizeof(escaped_path));
+        
+        // Write match entry (comma separated)
+        if (!g_first_match) {
+            fprintf(g_json_report, ",\n");
+        }
+        g_first_match = 0;
+        
+        fprintf(g_json_report, "    {\n");
+        fprintf(g_json_report, "      \"type\": \"file\",\n");
+        fprintf(g_json_report, "      \"file\": \"%s\",\n", escaped_path);
+        fprintf(g_json_report, "      \"sha256\": \"%s\",\n", sha256);
+        fprintf(g_json_report, "      \"size\": %ld,\n", st.st_size);
+        fprintf(g_json_report, "      \"entropy\": %.14f,\n", entropy);
+        fprintf(g_json_report, "      \"regions\": [\n");
+        fprintf(g_json_report, "        {\n");
+        fprintf(g_json_report, "          \"address\": \"0x0-0x%lx\",\n", st.st_size);
+        fprintf(g_json_report, "          \"perms\": \"r--\",\n");
+        fprintf(g_json_report, "          \"entropy\": %.14f,\n", entropy);
+        fprintf(g_json_report, "          \"matches\": [\n");
+        
+        // Process each rule match
+        int first_rule = 1;
+        
+        char escaped_rule[256];
+        json_escape_string(rule->identifier, escaped_rule, sizeof(escaped_rule));
+        
+        if (!first_rule) fprintf(g_json_report, ",\n");
+        first_rule = 0;
+        
+        fprintf(g_json_report, "            {\n");
+        fprintf(g_json_report, "              \"rule\": \"%s\",\n", escaped_rule);
+        fprintf(g_json_report, "              \"meta\": {\n");
+        
+        // Extract rule metadata
+        int first_meta = 1;
+        YR_META* meta;
+        yr_rule_metas_foreach(rule, meta) {
+            if (!first_meta) fprintf(g_json_report, ",\n");
+            first_meta = 0;
+            
+            char escaped_id[256], escaped_val[1024];
+            json_escape_string(meta->identifier, escaped_id, sizeof(escaped_id));
+            
+            fprintf(g_json_report, "                \"%s\": ", escaped_id);
+            
+            if (meta->type == META_TYPE_INTEGER) {
+                fprintf(g_json_report, "%ld", (long)meta->integer);
+            } else if (meta->type == META_TYPE_STRING) {
+                json_escape_string(meta->string, escaped_val, sizeof(escaped_val));
+                fprintf(g_json_report, "\"%s\"", escaped_val);
+            } else if (meta->type == META_TYPE_BOOLEAN) {
+                fprintf(g_json_report, "%s", meta->integer ? "true" : "false");
+            }
+        }
+        
+        fprintf(g_json_report, "\n              },\n");
+        fprintf(g_json_report, "              \"strings\": [\n");
+        
+        // Process string matches
+        int first_string = 1;
+        YR_STRING* string;
+        yr_rule_strings_foreach(rule, string) {
+            YR_MATCH* match;
+            yr_string_matches_foreach(context, string, match) {
+                if (!first_string) fprintf(g_json_report, ",\n");
+                first_string = 0;
+                
+                char escaped_str_id[256];
+                json_escape_string(string->identifier, escaped_str_id, sizeof(escaped_str_id));
+                
+                fprintf(g_json_report, "                {\n");
+                fprintf(g_json_report, "                  \"identifier\": \"%s\",\n", escaped_str_id);
+                fprintf(g_json_report, "                  \"offset\": %lu,\n", (unsigned long)match->offset);
+                fprintf(g_json_report, "                  \"length\": %d,\n", match->match_length);
+                
+                // Hex representation of matched bytes
+                fprintf(g_json_report, "                  \"hex\": \"");
+                for (int i = 0; i < match->match_length && i < 256; i++) {
+                    fprintf(g_json_report, "%02x", file_data[match->offset + i]);
+                }
+                fprintf(g_json_report, "\",\n");
+                
+                // Hex dump
+                json_hex_dump(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                
+                // Disassembly if looks like code
+                if (strstr(string->identifier, "opcode") != NULL ||
+                    strstr(string->identifier, "shellcode") != NULL ||
+                    strstr(string->identifier, "code") != NULL) {
+                    json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                }
+                
+                fprintf(g_json_report, "\n                }");
+            }
+        }
+        
+        fprintf(g_json_report, "\n              ]\n");
+        fprintf(g_json_report, "            }\n");
+        fprintf(g_json_report, "          ]\n");
+        fprintf(g_json_report, "        }\n");
+        fprintf(g_json_report, "      ]\n");
+        fprintf(g_json_report, "    }");
+        
+        free(file_data);
+    }
+    
+    return CALLBACK_CONTINUE;
+}
+
 // Scan a single file with YARA rules
 int scan_file(YR_RULES* rules, const char* filepath) {
-    printf("[*] Scanning file: " COLOR_YELLOW "%s" COLOR_RESET "\n", filepath);
+    if (!g_json_report) {
+        printf("[*] Scanning file: " COLOR_YELLOW "%s" COLOR_RESET "\n", filepath);
+    }
     
-    int result = yr_rules_scan_file(rules, filepath, 0, yara_callback, 
+    int result = yr_rules_scan_file(rules, filepath, 0, 
+                                     g_json_report ? yara_callback_json : yara_callback, 
                                      (void*)filepath, 0);
     
     if (result != ERROR_SUCCESS) {
-        fprintf(stderr, "  [!] Error scanning file: %d\n", result);
+        if (!g_json_report) {
+            fprintf(stderr, "  [!] Error scanning file: %d\n", result);
+        }
         return -1;
     }
     
@@ -300,13 +605,16 @@ void scan_directory(YR_RULES* rules, const char* dirpath) {
 }
 
 void print_usage(const char* progname) {
-    printf("Usage: %s <yara_rules> <file_or_directory>\n", progname);
+    printf("Usage: %s [OPTIONS] <yara_rules> <file_or_directory>\n", progname);
     printf("\n");
     printf("Standalone YARA scanner with detailed match information\n");
     printf("\n");
     printf("Arguments:\n");
     printf("  yara_rules          Path to YARA rules file (.yar)\n");
     printf("  file_or_directory   File or directory to scan\n");
+    printf("\n");
+    printf("Options:\n");
+    printf("  -r, --report        Generate JSON report (report_<input>.json)\n");
     printf("\n");
     printf("Output includes:\n");
     printf("  - File size and entropy\n");
@@ -317,13 +625,22 @@ void print_usage(const char* progname) {
 }
 
 int main(int argc, char** argv) {
-    if (argc != 3) {
+    int generate_report = 0;
+    int arg_offset = 1;
+    
+    // Parse options
+    if (argc > 1 && (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "--report") == 0)) {
+        generate_report = 1;
+        arg_offset = 2;
+    }
+    
+    if (argc < arg_offset + 2) {
         print_usage(argv[0]);
         return 1;
     }
     
-    const char* rules_file = argv[1];
-    const char* scan_target = argv[2];
+    const char* rules_file = argv[arg_offset];
+    const char* scan_target = argv[arg_offset + 1];
     
     // Initialize YARA
     int result = yr_initialize();
@@ -336,7 +653,9 @@ int main(int argc, char** argv) {
     const char* rules_filename = strrchr(rules_file, '/');
     rules_filename = rules_filename ? rules_filename + 1 : rules_file;
     
-    printf("[*] Loading YARA: %s\n", rules_filename);
+    if (!generate_report) {
+        printf("[*] Loading YARA: %s\n", rules_filename);
+    }
     
     // Compile YARA rules
     YR_COMPILER* compiler = NULL;
@@ -375,27 +694,75 @@ int main(int argc, char** argv) {
         return 1;
     }
     
+    // Setup JSON report if requested
+    char report_filename[MAX_PATH];
+    if (generate_report) {
+        // Extract base name from scan target
+        const char* base = strrchr(scan_target, '/');
+        base = base ? base + 1 : scan_target;
+        
+        snprintf(report_filename, sizeof(report_filename), "report_%s.json", base);
+        
+        g_json_report = fopen(report_filename, "w");
+        if (!g_json_report) {
+            fprintf(stderr, "[!] Cannot create report file: %s\n", report_filename);
+            yr_rules_destroy(rules);
+            yr_finalize();
+            return 1;
+        }
+        
+        // Write JSON header
+        time_t now = time(NULL);
+        struct tm *tm_info = localtime(&now);
+        char timestamp[64];
+        strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+        
+        // Get microseconds
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        
+        fprintf(g_json_report, "{\n");
+        fprintf(g_json_report, "  \"generated\": \"%s.%06ld\",\n", timestamp, ts.tv_nsec / 1000);
+        fprintf(g_json_report, "  \"matches\": [\n");
+        
+        g_first_match = 1;
+    }
+    
     // Check if target is file or directory
     struct stat st;
     if (stat(scan_target, &st) != 0) {
         fprintf(stderr, "[!] Cannot access: %s\n", scan_target);
+        if (g_json_report) fclose(g_json_report);
         yr_rules_destroy(rules);
         yr_finalize();
         return 1;
     }
     
     if (S_ISREG(st.st_mode)) {
-        printf("[*] File/dir scan mode enabled. Files to scan: 1\n\n");
+        if (!generate_report) {
+            printf("[*] File/dir scan mode enabled. Files to scan: 1\n\n");
+        }
         scan_file(rules, scan_target);
     } else if (S_ISDIR(st.st_mode)) {
         int file_count = count_files_recursive(scan_target);
-        printf("[*] File/dir scan mode enabled. Files to scan: %d\n\n", file_count);
+        if (!generate_report) {
+            printf("[*] File/dir scan mode enabled. Files to scan: %d\n\n", file_count);
+        }
         scan_directory(rules, scan_target);
     } else {
         fprintf(stderr, "[!] Target is neither a regular file nor directory\n");
+        if (g_json_report) fclose(g_json_report);
         yr_rules_destroy(rules);
         yr_finalize();
         return 1;
+    }
+    
+    // Close JSON report if generated
+    if (generate_report && g_json_report) {
+        fprintf(g_json_report, "\n  ]\n");
+        fprintf(g_json_report, "}\n");
+        fclose(g_json_report);
+        printf("[*] Report saved to: %s\n", report_filename);
     }
     
     // Cleanup
