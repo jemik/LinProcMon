@@ -1105,6 +1105,42 @@ int main(int argc, char** argv) {
             return 1;
         }
         
+        // Setup JSON report if requested for process scan
+        char report_filename[MAX_PATH];
+        if (generate_report) {
+            struct utsname uts;
+            if (uname(&uts) == 0) {
+                snprintf(report_filename, sizeof(report_filename), 
+                        "scan_report_processes_%s.json", uts.nodename);
+            } else {
+                snprintf(report_filename, sizeof(report_filename), 
+                        "scan_report_processes.json");
+            }
+            
+            g_json_report = fopen(report_filename, "w");
+            if (!g_json_report) {
+                fprintf(stderr, "[!] Cannot create report file: %s\n", report_filename);
+                yr_rules_destroy(rules);
+                yr_finalize();
+                return 1;
+            }
+            
+            // Write JSON header
+            time_t now = time(NULL);
+            struct tm *tm_info = localtime(&now);
+            char timestamp[64];
+            strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+            
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            
+            fprintf(g_json_report, "{\n");
+            fprintf(g_json_report, "  \"generated\": \"%s.%06ld\",\n", timestamp, ts.tv_nsec / 1000);
+            fprintf(g_json_report, "  \"matches\": [\n");
+            
+            g_first_match = 1;
+        }
+        
         printf("\n[*] Enumerating processes...\n");
         
         pid_t my_pid = getpid();
@@ -1184,6 +1220,14 @@ int main(int argc, char** argv) {
             free(g_processes[i].matched_rules);
         }
         free(g_processes);
+        
+        // Close JSON report if generated
+        if (generate_report && g_json_report) {
+            fprintf(g_json_report, "\n  ]\n");
+            fprintf(g_json_report, "}\n");
+            fclose(g_json_report);
+            printf("\n[*] Report saved to: %s\n", report_filename);
+        }
         
         yr_rules_destroy(rules);
         yr_finalize();
