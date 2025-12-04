@@ -89,31 +89,6 @@ double calculate_entropy(const uint8_t *data, size_t len) {
     return entropy;
 }
 
-// Escape string for JSON output
-void json_escape_string(const char *input, char *output, size_t output_size) {
-    size_t j = 0;
-    for (size_t i = 0; input[i] && j < output_size - 2; i++) {
-        switch (input[i]) {
-            case '"': case '\\': case '/': 
-                output[j++] = '\\';
-                output[j++] = input[i];
-                break;
-            case '\b': output[j++] = '\\'; output[j++] = 'b'; break;
-            case '\f': output[j++] = '\\'; output[j++] = 'f'; break;
-            case '\n': output[j++] = '\\'; output[j++] = 'n'; break;
-            case '\r': output[j++] = '\\'; output[j++] = 'r'; break;
-            case '\t': output[j++] = '\\'; output[j++] = 't'; break;
-            default:
-                if (input[i] < 32) {
-                    j += snprintf(output + j, output_size - j, "\\u%04x", (unsigned char)input[i]);
-                } else {
-                    output[j++] = input[i];
-                }
-        }
-    }
-    output[j] = '\0';
-}
-
 // Print hex dump with context around a specific offset
 void print_hex_dump(const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
     // Calculate context range
