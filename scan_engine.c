@@ -601,21 +601,24 @@ void print_usage(const char* progname) {
 
 int main(int argc, char** argv) {
     int generate_report = 0;
-    int arg_offset = 1;
+    const char* rules_file = NULL;
+    const char* scan_target = NULL;
     
-    // Parse options
-    if (argc > 1 && (strcmp(argv[1], "-r") == 0 || strcmp(argv[1], "--report") == 0)) {
-        generate_report = 1;
-        arg_offset = 2;
+    // Parse arguments - accept -r/--report anywhere
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--report") == 0) {
+            generate_report = 1;
+        } else if (!rules_file) {
+            rules_file = argv[i];
+        } else if (!scan_target) {
+            scan_target = argv[i];
+        }
     }
     
-    if (argc < arg_offset + 2) {
+    if (!rules_file || !scan_target) {
         print_usage(argv[0]);
         return 1;
     }
-    
-    const char* rules_file = argv[arg_offset];
-    const char* scan_target = argv[arg_offset + 1];
     
     // Initialize YARA
     int result = yr_initialize();
