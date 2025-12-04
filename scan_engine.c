@@ -894,6 +894,38 @@ void print_matched_process(ProcessInfo *info) {
     printf("\n====================================================\n");
 }
 
+// Write process match to JSON report
+void write_process_to_json(ProcessInfo *info) {
+    if (!g_json_report) return;
+    
+    if (!g_first_match) {
+        fprintf(g_json_report, ",\n");
+    }
+    g_first_match = 0;
+    
+    char escaped_name[512], escaped_exe[MAX_PATH * 2], escaped_cmd[2048];
+    json_escape_string(info->name, escaped_name, sizeof(escaped_name));
+    json_escape_string(info->exe, escaped_exe, sizeof(escaped_exe));
+    json_escape_string(info->cmdline, escaped_cmd, sizeof(escaped_cmd));
+    
+    fprintf(g_json_report, "    {\n");
+    fprintf(g_json_report, "      \"type\": \"process\",\n");
+    fprintf(g_json_report, "      \"pid\": %d,\n", info->pid);
+    fprintf(g_json_report, "      \"name\": \"%s\",\n", escaped_name);
+    fprintf(g_json_report, "      \"exe\": \"%s\",\n", escaped_exe);
+    fprintf(g_json_report, "      \"cmdline\": \"%s\",\n", escaped_cmd);
+    fprintf(g_json_report, "      \"sha256\": \"%s\",\n", info->sha256);
+    fprintf(g_json_report, "      \"matched_rules\": [");
+    for (int i = 0; i < info->matched_rules_count; i++) {
+        char escaped_rule[512];
+        json_escape_string(info->matched_rules[i], escaped_rule, sizeof(escaped_rule));
+        fprintf(g_json_report, "\"%s\"%s", escaped_rule,
+                i < info->matched_rules_count - 1 ? ", " : "");
+    }
+    fprintf(g_json_report, "]\n");
+    fprintf(g_json_report, "    }");
+}
+
 // Scan a single file with YARA rules
 int scan_file(YR_RULES* rules, const char* filepath) {
     if (!g_json_report) {
@@ -1208,7 +1240,14 @@ int main(int argc, char** argv) {
         // Deep scan matched processes
         for (int i = 0; i < g_process_count; i++) {
             if (g_processes[i].matched) {
-                print_matched_process(&g_processes[i]);
+                if (!generate_report) {
+                    print_matched_process(&g_processes[i]);
+                }
+                
+                // Write to JSON report if enabled
+                if (generate_report) {
+                    write_process_to_json(&g_processes[i]);
+                }
             }
         }
         
