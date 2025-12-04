@@ -2,17 +2,38 @@
 
 CC = gcc
 CFLAGS = -Wall -O2 -g
-LIBS = -lyara -lm
+LIBS = -lm
 
-# Check if capstone is available
-HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+# Build mode: dynamic (default) or static
+BUILD_MODE ?= dynamic
 
-ifeq ($(HAS_CAPSTONE),yes)
-    CFLAGS += -DHAVE_CAPSTONE $(shell pkg-config --cflags capstone)
-    LIBS += $(shell pkg-config --libs capstone)
+ifeq ($(BUILD_MODE),static)
+    # Static linking - creates portable binary
+    CFLAGS += -static
+    LIBS += -lyara -lcrypto -lssl -lmagic -lz -lpthread
+    
+    # Check if capstone is available for static linking
+    HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+    ifeq ($(HAS_CAPSTONE),yes)
+        CFLAGS += -DHAVE_CAPSTONE
+        LIBS += -lcapstone
+        $(info Building with static Capstone support)
+    else
+        $(info Building statically without Capstone - disassembly disabled)
+    endif
 else
-    $(info Note: Building without Capstone support - disassembly will be disabled)
-    $(info Install libcapstone-dev to enable disassembly feature)
+    # Dynamic linking - requires libraries on target system
+    LIBS += -lyara
+    
+    # Check if capstone is available
+    HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+    ifeq ($(HAS_CAPSTONE),yes)
+        CFLAGS += -DHAVE_CAPSTONE $(shell pkg-config --cflags capstone)
+        LIBS += $(shell pkg-config --libs capstone)
+        $(info Building with dynamic Capstone support)
+    else
+        $(info Building without Capstone - disassembly disabled)
+    endif
 endif
 
 TARGET = scan_engine
@@ -22,6 +43,23 @@ all: $(TARGET)
 
 $(TARGET): $(SOURCE)
 	$(CC) $(CFLAGS) -o $(TARGET) $(SOURCE) $(LIBS)
+	@echo ""
+	@echo "Build complete: $(TARGET)"
+ifeq ($(BUILD_MODE),static)
+	@echo "Mode: Static (portable binary)"
+	@file $(TARGET) | grep "statically linked" && echo "✓ Successfully statically linked" || echo "⚠ Warning: May not be fully static"
+else
+	@echo "Mode: Dynamic (requires libraries on target)"
+	@ldd $(TARGET)
+endif
+
+static:
+	@echo "Building static (portable) binary..."
+	$(MAKE) BUILD_MODE=static
+
+dynamic:
+	@echo "Building dynamic binary..."
+	$(MAKE) BUILD_MODE=dynamic
 
 clean:
 	rm -f $(TARGET)
