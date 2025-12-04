@@ -21,7 +21,8 @@
 #define MAX_PATH 4096
 #endif
 
-#define HEX_DUMP_CONTEXT 0x40  // Show 64 bytes of context around match
+#define HEX_DUMP_CONTEXT_DEFAULT 0x100  // Default: show 256 bytes of context
+#define HEX_DUMP_CONTEXT_MAX 0x400      // Maximum: 1024 bytes
 
 // ANSI color codes
 #define COLOR_RESET   "\033[0m"
@@ -32,6 +33,7 @@
 // Global state for JSON report generation
 static FILE* g_json_report = NULL;
 static int g_first_match = 1;
+static size_t g_hex_dump_size = HEX_DUMP_CONTEXT_DEFAULT;
 
 // Calculate SHA256 hash of data
 void calculate_sha256(const uint8_t *data, size_t len, char *output) {
@@ -92,8 +94,9 @@ double calculate_entropy(const uint8_t *data, size_t len) {
 // Print hex dump with context around a specific offset
 void print_hex_dump(const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
     // Calculate context range
-    size_t start = (match_offset >= 0x10) ? (match_offset - 0x10) : 0;
-    size_t end = match_offset + match_len + 0x10;
+    size_t context = g_hex_dump_size / 2;
+    size_t start = (match_offset >= context) ? (match_offset - context) : 0;
+    size_t end = match_offset + match_len + context;
     if (end > data_len) end = data_len;
     
     // Round start down to 16-byte boundary for clean display
@@ -203,8 +206,9 @@ void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset
 
 // Generate hex dump lines for JSON
 void json_hex_dump(FILE *fp, const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
-    size_t start = (match_offset >= 0x10) ? (match_offset - 0x10) : 0;
-    size_t end = match_offset + match_len + 0x10;
+    size_t context = g_hex_dump_size / 2;
+    size_t start = (match_offset >= context) ? (match_offset - context) : 0;
+    size_t end = match_offset + match_len + context;
     if (end > data_len) end = data_len;
     start = (start / 16) * 16;
     
@@ -589,7 +593,8 @@ void print_usage(const char* progname) {
     printf("  file_or_directory   File or directory to scan\n");
     printf("\n");
     printf("Options:\n");
-    printf("  -r, --report        Generate JSON report (report_<input>.json)\n");
+    printf("  -r, --report        Generate JSON report (scan_report_<sha256>.json)\n");
+    printf("  -s, --size <bytes>  Hex dump context size in bytes (default: 256, max: 1024)\n");
     printf("\n");
     printf("Output includes:\n");
     printf("  - File size and entropy\n");
@@ -604,10 +609,23 @@ int main(int argc, char** argv) {
     const char* rules_file = NULL;
     const char* scan_target = NULL;
     
-    // Parse arguments - accept -r/--report anywhere
+    // Parse arguments - accept -r/--report and -s/--size anywhere
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-r") == 0 || strcmp(argv[i], "--report") == 0) {
             generate_report = 1;
+        } else if (strcmp(argv[i], "-s") == 0 || strcmp(argv[i], "--size") == 0) {
+            if (i + 1 < argc) {
+                int size = atoi(argv[++i]);
+                if (size > 0 && size <= HEX_DUMP_CONTEXT_MAX) {
+                    g_hex_dump_size = size;
+                } else {
+                    fprintf(stderr, "[!] Invalid hex dump size: %d (max: %d)\n", size, HEX_DUMP_CONTEXT_MAX);
+                    return 1;
+                }
+            } else {
+                fprintf(stderr, "[!] Missing value for -s/--size option\n");
+                return 1;
+            }
         } else if (!rules_file) {
             rules_file = argv[i];
         } else if (!scan_target) {
