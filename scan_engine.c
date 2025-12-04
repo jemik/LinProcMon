@@ -741,6 +741,60 @@ int read_memory_regions(int pid, MemoryRegion **regions, int *count) {
     return 0;
 }
 
+// Context for memory region scanning
+typedef struct {
+    size_t base_address;
+    const uint8_t *data;
+    size_t data_size;
+    char perms[5];
+    double entropy;
+    int has_match;
+} MemoryScanContext;
+
+// YARA callback for memory region scanning
+int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_data, void* user_data) {
+    if (message == CALLBACK_MSG_RULE_MATCHING) {
+        YR_RULE* rule = (YR_RULE*)message_data;
+        MemoryScanContext *mem_ctx = (MemoryScanContext*)user_data;
+        
+        if (!mem_ctx->has_match) {
+            printf("\n  " COLOR_RED "[+] Region match at %lx-%lx perms=%s" COLOR_RESET "\n",
+                   mem_ctx->base_address, mem_ctx->base_address + mem_ctx->data_size, mem_ctx->perms);
+            printf("      Entropy: %.3f\n", mem_ctx->entropy);
+            mem_ctx->has_match = 1;
+        }
+        
+        printf("    Rule: " COLOR_PURPLE "%s" COLOR_RESET "\n", rule->identifier);
+        
+        YR_STRING* string;
+        yr_rule_strings_foreach(rule, string) {
+            YR_MATCH* match;
+            yr_string_matches_foreach(context, string, match) {
+                printf("\n    String %s: offset=0x%lx len=%d\n",
+                       string->identifier,
+                       mem_ctx->base_address + (unsigned long)match->offset,
+                       (int)match->match_length);
+                
+                // Print hex dump around the match
+                if (match->offset < mem_ctx->data_size) {
+                    print_hex_dump(mem_ctx->data, mem_ctx->data_size, 
+                                 match->offset, match->match_length);
+                }
+                
+                // Try to disassemble if it looks like code
+                if (strstr(string->identifier, "opcode") != NULL ||
+                    strstr(string->identifier, "shellcode") != NULL ||
+                    strstr(string->identifier, "code") != NULL) {
+                    print_disassembly(mem_ctx->data, mem_ctx->data_size,
+                                    match->offset, match->match_length);
+                }
+            }
+        }
+    }
+    
+    return CALLBACK_CONTINUE;
+}
+
 // Scan process memory regions
 void scan_process_memory(ProcessInfo *info) {
     MemoryRegion *regions = NULL;
@@ -766,7 +820,7 @@ void scan_process_memory(ProcessInfo *info) {
     for (int i = 0; i < region_count; i++) {
         MemoryRegion *region = &regions[i];
         
-        // Only scan readable, writable regions
+        // Only scan readable regions
         if (region->perms[0] != 'r') continue;
         
         size_t size = region->end - region->start;
@@ -787,21 +841,19 @@ void scan_process_memory(ProcessInfo *info) {
             continue;
         }
         
-        // Scan with YARA
-        int result = yr_rules_scan_mem(g_yara_rules, data, bytes_read, 0, 
-                                       yara_callback, NULL, 0);
+        // Prepare scan context
+        MemoryScanContext mem_ctx = {
+            .base_address = region->start,
+            .data = data,
+            .data_size = bytes_read,
+            .entropy = calculate_entropy(data, bytes_read),
+            .has_match = 0
+        };
+        strncpy(mem_ctx.perms, region->perms, sizeof(mem_ctx.perms));
         
-        if (result == ERROR_SUCCESS) {
-            // Check if there was a match (simplified - would need callback context)
-            double entropy = calculate_entropy(data, bytes_read);
-            
-            printf("\n  " COLOR_RED "[+] Region match at %lx-%lx perms=%s" COLOR_RESET "\n",
-                   region->start, region->end, region->perms);
-            printf("      Entropy: %.3f\n", entropy);
-            
-            // Re-scan to get details with proper callback
-            // (This is simplified - in production you'd use a custom callback)
-        }
+        // Scan with YARA using our custom callback
+        yr_rules_scan_mem(g_yara_rules, data, bytes_read, 0, 
+                         yara_callback_memory, &mem_ctx, 0);
         
         free(data);
     }
@@ -1027,6 +1079,15 @@ int main(int argc, char** argv) {
     
     // Process scanning mode
     if (g_scan_processes) {
+        // Check if running as root
+        if (geteuid() != 0) {
+            fprintf(stderr, "\n" COLOR_RED "[!] Process scanning requires root privileges" COLOR_RESET "\n");
+            fprintf(stderr, "    Please run with: sudo %s -p %s\n\n", argv[0], rules_file);
+            yr_rules_destroy(rules);
+            yr_finalize();
+            return 1;
+        }
+        
         printf("\n[*] Enumerating processes...\n");
         
         if (enumerate_processes(&g_processes, &g_process_count) != 0) {
