@@ -7,9 +7,16 @@
 #include <unistd.h>
 #include <math.h>
 #include <yara.h>
-#include <capstone/capstone.h>
 
+#ifdef HAVE_CAPSTONE
+#include <capstone/capstone.h>
+#endif
+
+// Don't redefine MAX_PATH if YARA already defined it
+#ifndef MAX_PATH
 #define MAX_PATH 4096
+#endif
+
 #define HEX_DUMP_CONTEXT 0x40  // Show 64 bytes of context around match
 
 // ANSI color codes
@@ -96,6 +103,7 @@ void print_hex_dump(const uint8_t *data, size_t data_len, size_t match_offset, s
 
 // Disassemble code at match location
 void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset, size_t match_len) {
+#ifdef HAVE_CAPSTONE
     csh handle;
     cs_insn *insn;
     
@@ -144,6 +152,9 @@ void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset
     }
     
     cs_close(&handle);
+#else
+    printf("\n    Disassembly: (Capstone not available - install libcapstone-dev)\n");
+#endif
 }
 
 // YARA callback for each match
@@ -152,7 +163,7 @@ int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, voi
         YR_RULE* rule = (YR_RULE*)message_data;
         const char* filepath = (const char*)user_data;
         
-        printf("  [+] File match at %s\n", filepath);
+        printf("  " COLOR_RED "[+] File match at %s" COLOR_RESET "\n", filepath);
         
         // Get file size and calculate entropy
         struct stat st;
@@ -177,10 +188,10 @@ int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, voi
                     yr_rule_strings_foreach(rule, string) {
                         YR_MATCH* match;
                         yr_string_matches_foreach(context, string, match) {
-                            printf("\n    String %s: offset=0x%lx len=%ld\n",
+                            printf("\n    String %s: offset=0x%lx len=%d\n",
                                    string->identifier,
-                                   match->offset,
-                                   match->match_length);
+                                   (unsigned long)match->offset,
+                                   (int)match->match_length);
                             
                             // Print hex dump around the match
                             if (match->offset < st.st_size) {

@@ -2,7 +2,18 @@
 
 CC = gcc
 CFLAGS = -Wall -O2 -g
-LIBS = -lyara -lcapstone -lm
+LIBS = -lyara -lm
+
+# Check if capstone is available
+HAS_CAPSTONE := $(shell pkg-config --exists capstone && echo yes)
+
+ifeq ($(HAS_CAPSTONE),yes)
+    CFLAGS += -DHAVE_CAPSTONE $(shell pkg-config --cflags capstone)
+    LIBS += $(shell pkg-config --libs capstone)
+else
+    $(info Note: Building without Capstone support - disassembly will be disabled)
+    $(info Install libcapstone-dev to enable disassembly feature)
+endif
 
 TARGET = scan_engine
 SOURCE = scan_engine.c
