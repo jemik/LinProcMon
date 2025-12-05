@@ -461,8 +461,16 @@ void json_hex_dump(FILE *fp, const uint8_t *data, size_t data_len, size_t match_
         for (size_t i = 0; i < 16; i++) {
             if (offset + i < end) {
                 uint8_t c = data[offset + i];
-                char display = (c >= 32 && c < 127) ? c : '.';
-                fprintf(fp, "%c", display);
+                // Escape special JSON characters in ASCII representation
+                if (c == '"') {
+                    fprintf(fp, "\\\"");
+                } else if (c == '\\') {
+                    fprintf(fp, "\\\\");
+                } else if (c >= 32 && c < 127) {
+                    fprintf(fp, "%c", c);
+                } else {
+                    fprintf(fp, ".");
+                }
             }
         }
         
