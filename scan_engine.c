@@ -863,6 +863,7 @@ typedef struct {
     double entropy;
     int has_match;
     int first_region;  // For JSON formatting
+    int first_match;   // Track first match in current region for JSON formatting
 } MemoryScanContext;
 
 // YARA callback for memory region scanning
@@ -896,9 +897,8 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
         
         if (g_json_report) {
             // JSON: Write rule info
-            static int first_rule = 1;
-            if (!first_rule) fprintf(g_json_report, ",\n");
-            first_rule = 0;
+            if (!mem_ctx->first_match) fprintf(g_json_report, ",\n");
+            mem_ctx->first_match = 0;
             
             char escaped_rule[512];
             json_escape_string(rule->identifier, escaped_rule, sizeof(escaped_rule));
@@ -1119,7 +1119,8 @@ void scan_process_memory(ProcessInfo *info) {
             .data_size = bytes_read,
             .entropy = calculate_entropy(data, bytes_read),
             .has_match = 0,
-            .first_region = first_region
+            .first_region = first_region,
+            .first_match = 1
         };
         snprintf(mem_ctx.perms, sizeof(mem_ctx.perms), "%s", region->perms);
         
