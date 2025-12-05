@@ -552,17 +552,30 @@ int yara_callback(YR_SCAN_CONTEXT* context, int message, void* message_data, voi
                                 strstr(string->identifier, "code") != NULL) {
                                 looks_like_code = 1;
                             } else {
-                                // Check if matched data contains common shellcode indicators
-                                for (size_t k = 0; k < match->match_length && k < 32; k++) {
-                                    uint8_t b = file_data[match->offset + k];
-                                    // Look for syscall (0x0f 0x05), int 0x80 (0xcd 0x80), or /bin/sh pattern
-                                    if (k + 1 < match->match_length) {
-                                        if ((b == 0x0f && file_data[match->offset + k + 1] == 0x05) ||  // syscall
-                                            (b == 0xcd && file_data[match->offset + k + 1] == 0x80) ||  // int 0x80
-                                            (b == 0x6a && file_data[match->offset + k + 1] == 0x3b)) {  // push 0x3b
-                                            looks_like_code = 1;
-                                            break;
-                                        }
+                                // Check matched data and surrounding context for shellcode indicators
+                                // Look at up to 64 bytes before and after the match
+                                size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                                size_t context_end = (match->offset + match->match_length + 64 < st.st_size) ? 
+                                                    (match->offset + match->match_length + 64) : st.st_size;
+                                
+                                for (size_t k = context_start; k < context_end - 1; k++) {
+                                    uint8_t b = file_data[k];
+                                    uint8_t next = file_data[k + 1];
+                                    
+                                    if ((b == 0x0f && next == 0x05) ||  // syscall
+                                        (b == 0xcd && next == 0x80) ||  // int 0x80  
+                                        (b == 0x6a && next == 0x3b) ||  // push 0x3b (execve)
+                                        (b == 0x6a && next == 0x02)) {  // push 0x2 (socket family)
+                                        looks_like_code = 1;
+                                        break;
+                                    }
+                                }
+                                
+                                // Also check if it's a shellcode string like /bin/sh
+                                if (!looks_like_code && match->match_length >= 4) {
+                                    if (strstr((char*)&file_data[match->offset], "/bin/") != NULL ||
+                                        strstr((char*)&file_data[match->offset], "/sh") != NULL) {
+                                        looks_like_code = 1;
                                     }
                                 }
                             }
@@ -705,23 +718,41 @@ int yara_callback_json(YR_SCAN_CONTEXT* context, int message, void* message_data
                 json_hex_dump(g_json_report, file_data, st.st_size, match->offset, match->match_length);
                 
                 // Disassembly if looks like code
+                int looks_like_code = 0;
                 if (strstr(string->identifier, "opcode") != NULL ||
                     strstr(string->identifier, "shellcode") != NULL ||
                     strstr(string->identifier, "code") != NULL) {
-                    json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                    looks_like_code = 1;
                 } else {
-                    // Check if matched data contains shellcode indicators
-                    for (int k = 0; k < match->match_length && k < 32; k++) {
-                        uint8_t b = file_data[match->offset + k];
-                        if (k + 1 < match->match_length) {
-                            if ((b == 0x0f && file_data[match->offset + k + 1] == 0x05) ||
-                                (b == 0xcd && file_data[match->offset + k + 1] == 0x80) ||
-                                (b == 0x6a && file_data[match->offset + k + 1] == 0x3b)) {
-                                json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
-                                break;
-                            }
+                    // Check matched data and surrounding context for shellcode indicators
+                    size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                    size_t context_end = (match->offset + match->match_length + 64 < st.st_size) ? 
+                                        (match->offset + match->match_length + 64) : st.st_size;
+                    
+                    for (size_t k = context_start; k < context_end - 1; k++) {
+                        uint8_t b = file_data[k];
+                        uint8_t next = file_data[k + 1];
+                        
+                        if ((b == 0x0f && next == 0x05) ||  // syscall
+                            (b == 0xcd && next == 0x80) ||  // int 0x80
+                            (b == 0x6a && next == 0x3b) ||  // push 0x3b
+                            (b == 0x6a && next == 0x02)) {  // push 0x2
+                            looks_like_code = 1;
+                            break;
                         }
                     }
+                    
+                    // Check for shellcode strings
+                    if (!looks_like_code && match->match_length >= 4) {
+                        if (strstr((char*)&file_data[match->offset], "/bin/") != NULL ||
+                            strstr((char*)&file_data[match->offset], "/sh") != NULL) {
+                            looks_like_code = 1;
+                        }
+                    }
+                }
+                
+                if (looks_like_code) {
+                    json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
                 }
                 
                 fprintf(g_json_report, "\n                }");
@@ -878,16 +909,29 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
                         strstr(string->identifier, "code") != NULL) {
                         looks_like_code = 1;
                     } else {
-                        // Check if matched data contains shellcode indicators
-                        for (int k = 0; k < match->match_length && k < 32; k++) {
-                            uint8_t b = mem_ctx->data[match->offset + k];
-                            if (k + 1 < match->match_length) {
-                                if ((b == 0x0f && mem_ctx->data[match->offset + k + 1] == 0x05) ||
-                                    (b == 0xcd && mem_ctx->data[match->offset + k + 1] == 0x80) ||
-                                    (b == 0x6a && mem_ctx->data[match->offset + k + 1] == 0x3b)) {
-                                    looks_like_code = 1;
-                                    break;
-                                }
+                        // Check matched data and surrounding context
+                        size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                        size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
+                                            (match->offset + match->match_length + 64) : mem_ctx->data_size;
+                        
+                        for (size_t k = context_start; k < context_end - 1; k++) {
+                            uint8_t b = mem_ctx->data[k];
+                            uint8_t next = mem_ctx->data[k + 1];
+                            
+                            if ((b == 0x0f && next == 0x05) ||  // syscall
+                                (b == 0xcd && next == 0x80) ||  // int 0x80
+                                (b == 0x6a && next == 0x3b) ||  // push 0x3b
+                                (b == 0x6a && next == 0x02)) {  // push 0x2
+                                looks_like_code = 1;
+                                break;
+                            }
+                        }
+                        
+                        // Check for shellcode strings
+                        if (!looks_like_code && match->match_length >= 4) {
+                            if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
+                                strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
+                                looks_like_code = 1;
                             }
                         }
                     }
@@ -929,16 +973,29 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
                         strstr(string->identifier, "code") != NULL) {
                         looks_like_code = 1;
                     } else {
-                        // Check if matched data contains shellcode indicators
-                        for (int k = 0; k < match->match_length && k < 32; k++) {
-                            uint8_t b = mem_ctx->data[match->offset + k];
-                            if (k + 1 < match->match_length) {
-                                if ((b == 0x0f && mem_ctx->data[match->offset + k + 1] == 0x05) ||
-                                    (b == 0xcd && mem_ctx->data[match->offset + k + 1] == 0x80) ||
-                                    (b == 0x6a && mem_ctx->data[match->offset + k + 1] == 0x3b)) {
-                                    looks_like_code = 1;
-                                    break;
-                                }
+                        // Check matched data and surrounding context
+                        size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                        size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
+                                            (match->offset + match->match_length + 64) : mem_ctx->data_size;
+                        
+                        for (size_t k = context_start; k < context_end - 1; k++) {
+                            uint8_t b = mem_ctx->data[k];
+                            uint8_t next = mem_ctx->data[k + 1];
+                            
+                            if ((b == 0x0f && next == 0x05) ||  // syscall
+                                (b == 0xcd && next == 0x80) ||  // int 0x80
+                                (b == 0x6a && next == 0x3b) ||  // push 0x3b
+                                (b == 0x6a && next == 0x02)) {  // push 0x2
+                                looks_like_code = 1;
+                                break;
+                            }
+                        }
+                        
+                        // Check for shellcode strings
+                        if (!looks_like_code && match->match_length >= 4) {
+                            if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
+                                strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
+                                looks_like_code = 1;
                             }
                         }
                     }
