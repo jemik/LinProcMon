@@ -932,36 +932,42 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
                     json_hex_dump(g_json_report, mem_ctx->data, mem_ctx->data_size, 
                                  match->offset, match->match_length);
                     
-                    // Disassembly if looks like code
+                    // Disassembly if looks like code AND in executable memory
                     int looks_like_code = 0;
-                    if (strstr(string->identifier, "opcode") != NULL ||
-                        strstr(string->identifier, "shellcode") != NULL ||
-                        strstr(string->identifier, "code") != NULL) {
-                        looks_like_code = 1;
-                    } else {
-                        // Check matched data and surrounding context
-                        size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
-                        size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
-                                            (match->offset + match->match_length + 64) : mem_ctx->data_size;
-                        
-                        for (size_t k = context_start; k < context_end - 1; k++) {
-                            uint8_t b = mem_ctx->data[k];
-                            uint8_t next = mem_ctx->data[k + 1];
+                    
+                    // Only consider disassembly for executable memory regions
+                    int is_executable = (strchr(mem_ctx->perms, 'x') != NULL);
+                    
+                    if (is_executable) {
+                        if (strstr(string->identifier, "opcode") != NULL ||
+                            strstr(string->identifier, "shellcode") != NULL ||
+                            strstr(string->identifier, "code") != NULL) {
+                            looks_like_code = 1;
+                        } else {
+                            // Check matched data and surrounding context
+                            size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                            size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
+                                                (match->offset + match->match_length + 64) : mem_ctx->data_size;
                             
-                            if ((b == 0x0f && next == 0x05) ||  // syscall
-                                (b == 0xcd && next == 0x80) ||  // int 0x80
-                                (b == 0x6a && next == 0x3b) ||  // push 0x3b
-                                (b == 0x6a && next == 0x02)) {  // push 0x2
-                                looks_like_code = 1;
-                                break;
+                            for (size_t k = context_start; k < context_end - 1; k++) {
+                                uint8_t b = mem_ctx->data[k];
+                                uint8_t next = mem_ctx->data[k + 1];
+                                
+                                if ((b == 0x0f && next == 0x05) ||  // syscall
+                                    (b == 0xcd && next == 0x80) ||  // int 0x80
+                                    (b == 0x6a && next == 0x3b) ||  // push 0x3b
+                                    (b == 0x6a && next == 0x02)) {  // push 0x2
+                                    looks_like_code = 1;
+                                    break;
+                                }
                             }
-                        }
-                        
-                        // Check for shellcode strings
-                        if (!looks_like_code && match->match_length >= 4) {
-                            if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
-                                strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
-                                looks_like_code = 1;
+                            
+                            // Check for shellcode strings
+                            if (!looks_like_code && match->match_length >= 4) {
+                                if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
+                                    strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
+                                    looks_like_code = 1;
+                                }
                             }
                         }
                     }
@@ -996,36 +1002,42 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
                                      match->offset, match->match_length);
                     }
                     
-                    // Try to disassemble if it looks like code
+                    // Try to disassemble if it looks like code AND in executable memory
                     int looks_like_code = 0;
-                    if (strstr(string->identifier, "opcode") != NULL ||
-                        strstr(string->identifier, "shellcode") != NULL ||
-                        strstr(string->identifier, "code") != NULL) {
-                        looks_like_code = 1;
-                    } else {
-                        // Check matched data and surrounding context
-                        size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
-                        size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
-                                            (match->offset + match->match_length + 64) : mem_ctx->data_size;
-                        
-                        for (size_t k = context_start; k < context_end - 1; k++) {
-                            uint8_t b = mem_ctx->data[k];
-                            uint8_t next = mem_ctx->data[k + 1];
+                    
+                    // Only consider disassembly for executable memory regions
+                    int is_executable = (strchr(mem_ctx->perms, 'x') != NULL);
+                    
+                    if (is_executable) {
+                        if (strstr(string->identifier, "opcode") != NULL ||
+                            strstr(string->identifier, "shellcode") != NULL ||
+                            strstr(string->identifier, "code") != NULL) {
+                            looks_like_code = 1;
+                        } else {
+                            // Check matched data and surrounding context
+                            size_t context_start = (match->offset > 64) ? (match->offset - 64) : 0;
+                            size_t context_end = (match->offset + match->match_length + 64 < mem_ctx->data_size) ? 
+                                                (match->offset + match->match_length + 64) : mem_ctx->data_size;
                             
-                            if ((b == 0x0f && next == 0x05) ||  // syscall
-                                (b == 0xcd && next == 0x80) ||  // int 0x80
-                                (b == 0x6a && next == 0x3b) ||  // push 0x3b
-                                (b == 0x6a && next == 0x02)) {  // push 0x2
-                                looks_like_code = 1;
-                                break;
+                            for (size_t k = context_start; k < context_end - 1; k++) {
+                                uint8_t b = mem_ctx->data[k];
+                                uint8_t next = mem_ctx->data[k + 1];
+                                
+                                if ((b == 0x0f && next == 0x05) ||  // syscall
+                                    (b == 0xcd && next == 0x80) ||  // int 0x80
+                                    (b == 0x6a && next == 0x3b) ||  // push 0x3b
+                                    (b == 0x6a && next == 0x02)) {  // push 0x2
+                                    looks_like_code = 1;
+                                    break;
+                                }
                             }
-                        }
-                        
-                        // Check for shellcode strings
-                        if (!looks_like_code && match->match_length >= 4) {
-                            if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
-                                strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
-                                looks_like_code = 1;
+                            
+                            // Check for shellcode strings
+                            if (!looks_like_code && match->match_length >= 4) {
+                                if (strstr((char*)&mem_ctx->data[match->offset], "/bin/") != NULL ||
+                                    strstr((char*)&mem_ctx->data[match->offset], "/sh") != NULL) {
+                                    looks_like_code = 1;
+                                }
                             }
                         }
                     }
