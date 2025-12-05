@@ -370,11 +370,23 @@ void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset
         return;
     }
     
-    // Start disassembly a bit before the match for context
-    size_t dis_start = (match_offset >= 0x20) ? (match_offset - 0x20) : 0;
-    size_t dis_len = match_len + 0x40;
-    if (dis_start + dis_len > data_len) {
-        dis_len = data_len - dis_start;
+    // Start disassembly from the beginning for small files, or from a reasonable offset for larger ones
+    // Starting mid-instruction causes disassembly to fail
+    size_t dis_start;
+    size_t dis_len;
+    
+    if (data_len < 512) {
+        // Small file - disassemble the whole thing
+        dis_start = 0;
+        dis_len = data_len;
+    } else {
+        // Larger file - try to find a safe starting point
+        // Look for instruction boundaries (try to align to likely function start)
+        dis_start = (match_offset >= 0x40) ? (match_offset - 0x40) : 0;
+        dis_len = match_len + 0x80;
+        if (dis_start + dis_len > data_len) {
+            dis_len = data_len - dis_start;
+        }
     }
     
     printf("\n    Disassembly:\n");
@@ -467,10 +479,20 @@ void json_disassembly(FILE *fp, const uint8_t *data, size_t data_len, size_t mat
         return;
     }
     
-    size_t dis_start = (match_offset >= 0x20) ? (match_offset - 0x20) : 0;
-    size_t dis_len = match_len + 0x40;
-    if (dis_start + dis_len > data_len) {
-        dis_len = data_len - dis_start;
+    size_t dis_start;
+    size_t dis_len;
+    
+    if (data_len < 512) {
+        // Small file - disassemble the whole thing
+        dis_start = 0;
+        dis_len = data_len;
+    } else {
+        // Larger file - try to find a safe starting point
+        dis_start = (match_offset >= 0x40) ? (match_offset - 0x40) : 0;
+        dis_len = match_len + 0x80;
+        if (dis_start + dis_len > data_len) {
+            dis_len = data_len - dis_start;
+        }
     }
     
     size_t count = cs_disasm(handle, data + dis_start, dis_len, dis_start, 0, &insn);
