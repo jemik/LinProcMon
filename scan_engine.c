@@ -783,6 +783,9 @@ int yara_callback_json(YR_SCAN_CONTEXT* context, int message, void* message_data
                 
                 if (looks_like_code) {
                     json_disassembly(g_json_report, file_data, st.st_size, match->offset, match->match_length);
+                } else {
+                    // Still need to output empty disasm field for valid JSON
+                    fprintf(g_json_report, ",\n          \"disasm\": []");
                 }
                 
                 fprintf(g_json_report, "\n                }");
@@ -975,6 +978,9 @@ int yara_callback_memory(YR_SCAN_CONTEXT* context, int message, void* message_da
                     if (looks_like_code) {
                         json_disassembly(g_json_report, mem_ctx->data, mem_ctx->data_size,
                                         match->offset, match->match_length);
+                    } else {
+                        // Still need to output empty disasm field for valid JSON
+                        fprintf(g_json_report, ",\n          \"disasm\": []");
                     }
                     
                     fprintf(g_json_report, "\n                }");
