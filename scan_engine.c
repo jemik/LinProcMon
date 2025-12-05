@@ -395,9 +395,13 @@ void print_disassembly(const uint8_t *data, size_t data_len, size_t match_offset
     
     if (count > 0) {
         for (size_t i = 0; i < count; i++) {
-            // Check if instruction is within the match range
-            int is_match = (insn[i].address >= match_offset && 
-                          insn[i].address < match_offset + match_len);
+            // Check if instruction overlaps with the match range
+            // An instruction matches if any of its bytes are in the match range
+            size_t insn_start = insn[i].address;
+            size_t insn_end = insn[i].address + insn[i].size;
+            size_t match_end = match_offset + match_len;
+            
+            int is_match = (insn_start < match_end && insn_end > match_offset);
             
             if (is_match) {
                 // Color matched instructions in red with >> marker
@@ -503,8 +507,12 @@ void json_disassembly(FILE *fp, const uint8_t *data, size_t data_len, size_t mat
         for (size_t i = 0; i < count; i++) {
             if (i > 0) fprintf(fp, ",\n");
             
-            int is_match = (insn[i].address >= match_offset && 
-                          insn[i].address < match_offset + match_len);
+            // Check if instruction overlaps with the match range
+            size_t insn_start = insn[i].address;
+            size_t insn_end = insn[i].address + insn[i].size;
+            size_t match_end = match_offset + match_len;
+            
+            int is_match = (insn_start < match_end && insn_end > match_offset);
             
             if (is_match) {
                 fprintf(fp, "            \">> 0x%lx: %s %s\"",
